@@ -83,8 +83,10 @@ pub fn spawn_base(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    terrain: Res<crate::terrain::TerrainHeightMap>,
 ) {
-    let pos = Vec3::new(0.0, DRONE_RADIUS, -WORLD_SIZE / 2.0 + 1.0); // south edge
+    let z = -WORLD_SIZE / 2.0 + 1.0;
+    let pos = Vec3::new(0.0, terrain.height_at(0.0, z) + DRONE_RADIUS, z); // south edge
 
     // 5 connections — same hardware as the drones, one antenna per 72° sector.
     let antennas: Vec<Antenna> =
