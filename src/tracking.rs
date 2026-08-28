@@ -121,9 +121,14 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
 
     use crate::drone::{make_antenna, DroneType};
+    use crate::networking::NetworkingBundle;
 
     /// Spawn a drone at `pos` in ring slot `ring`, with 3 zeroed antennas the
-    /// aiming system will retarget. Returns its entity.
+    /// aiming system will retarget. Uses the real `NetworkingBundle` (which
+    /// carries `RingIndex`, `TrackedPeers`, and any other per-drone networking
+    /// state) so the drone matches `maintain_mesh_antennas`'s query in full —
+    /// hand-listing components would silently stop matching if the query ever
+    /// gains a param.
     fn spawn_drone(world: &mut World, pos: Vec3, ring: usize) -> Entity {
         world
             .spawn((
@@ -137,8 +142,7 @@ mod tests {
                         make_antenna(0.0, 0.0, 2),
                     ],
                 },
-                RingIndex(ring),
-                TrackedPeers::default(),
+                NetworkingBundle::random(ring),
             ))
             .id()
     }
