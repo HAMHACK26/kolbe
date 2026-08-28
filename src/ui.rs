@@ -8,6 +8,22 @@ use crate::{
 };
 
 #[derive(Component)]
+pub struct UiCamera;
+
+/// UI exists before the 3D world, so it needs its own camera from startup.
+pub fn setup_camera(mut commands: Commands) {
+    commands.spawn((Camera2d, IsDefaultUiCamera, UiCamera));
+}
+
+/// Once the 3D camera exists, render UI transparently above it.
+pub fn make_camera_overlay(mut cameras: Query<&mut Camera, With<UiCamera>>) {
+    if let Ok(mut camera) = cameras.single_mut() {
+        camera.order = 1;
+        camera.clear_color = ClearColorConfig::None;
+    }
+}
+
+#[derive(Component)]
 pub struct InfoPopup;
 
 /// Single-line heading above the table (id + type + count).
@@ -37,9 +53,15 @@ pub fn update_popup_position(
     mut last_sig: Local<String>,
 ) {
     let pal = theme.palette();
-    let Ok((mut node, mut vis)) = popup_q.single_mut() else { return };
-    let Ok(mut title) = title_q.single_mut() else { return };
-    let Ok((table_entity, table_children)) = table_q.single() else { return };
+    let Ok((mut node, mut vis)) = popup_q.single_mut() else {
+        return;
+    };
+    let Ok(mut title) = title_q.single_mut() else {
+        return;
+    };
+    let Ok((table_entity, table_children)) = table_q.single() else {
+        return;
+    };
 
     let Some(entity) = selected.0 else {
         *vis = Visibility::Hidden;
@@ -49,16 +71,26 @@ pub fn update_popup_position(
 
     // Resolve world position + table content from either a drone or the base.
     let (world_pos, title_str, rows) = if let Ok((gt, drone)) = drones.get(entity) {
-        (gt.translation(), drone_title(drone), antenna_rows(&drone.antennas))
+        (
+            gt.translation(),
+            drone_title(drone),
+            antenna_rows(&drone.antennas),
+        )
     } else if let Ok((gt, base)) = bases.get(entity) {
-        (gt.translation(), base_title(base), antenna_rows(&base.antennas))
+        (
+            gt.translation(),
+            base_title(base),
+            antenna_rows(&base.antennas),
+        )
     } else {
         *vis = Visibility::Hidden;
         last_sig.clear();
         return;
     };
 
-    let Ok((camera, cam_gt)) = camera_q.single() else { return };
+    let Ok((camera, cam_gt)) = camera_q.single() else {
+        return;
+    };
     let Ok(screen_pos) = camera.world_to_viewport(cam_gt, world_pos) else {
         *vis = Visibility::Hidden;
         return;
@@ -87,7 +119,10 @@ pub fn update_popup_position(
         for h in HEADER {
             p.spawn((
                 Text::new(h),
-                TextFont { font_size: FontSize::Px(12.0), ..default() },
+                TextFont {
+                    font_size: FontSize::Px(12.0),
+                    ..default()
+                },
                 TextColor(accent),
             ));
         }
@@ -95,7 +130,10 @@ pub fn update_popup_position(
             for cell in row {
                 p.spawn((
                     Text::new(cell.clone()),
-                    TextFont { font_size: FontSize::Px(12.0), ..default() },
+                    TextFont {
+                        font_size: FontSize::Px(12.0),
+                        ..default()
+                    },
                     TextColor(text),
                 ));
             }

@@ -18,6 +18,7 @@ pub fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    terrain: Res<crate::terrain::TerrainHeightMap>,
 ) {
     commands.spawn((Camera3d::default(), Transform::default()));
 
@@ -26,26 +27,6 @@ pub fn setup(
         DirectionalLight { illuminance: 8000.0, shadow_maps_enabled: false, ..default() },
         Transform::from_xyz(8.0, 16.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-
-    // Ground
-    commands
-        .spawn((
-            Mesh3d(meshes.add(Plane3d::default().mesh().size(WORLD_SIZE, WORLD_SIZE))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.13, 0.25, 0.13),
-                perceptual_roughness: 1.0,
-                ..default()
-            })),
-            Transform::IDENTITY,
-            ThemeRole::Ground,
-        ))
-        .observe(
-            |_: On<Pointer<Click>>, orbit: Res<OrbitCamera>, mut sel: ResMut<SelectedDrone>| {
-                if orbit.drag_total < 5.0 {
-                    sel.0 = None;
-                }
-            },
-        );
 
     let positions: [(f32, f32); 12] = [
         (2.3, 4.1), (7.8, 1.5), (14.2, 6.3), (18.0, 2.0),
@@ -71,7 +52,9 @@ pub fn setup(
     let half = WORLD_SIZE / 2.0;
     for i in 0..DRONE_COUNT {
         let (km_x, km_z) = positions[i];
-        let drone_pos = Vec3::new(km_x - half, DRONE_RADIUS, km_z - half);
+        let x = km_x - half;
+        let z = km_z - half;
+        let drone_pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
         let drone_type = if i % 3 == 0 { DroneType::Attack } else { DroneType::Node };
 
         let az0 = (i as f32 * 137.5) % 360.0;
@@ -157,12 +140,29 @@ pub fn setup(
         });
 }
 
-pub fn draw_grid(mut gizmos: Gizmos, theme: Res<Theme>) {
+pub fn draw_grid(
+    mut gizmos: Gizmos,
+    theme: Res<Theme>,
+    terrain: Res<crate::terrain::TerrainHeightMap>,
+) {
     let half = WORLD_SIZE / 2.0;
     let color = theme.palette().grid.with_alpha(0.25);
+    const SEGMENTS: usize = 64;
     for i in 0..=4 {
         let offset = -half + i as f32 * 5.0;
-        gizmos.line(Vec3::new(-half, 0.01, offset), Vec3::new(half, 0.01, offset), color);
-        gizmos.line(Vec3::new(offset, 0.01, -half), Vec3::new(offset, 0.01, half), color);
+        for segment in 0..SEGMENTS {
+            let a = -half + WORLD_SIZE * segment as f32 / SEGMENTS as f32;
+            let b = -half + WORLD_SIZE * (segment + 1) as f32 / SEGMENTS as f32;
+            gizmos.line(
+                Vec3::new(a, terrain.height_at(a, offset) + 0.01, offset),
+                Vec3::new(b, terrain.height_at(b, offset) + 0.01, offset),
+                color,
+            );
+            gizmos.line(
+                Vec3::new(offset, terrain.height_at(offset, a) + 0.01, a),
+                Vec3::new(offset, terrain.height_at(offset, b) + 0.01, b),
+                color,
+            );
+        }
     }
 }
