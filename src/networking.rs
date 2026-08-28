@@ -1,9 +1,13 @@
-//! Peer-to-peer mesh networking.
+//! Peer-to-peer mesh networking: the comms protocol only (headers, packet
+//! routing, ranging, mesh-table gossip). Antenna *aiming* — including how
+//! `flight_direction` below gets used to keep a lock on a moving peer — is a
+//! separate concern and lives in [`crate::tracking`], which reads the data
+//! this module produces but never the reverse.
 //!
-//! ALL networking logic lives here (per project rule). A drone "detects a
-//! radio link" from a peer when one of its antennas receives that peer above
-//! sensitivity — which, with the 1°-beamwidth antennas, can only happen when
-//! the two antennas are pointed at each other.
+//! A drone "detects a radio link" from a peer when one of its antennas
+//! receives that peer above sensitivity — which, with the 1°-beamwidth
+//! antennas, can only happen when the two antennas are pointed at each
+//! other.
 //!
 //! On the rising edge of a detected link, the drone emits a header:
 //!
@@ -59,11 +63,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
 
-use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
 use crate::spherical::SphericalVec;
+use crate::tracking::TrackedPeers;
 
 /// How far ahead the flight-direction vector predicts (seconds).
 pub const FLIGHT_LOOKAHEAD_SECS: f32 = 0.1;
@@ -146,7 +150,7 @@ pub struct MeshRow {
 pub struct MeshTable(pub HashMap<String, MeshRow>);
 
 /// This drone's fixed position in the ring formation (0..N). Used only to
-/// pick its two direct mesh neighbors — see `maintain_mesh_antennas`.
+/// pick its two direct mesh neighbors — see `crate::tracking::maintain_mesh_antennas`.
 #[derive(Component)]
 pub struct RingIndex(pub usize);
 
@@ -160,6 +164,7 @@ pub struct NetworkingBundle {
     pub ranging: RangingResults,
     pub mesh_table: MeshTable,
     pub ring_index: RingIndex,
+    pub tracked_peers: TrackedPeers,
 }
 
 impl NetworkingBundle {
@@ -172,6 +177,7 @@ impl NetworkingBundle {
             ranging: RangingResults::default(),
             mesh_table: MeshTable::default(),
             ring_index: RingIndex(ring_index),
+            tracked_peers: TrackedPeers::default(),
         }
     }
 }
@@ -242,54 +248,6 @@ pub fn advance_clocks(time: Res<Time>, mut clocks: Query<&mut DroneClock>) {
     let dt = time.delta_secs_f64();
     for mut clock in &mut clocks {
         clock.now += dt;
-    }
-}
-
-/// Keep every drone locked onto its ring neighbors: antenna #1 → next
-/// neighbor, antenna #2 → base, antenna #3 → previous neighbor. Non-adjacent
-/// drones are never targeted by any antenna, so they can only learn about
-/// each other by relay through the mesh table.
-///
-/// This overrides the fixed 120°-apart layout `world::setup` used to compute
-/// the initial angles; those were only ever a starting point.
-pub fn maintain_mesh_antennas(
-    mut drones: Query<(&Transform, &mut Drone, &RingIndex)>,
-    positions: Query<(&Transform, &RingIndex), With<Drone>>,
-    bases: Query<&Base>,
-) {
-    let base_pos = bases.iter().next().map(|b| b.position);
-
-    // Ring neighbors, not "the other drone" — with N > 2 most pairs are
-    // never mutually visible on purpose, so relayed (multi-hop) rows in the
-    // mesh table actually get exercised.
-    let mut ring: Vec<(usize, Vec3)> =
-        positions.iter().map(|(t, ri)| (ri.0, t.translation)).collect();
-    ring.sort_by_key(|(i, _)| *i);
-    let n = ring.len();
-
-    for (self_transform, mut drone, self_ring) in &mut drones {
-        if n == 0 {
-            continue;
-        }
-        let self_pos = self_transform.translation;
-        let next_pos = ring[(self_ring.0 + 1) % n].1;
-        let prev_pos = ring[(self_ring.0 + n - 1) % n].1;
-
-        if let Some(first) = drone.antennas.get_mut(0) {
-            let (az, el) = angles_toward(self_pos, next_pos);
-            first.azimuth_deg = az;
-            first.elevation_deg = el;
-        }
-        if let (Some(base_pos), Some(second)) = (base_pos, drone.antennas.get_mut(1)) {
-            let (az, el) = angles_toward(self_pos, base_pos);
-            second.azimuth_deg = az;
-            second.elevation_deg = el;
-        }
-        if let Some(third) = drone.antennas.get_mut(2) {
-            let (az, el) = angles_toward(self_pos, prev_pos);
-            third.azimuth_deg = az;
-            third.elevation_deg = el;
-        }
     }
 }
 
@@ -400,6 +358,7 @@ pub fn route_packets(
         &DroneUuid,
         &DroneClock,
         &mut MeshTable,
+        &mut TrackedPeers,
     )>,
 ) {
     let packets = std::mem::take(&mut mailbox.0);
@@ -409,11 +368,21 @@ pub fn route_packets(
         match pkt.kind {
             PacketKind::Header => {
                 // `target` is the responder.
-                let Ok((resp_gt, _, resp_uuid, resp_clock, mut resp_table)) = drones.get_mut(target)
+                let Ok((resp_gt, _, resp_uuid, resp_clock, mut resp_table, mut resp_tracked)) =
+                    drones.get_mut(target)
                 else {
                     continue;
                 };
                 let responder_pos = resp_gt.translation();
+
+                // Antenna-tracking only: the sender told us, in this header,
+                // where it believes it will be `FLIGHT_LOOKAHEAD_SECS` from
+                // when it sent it. Record that predicted point so
+                // `crate::tracking::maintain_mesh_antennas` can lead the
+                // target instead of aiming at (comms-wise) unknowable live
+                // ground truth. This never touches the responder's own
+                // position/velocity.
+                resp_tracked.0.insert(pkt.origin, pkt.origin_pos + pkt.header.flight_direction);
 
                 // Relay-merge every third-party row: one hop further than it
                 // was from the sender, and only if that's an improvement.

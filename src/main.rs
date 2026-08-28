@@ -8,6 +8,7 @@ mod networking;
 mod radar;
 mod spherical;
 mod theme;
+mod tracking;
 mod ui;
 mod world;
 
@@ -48,7 +49,7 @@ fn main() {
         .add_systems(
             Update,
             (
-                networking::maintain_mesh_antennas,
+                tracking::maintain_mesh_antennas,
                 networking::detect_links_and_send_headers,
                 networking::route_packets,
             )
