@@ -13,6 +13,19 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Local credentials and generated terrain data
+.env
+**/.env
+**/.venv/
+**/__pycache__/
+**/*.pyc
+height_server/*.bin
+height_server/*.bin.meta
+height_server/.cache/
+
+# Temporary reference checkout
+.tmp-dies-irae/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
