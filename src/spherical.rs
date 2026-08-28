@@ -39,3 +39,31 @@ impl SphericalVec {
         radar_direction(self.azimuth_deg, self.elevation_deg) * self.length
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `from_cartesian` → `to_cartesian` reproduces the original vector.
+    #[test]
+    fn cartesian_round_trip() {
+        for v in [
+            Vec3::new(3.0, 0.0, 4.0),
+            Vec3::new(-2.0, 5.0, 1.0),
+            Vec3::new(0.0, 0.0, -7.0),
+        ] {
+            let back = SphericalVec::from_cartesian(v).to_cartesian();
+            assert!((back - v).length() < 1e-3, "{back:?} vs {v:?}");
+        }
+    }
+
+    /// `toward` takes the direction from the two points but the length from
+    /// the caller (not the geometric gap).
+    #[test]
+    fn toward_uses_given_length_and_pointing() {
+        let sv = SphericalVec::toward(Vec3::new(1.0, 1.0, 1.0), Vec3::new(1.0, 1.0, 5.0), 10.0);
+        assert!((sv.length - 10.0).abs() < 1e-6);
+        let dir = sv.to_cartesian().normalize();
+        assert!((dir - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-4, "dir {dir:?}");
+    }
+}

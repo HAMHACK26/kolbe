@@ -114,3 +114,94 @@ pub fn maintain_mesh_antennas(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    use crate::drone::{make_antenna, DroneType};
+
+    /// Spawn a drone at `pos` in ring slot `ring`, with 3 zeroed antennas the
+    /// aiming system will retarget. Returns its entity.
+    fn spawn_drone(world: &mut World, pos: Vec3, ring: usize) -> Entity {
+        world
+            .spawn((
+                Transform::from_translation(pos),
+                Drone {
+                    id: format!("d{ring}"),
+                    drone_type: DroneType::Node,
+                    antennas: vec![
+                        make_antenna(0.0, 0.0, 0),
+                        make_antenna(0.0, 0.0, 1),
+                        make_antenna(0.0, 0.0, 2),
+                    ],
+                },
+                RingIndex(ring),
+                TrackedPeers::default(),
+            ))
+            .id()
+    }
+
+    fn spawn_base(world: &mut World, pos: Vec3) {
+        world.spawn(Base { id: "base".into(), position: pos, antennas: vec![] });
+    }
+
+    fn antenna0_az(world: &World, drone: Entity) -> f32 {
+        world.get::<Drone>(drone).unwrap().antennas[0].azimuth_deg
+    }
+
+    /// Set drone `owner`'s tracked prediction for `peer`.
+    fn set_tracked(world: &mut World, owner: Entity, peer: Entity, predicted: Vec3) {
+        world.get_mut::<TrackedPeers>(owner).unwrap().0.insert(peer, predicted);
+    }
+
+    /// With a tracked prediction present, antenna #1 aims at the *predicted*
+    /// point — not the peer's true position.
+    #[test]
+    fn aims_at_predicted_not_true_position() {
+        let mut world = World::new();
+        spawn_base(&mut world, Vec3::new(0.0, 0.0, -5.0));
+        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
+        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
+
+        // B's true bearing from A is +X → azimuth 90°. Predicted point is
+        // off in +Z, which bears 45°.
+        set_tracked(&mut world, a, b, Vec3::new(1.0, 0.0, 1.0));
+        world.run_system_once(maintain_mesh_antennas).unwrap();
+
+        let az = antenna0_az(&world, a);
+        assert!((az - 45.0).abs() < 0.5, "expected ~45° (predicted), got {az}");
+        assert!((az - 90.0).abs() > 10.0, "must not aim at true position (90°)");
+    }
+
+    /// As the tracked prediction moves, the antenna follows it — the whole
+    /// point of prediction-led tracking.
+    #[test]
+    fn antenna_follows_moving_prediction() {
+        let mut world = World::new();
+        spawn_base(&mut world, Vec3::new(0.0, 0.0, -5.0));
+        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
+        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
+
+        // No prediction yet → aims at true B (+X, 90°).
+        world.run_system_once(maintain_mesh_antennas).unwrap();
+        let az_true = antenna0_az(&world, a);
+        assert!((az_true - 90.0).abs() < 0.5, "cold start aims at true pos, got {az_true}");
+
+        // Prediction slides in +Z; azimuth should swing monotonically toward 45°.
+        set_tracked(&mut world, a, b, Vec3::new(1.0, 0.0, 0.5));
+        world.run_system_once(maintain_mesh_antennas).unwrap();
+        let az_mid = antenna0_az(&world, a);
+
+        set_tracked(&mut world, a, b, Vec3::new(1.0, 0.0, 1.0));
+        world.run_system_once(maintain_mesh_antennas).unwrap();
+        let az_far = antenna0_az(&world, a);
+
+        assert!(
+            az_true > az_mid && az_mid > az_far,
+            "antenna should track the moving prediction: {az_true} > {az_mid} > {az_far}"
+        );
+        assert!((az_far - 45.0).abs() < 0.5, "final aim should reach ~45°, got {az_far}");
+    }
+}

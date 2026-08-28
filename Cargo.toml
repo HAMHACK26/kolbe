@@ -11,3 +11,8 @@ pyo3 = { version = "0.22", optional = true, features = ["auto-initialize"] }
 # Enable to implement drone logic in Python:
 #   cargo run --features python
 python = ["dep:pyo3"]
+
+# Thin debuginfo: faster compile + link while keeping backtraces with line
+# numbers. Full DWARF debuginfo isn't worth its build/link cost here.
+[profile.dev]
+debug = "line-tables-only"
