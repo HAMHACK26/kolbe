@@ -27,16 +27,16 @@ pub fn drone_id(seed: usize) -> String {
     format!("{:08X}", x)
 }
 
-/// Build an antenna with per-drone variation derived from seed.
-pub fn make_antenna(azimuth_deg: f32, elevation_deg: f32, seed: usize) -> Antenna {
-    let v = (seed as f32 * 1.618) % 1.0;
+/// Build an antenna pointed at the given angles. All units share the same
+/// hardware — only azimuth/elevation vary. `seed` is unused (kept for callers).
+pub fn make_antenna(azimuth_deg: f32, elevation_deg: f32, _seed: usize) -> Antenna {
     Antenna {
         azimuth_deg,
         elevation_deg,
-        g_peak_dbi: 8.0 + v * 6.0,
-        theta_3db_deg: 0.8 + v * 0.4,
+        g_peak_dbi: 11.0,
+        theta_3db_deg: 1.0,
         floor_db: -30.0,
-        p_tx_dbm: 18.0 + v * 4.0,
+        p_tx_dbm: 20.0,
         frequency_mhz: 2400.0,
         alpha_db_per_km: 0.005,
         g_rx_dbi: 0.0,

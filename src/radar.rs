@@ -3,21 +3,24 @@ use bevy::{mesh::primitives::ConeAnchor, prelude::*};
 use crate::{
     antenna::{Antenna, radar_direction},
     drone::SelectedDrone,
-    world::WORLD_SIZE,
 };
+
+/// Fixed visual beam length (km). The drone knows only its pointing angles —
+/// not how far the beam reaches — so the cone length is a constant, not derived
+/// from link physics.
+pub const BEAM_KM: f32 = 3.0;
 
 #[derive(Component)]
 pub struct RadarCone {
     pub drone_entity: Entity,
 }
 
-/// Build a cone mesh whose geometry derives from antenna physics:
-/// length = max_range_km, half-angle = θ₃dB / 2.
+/// Build a cone mesh: fixed `BEAM_KM` length, half-angle = θ₃dB / 2.
+/// Length is a constant — the drone only knows its pointing angles.
 pub fn cone_mesh_for(antenna: &Antenna, meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
-    let range = antenna.max_range_km().min(WORLD_SIZE * 1.5);
     let half_angle = (antenna.theta_3db_deg / 2.0).to_radians();
     meshes.add(
-        Cone { radius: range * half_angle.tan(), height: range }
+        Cone { radius: BEAM_KM * half_angle.tan(), height: BEAM_KM }
             .mesh()
             .anchor(ConeAnchor::Tip)
             .build(),

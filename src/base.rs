@@ -19,12 +19,15 @@ use bevy::{color::palettes::css, prelude::*};
 
 use crate::{
     antenna::Antenna,
-    drone::Drone,
+    camera::OrbitCamera,
+    drone::{Drone, SelectedDrone, make_antenna},
     factories::{
         movement::DroneKinematics,
         seek::SeekTarget,
         track::{Track, TrackingActive},
     },
+    radar::{RadarCone, cone_mesh_for, cone_transform_for},
+    theme::ThemeRole,
     world::{DRONE_RADIUS, WORLD_SIZE},
 };
 
@@ -83,20 +86,12 @@ pub fn spawn_base(
 ) {
     let pos = Vec3::new(0.0, DRONE_RADIUS, -WORLD_SIZE / 2.0 + 1.0); // south edge
 
-    let antenna = Antenna {
-        azimuth_deg: 0.0,
-        elevation_deg: 5.0,
-        g_peak_dbi: 18.0,
-        theta_3db_deg: 15.0,   // wider beam — covers whole area
-        floor_db: -30.0,
-        p_tx_dbm: 30.0,        // 1 W — stronger than drones
-        frequency_mhz: 2400.0,
-        alpha_db_per_km: 0.005,
-        g_rx_dbi: 2.0,
-        sensitivity_dbm: -90.0,
-    };
+    // 5 connections — same hardware as the drones, one antenna per 72° sector.
+    let antennas: Vec<Antenna> =
+        (0..5).map(|k| make_antenna(k as f32 * 72.0, 5.0, 200 + k)).collect();
 
-    commands.spawn((
+    let base_entity = commands
+        .spawn((
         // Visual: yellow box
         Mesh3d(meshes.add(Cuboid::new(0.3, 0.3, 0.3))),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -108,10 +103,40 @@ pub fn spawn_base(
         Base {
             id: "GCS-ALPHA".into(),
             position: pos,
-            antennas: vec![antenna],
+            antennas: antennas.clone(),
         },
         BaseNetworkState::default(),
-    ));
+        ThemeRole::BaseMarker,
+    ))
+    .observe(
+        |mut t: On<Pointer<Click>>, orbit: Res<OrbitCamera>, mut sel: ResMut<SelectedDrone>| {
+            t.propagate(false);
+            if orbit.drag_total < 5.0 {
+                sel.0 = Some(t.original_event_target());
+            }
+        },
+    )
+    .id();
+
+    // Radar cones — hidden until the base is selected (keyed by base entity).
+    let cone_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.9, 0.0, 0.20),
+        emissive: LinearRgba::new(0.6, 0.5, 0.0, 0.0),
+        alpha_mode: AlphaMode::Blend,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+    for antenna in &antennas {
+        commands.spawn((
+            Mesh3d(cone_mesh_for(antenna, &mut meshes)),
+            MeshMaterial3d(cone_mat.clone()),
+            cone_transform_for(antenna, pos),
+            Visibility::Hidden,
+            RadarCone { drone_entity: base_entity },
+            ThemeRole::BaseCone,
+        ));
+    }
 }
 
 // ─── Systems (stubs) ──────────────────────────────────────────────────────────

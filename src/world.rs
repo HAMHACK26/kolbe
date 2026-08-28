@@ -6,7 +6,8 @@ use crate::{
     drone::{Drone, DroneType, SelectedDrone, drone_id, make_antenna},
     factories::{DroneAi, movement::DroneKinematics},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
-    ui::{InfoPopup, InfoPopupText},
+    theme::{Theme, ThemeRole},
+    ui::{InfoPopup, InfoPopupTable, InfoPopupTitle},
 };
 
 pub const WORLD_SIZE: f32 = 20.0;
@@ -36,6 +37,7 @@ pub fn setup(
                 ..default()
             })),
             Transform::IDENTITY,
+            ThemeRole::Ground,
         ))
         .observe(
             |_: On<Pointer<Click>>, orbit: Res<OrbitCamera>, mut sel: ResMut<SelectedDrone>| {
@@ -74,14 +76,13 @@ pub fn setup(
 
         let az0 = (i as f32 * 137.5) % 360.0;
         let el0 = ((i as f32 * 23.0) % 30.0) - 15.0;
-        let az1 = (az0 + 150.0) % 360.0;
 
-        let antennas = match drone_type {
-            DroneType::Attack => vec![make_antenna(az0, el0, i)],
-            DroneType::Node => {
-                vec![make_antenna(az0, el0, i), make_antenna(az1, -el0, i + 100)]
-            }
-        };
+        // Every drone carries exactly 3 antennas, 120° apart. Invariant.
+        let antennas = vec![
+            make_antenna(az0, el0, i),
+            make_antenna((az0 + 120.0) % 360.0, el0, i + 100),
+            make_antenna((az0 + 240.0) % 360.0, el0, i + 200),
+        ];
 
         let drone_entity = commands
             .spawn((
@@ -92,6 +93,7 @@ pub fn setup(
                 DroneKinematics::default(),
                 DroneAi::default(),
                 CommandQueue::default(),
+                ThemeRole::Drone,
             ))
             .observe(
                 |mut t: On<Pointer<Click>>,
@@ -112,6 +114,7 @@ pub fn setup(
                 cone_transform_for(antenna, drone_pos),
                 Visibility::Hidden,
                 RadarCone { drone_entity },
+                ThemeRole::DroneCone,
             ));
         }
     }
@@ -136,16 +139,27 @@ pub fn setup(
         .with_children(|p| {
             p.spawn((
                 Text::new(""),
-                TextFont { font_size: FontSize::Px(12.0), ..default() },
+                TextFont { font_size: FontSize::Px(13.0), ..default() },
                 TextColor(Color::WHITE),
-                InfoPopupText,
+                InfoPopupTitle,
+            ));
+            p.spawn((
+                Node {
+                    display: Display::Grid,
+                    grid_template_columns: vec![RepeatedGridTrack::auto(3)],
+                    column_gap: Val::Px(10.0),
+                    row_gap: Val::Px(2.0),
+                    margin: UiRect::top(Val::Px(4.0)),
+                    ..default()
+                },
+                InfoPopupTable,
             ));
         });
 }
 
-pub fn draw_grid(mut gizmos: Gizmos) {
+pub fn draw_grid(mut gizmos: Gizmos, theme: Res<Theme>) {
     let half = WORLD_SIZE / 2.0;
-    let color = Color::srgba(0.8, 0.9, 0.8, 0.18);
+    let color = theme.palette().grid.with_alpha(0.25);
     for i in 0..=4 {
         let offset = -half + i as f32 * 5.0;
         gizmos.line(Vec3::new(-half, 0.01, offset), Vec3::new(half, 0.01, offset), color);
