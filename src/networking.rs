@@ -56,8 +56,44 @@
 //! - Relaxed/added rows keep the **incoming** timestamp, never the receiver's
 //!   own clock — only a direct connection (distance 0) gets a fresh stamp.
 //!   This is how staleness/provenance survives being relayed through the mesh.
+//!
+//! ## Reconnection handshake (priority)
+//!
+//! Reconnecting to a specific drone that's currently linked to someone else
+//! — so it isn't reachable directly, only by relay — is a three-message
+//! handshake, flooded hop-by-hop through every drone's *current* live links
+//! ([`LinkSet`]) rather than sent point-to-point:
+//!
+//! 1. **Request** — the requester floods `Request { id, requester, target }`.
+//!    Every drone that isn't `target` just repeats it onward to its own
+//!    links. When `target` receives it, `target` decides accept or not (see
+//!    [`Pairing`]): if it accepts, it **stops** whatever antenna behavior it
+//!    was doing for that slot and floods an `Accept` back; if not, it just
+//!    continues — no reply.
+//! 2. **Accept** — floods back the same way. When it reaches `requester`,
+//!    *requester* makes the same stop-or-continue call: if this is still the
+//!    request it's waiting on, it stops (commits) and floods a `Position`;
+//!    if it already committed to a different accept (or isn't waiting on
+//!    this id anymore), it just continues — the accept is dropped.
+//! 3. **Position** — floods to `target`, carrying the requester's position.
+//!    Receiving it is what "the pairing begins" means: both sides now know
+//!    the other's identity and the requester's position.
+//!
+//! Two rules make this work as a flood instead of infinite re-broadcast:
+//!
+//! - **No throttle.** Unlike headers (`HEADER_INTERVAL_SECS`), these are
+//!   forwarded the instant they're received — priority traffic, not gossip.
+//! - **Dedup by `(id, phase)`.** Every drone remembers which
+//!   `(request_id, phase)` pairs it has already processed ([`Pairing::seen`]).
+//!   Seeing the same pair again — whether as the addressed recipient or just a
+//!   repeater — is a no-op: don't reprocess, don't re-forward. This is what
+//!   stops the flood from looping forever around the mesh. (Keyed on
+//!   `(id, phase)` rather than bare id so a repeater that already forwarded
+//!   the `Request` still forwards the later `Accept`/`Position` for the same
+//!   id — split-horizon on `from` handles the rest.)
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -154,6 +190,45 @@ pub struct MeshTable(pub HashMap<String, MeshRow>);
 #[derive(Component)]
 pub struct RingIndex(pub usize);
 
+/// Where this drone currently is in (at most) one in-flight reconnection
+/// handshake. See the module docs, "Reconnection handshake (priority)".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum PairingState {
+    #[default]
+    Idle,
+    /// I flooded a `Request` for `target` and I'm waiting on its `Accept`.
+    AwaitingAccept { request_id: String, target: String },
+    /// I accepted `requester`'s `Request` and stopped for them; waiting on
+    /// their `Position` to complete the pairing.
+    AcceptedAwaitingPosition { request_id: String, requester: String },
+    /// Handshake complete — paired with `peer`.
+    Paired { request_id: String, peer: String },
+}
+
+/// This drone's reconnection-handshake state.
+///
+/// - `state` — where this drone is in (at most) one in-flight handshake.
+/// - `seen` — every `(request_id, phase)` it has already processed, as either
+///   the addressed party or a mid-flood repeater. A duplicate sighting of the
+///   same pair is dropped: not reprocessed, not re-forwarded. Keyed on
+///   *`(id, phase)`*, not bare id, so forwarding the `Request` phase doesn't
+///   make a repeater wrongly swallow the later `Accept`/`Position` phases that
+///   share the same id.
+/// - `frozen` — when true, this drone has "stopped": antenna slew is held so a
+///   lock can be acquired/kept (`tracking`/`seeking` skip re-aiming). Never
+///   touches the airframe — flight stays under `navigation`.
+/// - `paired_peer_pos` — the requester's base-relative position, learned by
+///   the target when the `Position` message lands. `Some` once paired.
+///
+/// See the module docs, "Reconnection handshake (priority)".
+#[derive(Component, Default)]
+pub struct Pairing {
+    pub state: PairingState,
+    pub seen: HashSet<(String, u8)>,
+    pub frozen: bool,
+    pub paired_peer_pos: Option<Vec3>,
+}
+
 /// Everything a drone needs to take part in the mesh.
 #[derive(Bundle)]
 pub struct NetworkingBundle {
@@ -165,6 +240,7 @@ pub struct NetworkingBundle {
     pub mesh_table: MeshTable,
     pub ring_index: RingIndex,
     pub tracked_peers: TrackedPeers,
+    pub pairing: Pairing,
 }
 
 impl NetworkingBundle {
@@ -178,6 +254,7 @@ impl NetworkingBundle {
             mesh_table: MeshTable::default(),
             ring_index: RingIndex(ring_index),
             tracked_peers: TrackedPeers::default(),
+            pairing: Pairing::default(),
         }
     }
 }
@@ -240,6 +317,76 @@ pub struct Packet {
 /// In-flight packets, keyed by target drone. Drained every frame.
 #[derive(Resource, Default)]
 pub struct Mailbox(pub Vec<(Entity, Packet)>);
+
+// ─── Reconnection handshake ─────────────────────────────────────────────────────
+
+/// The three message kinds (phases) of the reconnection handshake, each
+/// carrying the same `request_id`. See the module docs.
+#[derive(Clone, Debug)]
+pub enum ReconnectKind {
+    /// Requester → target: "reconnect to me". Floods until it reaches
+    /// `target`, which accepts (stops + floods `Accept`) or ignores it.
+    Request,
+    /// Target → requester: "accepted, I've stopped". Floods back.
+    Accept,
+    /// Requester → target: requester's base-relative position; receiving it
+    /// starts the pairing. Floods forward. `payload` carries the position.
+    Position { payload: Vec3 },
+}
+
+/// Phase discriminant for dedup keys — `(request_id, phase)`. Distinct from
+/// [`ReconnectKind`] because the dedup key must ignore the `Position`
+/// payload.
+pub const PHASE_REQUEST: u8 = 0;
+pub const PHASE_ACCEPT: u8 = 1;
+pub const PHASE_POSITION: u8 = 2;
+
+impl ReconnectKind {
+    pub fn phase(&self) -> u8 {
+        match self {
+            ReconnectKind::Request => PHASE_REQUEST,
+            ReconnectKind::Accept => PHASE_ACCEPT,
+            ReconnectKind::Position { .. } => PHASE_POSITION,
+        }
+    }
+}
+
+/// One reconnection message in flight across the mesh flood. Addressed by
+/// UUID (`requester`/`target`), because it hops through arbitrary repeater
+/// drones that only know peers by UUID. Each hop is one RF transmission along
+/// one live antenna link.
+#[derive(Clone, Debug)]
+pub struct ReconnectMsg {
+    /// Unique per originating request. Dedup keys off `(request_id, phase)` —
+    /// see [`Pairing::seen`].
+    pub request_id: String,
+    pub kind: ReconnectKind,
+    /// UUID of the drone that started the handshake.
+    pub requester: String,
+    /// UUID of the drone being reconnected to.
+    pub target: String,
+    /// Entity this copy is delivered to this hop. The flood re-addresses a
+    /// fresh copy to each of a repeater's live-link peers.
+    pub to: Entity,
+    /// Entity that transmitted this copy — used for split-horizon, so a
+    /// repeater never bounces a message straight back the way it came.
+    pub from: Entity,
+}
+
+/// Priority bus for reconnection messages. Separate from [`Mailbox`] and
+/// drained-then-refilled every frame with zero throttle: a drone forwards the
+/// instant it receives, it does not wait `HEADER_INTERVAL_SECS`. Because a
+/// forward this frame lands in next frame's bus, propagation is naturally one
+/// hop per frame — no whole-mesh teleport in a single tick.
+#[derive(Resource, Default)]
+pub struct ReconnectBus(pub Vec<ReconnectMsg>);
+
+/// Queue of reconnection attempts to kick off (requester_entity, target_uuid).
+/// A UI action, a `seeking` timeout, etc. pushes here; `process_reconnect`
+/// turns each into an initial `Request` flood. Kept as its own resource so
+/// *starting* a handshake doesn't need mutable access to the whole flood.
+#[derive(Resource, Default)]
+pub struct ReconnectRequests(pub Vec<(Entity, String)>);
 
 // ─── Systems ───────────────────────────────────────────────────────────────────
 
@@ -452,7 +599,159 @@ pub fn route_packets(
     mailbox.0 = outgoing;
 }
 
+/// Drive the priority reconnection flood one hop per frame.
+///
+/// Runs every frame, ungated by `HEADER_INTERVAL_SECS` (priority traffic).
+/// Drains [`ReconnectBus`], processes each delivered message at its addressed
+/// drone, and refills the bus with next-hop forwards — so a message advances
+/// exactly one live-link hop per frame. Also drains [`ReconnectRequests`] to
+/// originate new `Request` floods. See the module docs for the full state
+/// machine; this is a direct transcription of it.
+pub fn process_reconnect(
+    mut bus: ResMut<ReconnectBus>,
+    mut requests: ResMut<ReconnectRequests>,
+    bases: Query<&Base>,
+    mut drones: Query<(&DroneUuid, &GlobalTransform, &LinkSet, &mut Pairing)>,
+) {
+    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+    let incoming = std::mem::take(&mut bus.0);
+    let mut outgoing: Vec<ReconnectMsg> = Vec::new();
+
+    // ── Originate new requests ──────────────────────────────────────────────
+    for (requester_entity, target_uuid) in std::mem::take(&mut requests.0) {
+        let Ok((uuid, _gt, links, mut pairing)) = drones.get_mut(requester_entity) else {
+            continue;
+        };
+        // One handshake at a time — ignore new attempts while mid-flight.
+        if !matches!(pairing.state, PairingState::Idle) {
+            continue;
+        }
+        let request_id = new_request_id();
+        pairing.seen.insert((request_id.clone(), PHASE_REQUEST));
+        pairing.state = PairingState::AwaitingAccept {
+            request_id: request_id.clone(),
+            target: target_uuid.clone(),
+        };
+        // Flood the Request out every live link.
+        for &peer in links.connected.keys() {
+            outgoing.push(ReconnectMsg {
+                request_id: request_id.clone(),
+                kind: ReconnectKind::Request,
+                requester: uuid.0.clone(),
+                target: target_uuid.clone(),
+                to: peer,
+                from: requester_entity,
+            });
+        }
+    }
+
+    // ── Process one hop of in-flight messages ───────────────────────────────
+    for msg in incoming {
+        let Ok((uuid, gt, links, mut pairing)) = drones.get_mut(msg.to) else { continue };
+
+        // Dedup on (id, phase): already handled → drop entirely.
+        let key = (msg.request_id.clone(), msg.kind.phase());
+        if pairing.seen.contains(&key) {
+            continue;
+        }
+        pairing.seen.insert(key);
+
+        let me = &uuid.0;
+        let addressed = match msg.kind {
+            ReconnectKind::Request | ReconnectKind::Position { .. } => *me == msg.target,
+            ReconnectKind::Accept => *me == msg.requester,
+        };
+
+        if addressed {
+            match &msg.kind {
+                ReconnectKind::Request => {
+                    // Accept only if not already busy with another handshake.
+                    if matches!(pairing.state, PairingState::Idle) {
+                        pairing.frozen = true; // "stop": hold antenna slew.
+                        pairing.state = PairingState::AcceptedAwaitingPosition {
+                            request_id: msg.request_id.clone(),
+                            requester: msg.requester.clone(),
+                        };
+                        // Originate the Accept flood back out every live link.
+                        for &peer in links.connected.keys() {
+                            outgoing.push(ReconnectMsg {
+                                request_id: msg.request_id.clone(),
+                                kind: ReconnectKind::Accept,
+                                requester: msg.requester.clone(),
+                                target: msg.target.clone(),
+                                to: peer,
+                                from: msg.to,
+                            });
+                        }
+                    }
+                    // else: just continue — no reply.
+                }
+                ReconnectKind::Accept => {
+                    // Requester: stop & send position only if still waiting on
+                    // *this* request; otherwise it already committed elsewhere
+                    // — just continue (drop).
+                    let waiting_on_this = matches!(
+                        &pairing.state,
+                        PairingState::AwaitingAccept { request_id, .. }
+                            if *request_id == msg.request_id
+                    );
+                    if waiting_on_this {
+                        pairing.frozen = true; // "stop".
+                        pairing.state = PairingState::Paired {
+                            request_id: msg.request_id.clone(),
+                            peer: msg.target.clone(),
+                        };
+                        let pos_rel_base = gt.translation() - base_pos;
+                        for &peer in links.connected.keys() {
+                            outgoing.push(ReconnectMsg {
+                                request_id: msg.request_id.clone(),
+                                kind: ReconnectKind::Position { payload: pos_rel_base },
+                                requester: msg.requester.clone(),
+                                target: msg.target.clone(),
+                                to: peer,
+                                from: msg.to,
+                            });
+                        }
+                    }
+                }
+                ReconnectKind::Position { payload } => {
+                    // Target: the pairing begins — record requester's position.
+                    pairing.paired_peer_pos = Some(*payload);
+                    pairing.state = PairingState::Paired {
+                        request_id: msg.request_id.clone(),
+                        peer: msg.requester.clone(),
+                    };
+                    // Terminal for this message — don't forward past the target.
+                }
+            }
+        } else {
+            // Repeater: forward to every live link except where it came from.
+            for &peer in links.connected.keys() {
+                if peer == msg.from {
+                    continue;
+                }
+                outgoing.push(ReconnectMsg {
+                    request_id: msg.request_id.clone(),
+                    kind: msg.kind.clone(),
+                    requester: msg.requester.clone(),
+                    target: msg.target.clone(),
+                    to: peer,
+                    from: msg.to,
+                });
+            }
+        }
+    }
+
+    bus.0 = outgoing;
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────────
+
+/// A fresh random request id (v4-format UUID string) for a reconnection flood.
+pub fn new_request_id() -> String {
+    let seed = fresh_seed(0x1234_5678_9abc_def1);
+    format_uuid_v4(splitmix64(seed), splitmix64(seed ^ 0xa5a5_5a5a_c3c3_3c3c))
+}
 
 /// A unique-ish seed from wall clock XOR a monotonic spawn counter.
 fn fresh_seed(mix: u64) -> u64 {

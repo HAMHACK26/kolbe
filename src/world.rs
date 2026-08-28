@@ -7,6 +7,8 @@ use crate::{
     factories::{DroneAi, movement::DroneKinematics},
     networking::NetworkingBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
+    recovery::{ContactMemory, RecoveryState},
+    seeking::SeekState,
     theme::{Theme, ThemeRole},
     ui::{
         InfoPopup, InfoPopupTable, InfoPopupTitle, NetworkTableButton, NetworkTablePanelText,
@@ -100,6 +102,9 @@ pub fn setup(
                 DroneAi::default(),
                 CommandQueue::default(),
                 NetworkingBundle::random(i),
+                SeekState::default(),
+                RecoveryState::default(),
+                ContactMemory::default(),
                 ThemeRole::Drone,
             ))
             .observe(
