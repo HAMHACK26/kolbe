@@ -3,6 +3,7 @@ mod base;
 mod camera;
 mod drone;
 mod factories;
+mod navigation;
 mod networking;
 mod radar;
 mod spherical;
