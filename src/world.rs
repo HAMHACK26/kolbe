@@ -5,9 +5,15 @@ use crate::{
     camera::OrbitCamera,
     drone::{Drone, DroneType, SelectedDrone, drone_id, make_antenna},
     factories::{DroneAi, movement::DroneKinematics},
+    networking::NetworkingBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
+    recovery::{ContactMemory, RecoveryState},
+    seeking::SeekState,
     theme::{Theme, ThemeRole},
-    ui::{InfoPopup, InfoPopupTable, InfoPopupTitle},
+    ui::{
+        InfoPopup, InfoPopupTable, InfoPopupTitle, NetworkTableButton, NetworkTablePanelText,
+        NetworkTablePopup,
+    },
 };
 
 pub const WORLD_SIZE: f32 = 20.0;
@@ -60,7 +66,9 @@ pub fn setup(
         let az0 = (i as f32 * 137.5) % 360.0;
         let el0 = ((i as f32 * 23.0) % 30.0) - 15.0;
 
-        // Every drone carries exactly 3 antennas, 120° apart. Invariant.
+        // Every drone carries exactly 3 antennas, 120° apart. Initial layout
+        // only — `maintain_mesh_antennas` retargets every frame based on
+        // each drone's ring-index neighbors.
         let antennas = vec![
             make_antenna(az0, el0, i),
             make_antenna((az0 + 120.0) % 360.0, el0, i + 100),
@@ -76,6 +84,10 @@ pub fn setup(
                 DroneKinematics::default(),
                 DroneAi::default(),
                 CommandQueue::default(),
+                NetworkingBundle::random(i),
+                SeekState::default(),
+                RecoveryState::default(),
+                ContactMemory::default(),
                 ThemeRole::Drone,
             ))
             .observe(
@@ -136,6 +148,65 @@ pub fn setup(
                     ..default()
                 },
                 InfoPopupTable,
+            ));
+            p.spawn((
+                Button,
+                Node {
+                    margin: UiRect::top(Val::Px(6.0)),
+                    padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
+                    border_radius: BorderRadius::all(Val::Px(3.0)),
+                    align_self: AlignSelf::FlexStart,
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.12)),
+                NetworkTableButton,
+            ))
+            .observe(
+                |mut t: On<Pointer<Click>>, mut open: ResMut<crate::ui::NetworkTablePanelOpen>| {
+                    t.propagate(false);
+                    open.0 = !open.0;
+                },
+            )
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("View Network Table"),
+                    TextFont { font_size: FontSize::Px(11.0), ..default() },
+                    TextColor(Color::WHITE),
+                ));
+            });
+        });
+
+    // Network table window — a separate popup, same look as the info popup.
+    // Its lifecycle is tied to the info popup (see `update_popup_position`):
+    // closing the info popup closes this too.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(8.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(2.0),
+                max_width: Val::Px(280.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.05, 0.05, 0.88)),
+            Visibility::Hidden,
+            NetworkTablePopup,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("Network Table"),
+                TextFont { font_size: FontSize::Px(13.0), ..default() },
+                TextColor(Color::WHITE),
+            ));
+            p.spawn((
+                Text::new(""),
+                TextFont { font_size: FontSize::Px(11.0), ..default() },
+                TextColor(Color::srgb(0.7, 0.9, 1.0)),
+                NetworkTablePanelText,
             ));
         });
 }

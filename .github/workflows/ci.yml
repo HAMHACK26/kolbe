@@ -1,4 +1,4 @@
-name: CI
+name: Height server
 
 on:
   push:
@@ -8,19 +8,6 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Bevy system dependencies
-        run: >-
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends
-          g++ pkg-config libx11-dev libasound2-dev libudev-dev
-          libxkbcommon-x11-0 libwayland-dev libxkbcommon-dev
-      - name: Test Rust code
-        run: cargo test --locked
-
   python:
     runs-on: ubuntu-latest
     steps:

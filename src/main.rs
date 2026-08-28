@@ -4,9 +4,15 @@ mod base;
 mod camera;
 mod drone;
 mod factories;
+mod navigation;
+mod networking;
 mod radar;
+mod recovery;
+mod seeking;
+mod spherical;
 mod terrain;
 mod theme;
+mod tracking;
 mod ui;
 mod world;
 
@@ -41,6 +47,10 @@ fn main() {
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
         .insert_resource(ClearColor(Color::BLACK))
+        .init_resource::<networking::Mailbox>()
+        .init_resource::<networking::ReconnectBus>()
+        .init_resource::<networking::ReconnectRequests>()
+        .init_resource::<ui::NetworkTablePanelOpen>()
         .add_systems(Startup, (terrain::start_local_server, ui::setup_camera, theme::setup_moon))
         .add_systems(OnEnter(AppState::AreaSelection), area::setup)
         .add_systems(Update, area::interactions.run_if(in_state(AppState::AreaSelection)))
@@ -70,5 +80,27 @@ fn main() {
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
         .add_systems(Update, factories::movement::apply_velocity.run_if(in_state(AppState::Simulation)))
+        .add_systems(
+            Update,
+            networking::advance_clocks.run_if(in_state(AppState::Simulation)),
+        )
+        .add_systems(
+            Update,
+            (
+                // Priority reconnection flood first, so a fresh slew-freeze is
+                // visible to the aiming systems this same frame.
+                networking::process_reconnect,
+                tracking::maintain_mesh_antennas,
+                seeking::seek_lost_links,
+                networking::detect_links_and_send_headers,
+                networking::route_packets,
+                // Partition detection + recovery run last — they need the
+                // freshly (re)detected links and updated mesh table.
+                recovery::detect_partitions,
+                recovery::run_recovery,
+            )
+                .chain()
+                .run_if(in_state(AppState::Simulation)),
+        )
         .run();
 }
