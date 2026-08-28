@@ -25,8 +25,18 @@ jobs:
             libudev-dev \
             pkg-config
 
-      - name: Build
-        run: cargo build --locked --verbose
+      # Fast linker for the large Bevy link step.
+      - name: Install mold
+        uses: rui314/setup-mold@v1
 
-      - name: Run tests
+      # Cache ~/.cargo and target/, keyed on Cargo.lock — the single biggest
+      # win: warm runs skip recompiling the ~560-crate Bevy dependency tree
+      # from scratch.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # `cargo test` compiles the whole tree already, so the old separate
+      # `cargo build` step just built everything twice. One test run covers
+      # build + tests.
+      - name: Build and test
         run: cargo test --locked --verbose

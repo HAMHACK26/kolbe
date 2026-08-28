@@ -304,4 +304,41 @@ mod tests {
         assert!((state.position - target).length() < 0.1);
         assert!(state.velocity.length() < 0.1);
     }
+
+    /// Climb and descent are governed separately and asymmetrically — a quad
+    /// descends slower than it climbs (vortex-ring-state safety margin).
+    #[test]
+    fn climbs_faster_than_it_descends() {
+        let limits = FlightLimits::default();
+
+        // Cruise straight up, far target so it reaches the vertical limit.
+        let mut up = DroneState::default();
+        for _ in 0..200 {
+            navigate(&mut up, Vec3::new(0.0, 1000.0, 0.0), &limits, 0.02);
+        }
+        // Cruise straight down from altitude.
+        let mut down = DroneState { position: Vec3::new(0.0, 1000.0, 0.0), ..Default::default() };
+        for _ in 0..200 {
+            navigate(&mut down, Vec3::ZERO, &limits, 0.02);
+        }
+
+        assert!((up.velocity.y - limits.max_climb_mps).abs() < 0.2, "climb {}", up.velocity.y);
+        assert!(
+            (down.velocity.y + limits.max_descend_mps).abs() < 0.2,
+            "descend {}",
+            down.velocity.y
+        );
+        assert!(up.velocity.y > -down.velocity.y, "climb should be faster than descent");
+    }
+
+    /// A zero or negative timestep is a no-op — nothing moves.
+    #[test]
+    fn zero_dt_is_a_noop() {
+        let limits = FlightLimits::default();
+        let mut state = DroneState { velocity: Vec3::new(1.0, 0.0, 0.0), ..Default::default() };
+        let before = state;
+        navigate(&mut state, Vec3::new(100.0, 0.0, 0.0), &limits, 0.0);
+        assert_eq!(state.position, before.position);
+        assert_eq!(state.velocity, before.velocity);
+    }
 }
