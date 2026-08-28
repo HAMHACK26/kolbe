@@ -83,3 +83,12 @@ pub fn radar_direction(azimuth_deg: f32, elevation_deg: f32) -> Vec3 {
     let el = elevation_deg.to_radians();
     Vec3::new(el.cos() * az.sin(), el.sin(), el.cos() * az.cos()).normalize()
 }
+
+/// Inverse of `radar_direction`: (azimuth_deg in [0,360), elevation_deg) that
+/// points a boresight from `from` toward `to`. Azimuth clockwise from +Z.
+pub fn angles_toward(from: Vec3, to: Vec3) -> (f32, f32) {
+    let d = (to - from).normalize_or_zero();
+    let azimuth_deg = d.x.atan2(d.z).to_degrees().rem_euclid(360.0);
+    let elevation_deg = d.y.clamp(-1.0, 1.0).asin().to_degrees();
+    (azimuth_deg, elevation_deg)
+}
