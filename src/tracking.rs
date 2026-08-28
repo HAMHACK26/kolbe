@@ -20,7 +20,7 @@ use bevy::prelude::*;
 use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
-use crate::networking::RingIndex;
+use crate::networking::{Pairing, RingIndex};
 
 /// Where this drone currently believes a tracked peer *will be*, based
 /// purely on the last header that peer sent — never on omniscient ECS
@@ -54,7 +54,7 @@ pub struct TrackedPeers(pub HashMap<Entity, Vec3>);
 /// This overrides the fixed 120°-apart layout `world::setup` used to compute
 /// the initial angles; those were only ever a starting point.
 pub fn maintain_mesh_antennas(
-    mut drones: Query<(&Transform, &mut Drone, &RingIndex, &TrackedPeers)>,
+    mut drones: Query<(&Transform, &mut Drone, &RingIndex, &TrackedPeers, &Pairing)>,
     positions: Query<(Entity, &Transform, &RingIndex), With<Drone>>,
     bases: Query<&Base>,
 ) {
@@ -68,8 +68,13 @@ pub fn maintain_mesh_antennas(
     ring.sort_by_key(|(i, ..)| *i);
     let n = ring.len();
 
-    for (self_transform, mut drone, self_ring, tracked) in &mut drones {
+    for (self_transform, mut drone, self_ring, tracked, pairing) in &mut drones {
         if n == 0 {
+            continue;
+        }
+        // "Stopped" for a reconnection handshake — hold antenna slew steady so
+        // a lock can be acquired/kept. Don't re-aim this frame.
+        if pairing.frozen {
             continue;
         }
         let self_pos = self_transform.translation;
