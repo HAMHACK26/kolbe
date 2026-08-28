@@ -3,7 +3,9 @@ mod base;
 mod camera;
 mod drone;
 mod factories;
+mod networking;
 mod radar;
+mod spherical;
 mod theme;
 mod ui;
 mod world;
@@ -29,6 +31,8 @@ fn main() {
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
         .insert_resource(ClearColor(Color::BLACK))
+        .init_resource::<networking::Mailbox>()
+        .init_resource::<ui::NetworkTablePanelOpen>()
         .add_systems(Startup, world::setup)
         .add_systems(Startup, base::spawn_base)
         .add_systems(Startup, theme::setup_moon)
@@ -39,5 +43,15 @@ fn main() {
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
         .add_systems(Update, factories::movement::apply_velocity)
+        .add_systems(Update, networking::advance_clocks)
+        .add_systems(
+            Update,
+            (
+                networking::maintain_mesh_antennas,
+                networking::detect_links_and_send_headers,
+                networking::route_packets,
+            )
+                .chain(),
+        )
         .run();
 }
