@@ -18,9 +18,9 @@ Our headers are sent with every request and are structured as follows:
 
 Note that the connected antenna is the direction of the antenna on the receiver, we use this to calculate the vector in its lookup table.
 
-We use the connected antenna vector as a reference to see what the drone considers to be its front. This + the gravity vector (as mentioned in our [coordinates notes](navigation.md)) allows us to extrapolate the vectors for all other drones, more on that later.
+We use the connected antenna vector as a reference to see what the drone considers to be its front. This + the gravity vector (as mentioned in our [coordinates notes](coordinates.md)) allows us to extrapolate the vectors for all other drones, more on that later.
 
-We use the flight direction for our assisted conical scan and the time received to calculate the length of the vector as mentioned in our [coordinates notes](navigation.md).
+We use the flight direction for our assisted conical scan and the time received to calculate the length of the vector as mentioned in our [coordinates notes](coordinates.md).
 
 ## Lookup Table
 
