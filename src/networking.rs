@@ -15,8 +15,9 @@
 //! | ---- | ----------------- | ---------------- | ------------- |
 //! | UUID | vector            | vector           | datetime      |
 //!
-//! `connected antenna` = this drone's position vector relative to the base
-//! (not the antenna's own pointing direction).
+//! `connected antenna` = the exchange originator's local direction toward its
+//! direct neighbour. When the header returns as an echo, that originator is
+//! the receiver and combines the direction with gravity and its base anchor.
 //!
 //! ## Ranging (ping-pong)
 //!
@@ -35,8 +36,8 @@
 //! ## Mesh table (body)
 //!
 //! Every header send also carries the sender's full picture of the mesh — one
-//! row per drone it knows about, itself excluded (the receiver already learns
-//! the sender directly, at distance 0, from the header itself):
+//! row per drone it knows about, itself excluded (each exchange originator
+//! learns its responder directly after the ranging echo returns):
 //!
 //! | id   | timestamp | location | neighbour distance | connections |
 //! | ---- | --------- | -------- | ------------------- | ----------- |
@@ -45,17 +46,14 @@
 //! `neighbour distance` is hop count (0 = a direct connection). `connections`
 //! is that row's drone's own *direct* peers.
 //!
-//! On receipt (`route_packets`, `PacketKind::Header` arm):
-//! - The sender itself is upserted as a distance-0 row (direct connection, so
-//!   the receiver stamps it with its **own** clock — direct knowledge is
-//!   always fresh).
+//! On receipt (`route_packets`):
+//! - A completed echo upserts its responder as a distance-0 row, stamped on
+//!   the originator's own clock and projected through its base-frame anchor.
 //! - Every other row in the body is a candidate at `row.neighbour_distance +
-//!   1` (one hop further than it was from the sender). A brand-new id is
-//!   added at that distance; a known id is only updated if the new path is
-//!   strictly shorter (standard distance-vector relaxation).
-//! - Relaxed/added rows keep the **incoming** timestamp, never the receiver's
-//!   own clock — only a direct connection (distance 0) gets a fresh stamp.
-//!   This is how staleness/provenance survives being relayed through the mesh.
+//!   1`. A shorter path wins immediately; another valid path may replace it
+//!   after `HEADER_INTERVAL_SECS * (n + 1)` without an update.
+//! - Relayed row age is measured on the sender's clock and rebased onto the
+//!   receiver's clock. No comparison crosses independent clock domains.
 //!
 //! ## Reconnection handshake (priority)
 //!
@@ -105,6 +103,9 @@ use crate::factories::movement::DroneKinematics;
 use crate::spherical::SphericalVec;
 use crate::tracking::TrackedPeers;
 
+/// Numeric tolerance used when validating a closed yaw loop.
+pub const LOOP_CLOSURE_TOLERANCE_RAD: f32 = 1.0e-5;
+
 /// How far ahead the flight-direction vector predicts (seconds).
 pub const FLIGHT_LOOKAHEAD_SECS: f32 = 0.1;
 
@@ -129,7 +130,10 @@ impl DroneUuid {
     /// every drone gets a distinct value.
     pub fn random() -> Self {
         let seed = fresh_seed(0x9e3779b97f4a7c15);
-        DroneUuid(format_uuid_v4(splitmix64(seed), splitmix64(seed ^ 0xD1B54A32D192ED03)))
+        DroneUuid(format_uuid_v4(
+            splitmix64(seed),
+            splitmix64(seed ^ 0xD1B54A32D192ED03),
+        ))
     }
 }
 
@@ -185,6 +189,294 @@ pub struct MeshRow {
 #[derive(Component, Default)]
 pub struct MeshTable(pub HashMap<String, MeshRow>);
 
+/// The receiver's continuously maintained relationship to the shared base
+/// frame. Protocol projection reads this component instead of ECS world truth.
+#[derive(Component, Clone, Debug)]
+pub struct BaseFrameReference {
+    pub own_location_base: Vec3,
+    pub local_direction_to_base: Vec3,
+    pub gravity_up_local: Vec3,
+}
+
+/// One measured, directed orientation edge used by yaw-only loop closure.
+/// All timestamps are in the owning drone's local clock domain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct YawObservation {
+    pub from: String,
+    pub to: String,
+    pub measured_yaw_rad: f32,
+    pub corrected_yaw_rad: f32,
+    pub vector_length: f32,
+    pub neighbour_distance: u32,
+    pub timestamp: f64,
+    pub generation: u64,
+}
+
+/// Network representation of a directed yaw observation. Corrections are
+/// deliberately absent: every receiver computes those from its own graph.
+#[derive(Clone, Debug)]
+pub struct YawObservationMessage {
+    pub from: String,
+    pub to: String,
+    pub measured_yaw_rad: f32,
+    pub vector_length: f32,
+    pub neighbour_distance: u32,
+    pub timestamp: f64,
+    pub generation: u64,
+}
+
+impl From<&YawObservation> for YawObservationMessage {
+    fn from(edge: &YawObservation) -> Self {
+        Self {
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            measured_yaw_rad: edge.measured_yaw_rad,
+            vector_length: edge.vector_length,
+            neighbour_distance: edge.neighbour_distance,
+            timestamp: edge.timestamp,
+            generation: edge.generation,
+        }
+    }
+}
+
+/// The correction applied to an edge by [`close_yaw_loop`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct YawCorrection {
+    pub from: String,
+    pub to: String,
+    pub delta_rad: f32,
+}
+
+/// Directed yaw observations known to this drone.
+#[derive(Component, Default)]
+pub struct YawObservationTable {
+    pub edges: HashMap<(String, String), YawObservation>,
+    next_generation: u64,
+}
+
+impl YawObservationTable {
+    pub fn corrected_yaw(&self, from: &str, to: &str) -> Option<f32> {
+        self.edges
+            .get(&(from.to_owned(), to.to_owned()))
+            .map(|edge| edge.corrected_yaw_rad)
+    }
+
+    fn next_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.next_generation
+    }
+}
+
+/// Project a receiver-local antenna observation into the shared base frame.
+///
+/// Gravity fixes pitch. The horizontal direction to the base fixes the one
+/// remaining degree of freedom (yaw). `own_location_base` is the receiver's
+/// base-frame position and `local_base_direction` is its locally observed
+/// direction toward the base.
+pub fn project_direct_observation_to_base(
+    local_antenna_direction: Vec3,
+    gravity_up_local: Vec3,
+    local_base_direction: Vec3,
+    own_location_base: Vec3,
+    distance: f32,
+) -> Option<Vec3> {
+    if !local_antenna_direction.is_finite()
+        || !gravity_up_local.is_finite()
+        || !local_base_direction.is_finite()
+        || !own_location_base.is_finite()
+        || !distance.is_finite()
+        || distance < 0.0
+    {
+        return None;
+    }
+    let up = gravity_up_local.try_normalize()?;
+    let local_forward =
+        (local_base_direction - up * local_base_direction.dot(up)).try_normalize()?;
+    let local_right = up.cross(local_forward).try_normalize()?;
+
+    let base_up = Vec3::Y;
+    let base_forward =
+        (-own_location_base + base_up * own_location_base.dot(base_up)).try_normalize()?;
+    let base_right = base_up.cross(base_forward).try_normalize()?;
+    let local = local_antenna_direction.try_normalize()?;
+    let direction_base = base_forward * local.dot(local_forward)
+        + base_right * local.dot(local_right)
+        + base_up * local.dot(up);
+    Some(own_location_base + direction_base.normalize_or_zero() * distance)
+}
+
+fn row_is_valid(row: &MeshRow) -> bool {
+    !row.id.is_empty()
+        && row.timestamp.is_finite()
+        && row.location.is_finite()
+        && row.connections.iter().all(|id| !id.is_empty())
+}
+
+fn rebase_timestamp(sender_now: f64, incoming_timestamp: f64, receiver_now: f64) -> Option<f64> {
+    if !sender_now.is_finite() || !incoming_timestamp.is_finite() || !receiver_now.is_finite() {
+        return None;
+    }
+    let age = sender_now - incoming_timestamp;
+    if age < 0.0 || !age.is_finite() {
+        return None;
+    }
+    Some(receiver_now - age)
+}
+
+fn relayed_neighbour_distance(distance: u32) -> Option<u32> {
+    distance.checked_add(1)
+}
+
+/// Whether an incoming row may replace the last valid observation.
+/// Shorter paths win immediately. Otherwise the current path gets its
+/// documented `u_t * (n + 1)` update window before a valid candidate wins.
+pub fn should_replace_row(existing: &MeshRow, candidate: &MeshRow, now: f64) -> bool {
+    if !row_is_valid(candidate) || !now.is_finite() {
+        return false;
+    }
+    candidate.neighbour_distance < existing.neighbour_distance
+        || now - existing.timestamp
+            >= HEADER_INTERVAL_SECS * (existing.neighbour_distance as f64 + 1.0)
+}
+
+fn yaw_observation_is_valid(edge: &YawObservation) -> bool {
+    !edge.from.is_empty()
+        && !edge.to.is_empty()
+        && edge.from != edge.to
+        && edge.measured_yaw_rad.is_finite()
+        && edge.corrected_yaw_rad.is_finite()
+        && edge.vector_length.is_finite()
+        && edge.vector_length >= 0.0
+        && edge.timestamp.is_finite()
+}
+
+fn should_replace_yaw(existing: &YawObservation, candidate: &YawObservation, now: f64) -> bool {
+    yaw_observation_is_valid(candidate)
+        && (candidate.neighbour_distance < existing.neighbour_distance
+            || now - existing.timestamp
+                >= HEADER_INTERVAL_SECS * (existing.neighbour_distance as f64 + 1.0))
+}
+
+pub fn wrap_yaw_rad(yaw: f32) -> f32 {
+    (yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+/// Distribute a loop's signed yaw residual by confidence weight. Corrections
+/// are calculated completely before being committed, so invalid input cannot
+/// partially mutate the edge table. Vector lengths are never modified.
+pub fn close_yaw_loop(edges: &mut [YawObservation]) -> Option<Vec<YawCorrection>> {
+    if edges.len() < 3 {
+        return None;
+    }
+    for pair in edges.windows(2) {
+        if pair[0].to != pair[1].from {
+            return None;
+        }
+    }
+    if edges.last()?.to != edges.first()?.from {
+        return None;
+    }
+    if edges.iter().any(|edge| {
+        !edge.measured_yaw_rad.is_finite()
+            || !edge.vector_length.is_finite()
+            || edge.vector_length < 0.0
+    }) {
+        return None;
+    }
+    let residual = wrap_yaw_rad(edges.iter().map(|edge| edge.measured_yaw_rad).sum());
+    let weight_sum: f32 = edges
+        .iter()
+        .map(|edge| edge.neighbour_distance as f32 + 1.0)
+        .sum();
+    let updates: Vec<(f32, f32)> = edges
+        .iter()
+        .map(|edge| {
+            let delta = -residual * (edge.neighbour_distance as f32 + 1.0) / weight_sum;
+            (delta, wrap_yaw_rad(edge.measured_yaw_rad + delta))
+        })
+        .collect();
+    let mut corrections = Vec::with_capacity(edges.len());
+    for (edge, (delta, corrected)) in edges.iter_mut().zip(updates) {
+        edge.corrected_yaw_rad = corrected;
+        corrections.push(YawCorrection {
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            delta_rad: delta,
+        });
+    }
+    debug_assert!(
+        wrap_yaw_rad(edges.iter().map(|edge| edge.corrected_yaw_rad).sum()).abs()
+            <= LOOP_CLOSURE_TOLERANCE_RAD
+    );
+    Some(corrections)
+}
+
+/// Discover deterministic directed loops from lookup-table `connections`.
+/// References to missing rows are ignored, so incomplete gossip cannot form
+/// a loop or mutate the table.
+pub fn discover_loops(table: &MeshTable) -> Vec<Vec<String>> {
+    fn canonical_rotation(path: &[String]) -> Vec<String> {
+        let mut candidates = Vec::with_capacity(path.len());
+        for offset in 0..path.len() {
+            let mut candidate = path.to_vec();
+            candidate.rotate_left(offset);
+            candidates.push(candidate);
+        }
+        candidates.into_iter().min().unwrap()
+    }
+
+    fn undirected_key(path: &[String]) -> Vec<String> {
+        canonical_rotation(path).min(canonical_rotation(
+            &path.iter().rev().cloned().collect::<Vec<_>>(),
+        ))
+    }
+
+    fn visit(
+        table: &MeshTable,
+        start: &str,
+        current: &str,
+        path: &mut Vec<String>,
+        visited: &mut HashSet<String>,
+        cycles: &mut HashMap<Vec<String>, Vec<String>>,
+    ) {
+        let Some(row) = table.0.get(current).filter(|row| row_is_valid(row)) else {
+            return;
+        };
+        let mut neighbours = row.connections.clone();
+        neighbours.sort();
+        neighbours.dedup();
+        for next in neighbours {
+            if !table.0.get(&next).is_some_and(row_is_valid) {
+                continue;
+            }
+            if next == start {
+                if path.len() >= 3 {
+                    let directed = canonical_rotation(path);
+                    cycles.entry(undirected_key(path)).or_insert(directed);
+                }
+            } else if !visited.contains(&next) {
+                visited.insert(next.clone());
+                path.push(next.clone());
+                visit(table, start, &next, path, visited, cycles);
+                path.pop();
+                visited.remove(&next);
+            }
+        }
+    }
+
+    let mut starts: Vec<String> = table.0.keys().cloned().collect();
+    starts.sort();
+    let mut cycles = HashMap::new();
+    for start in starts {
+        let mut path = vec![start.clone()];
+        let mut visited = HashSet::from([start.clone()]);
+        visit(table, &start, &start, &mut path, &mut visited, &mut cycles);
+    }
+    let mut loops: Vec<Vec<String>> = cycles.into_values().collect();
+    loops.sort();
+    loops
+}
+
 /// This drone's fixed position in the ring formation (0..N). Used only to
 /// pick its two direct mesh neighbors — see `crate::tracking::maintain_mesh_antennas`.
 #[derive(Component)]
@@ -200,7 +492,10 @@ pub enum PairingState {
     AwaitingAccept { request_id: String, target: String },
     /// I accepted `requester`'s `Request` and stopped for them; waiting on
     /// their `Position` to complete the pairing.
-    AcceptedAwaitingPosition { request_id: String, requester: String },
+    AcceptedAwaitingPosition {
+        request_id: String,
+        requester: String,
+    },
     /// Handshake complete — paired with `peer`.
     Paired { request_id: String, peer: String },
 }
@@ -238,6 +533,7 @@ pub struct NetworkingBundle {
     pub sent: SentHeaders,
     pub ranging: RangingResults,
     pub mesh_table: MeshTable,
+    pub yaw_observations: YawObservationTable,
     pub ring_index: RingIndex,
     pub tracked_peers: TrackedPeers,
     pub pairing: Pairing,
@@ -252,6 +548,7 @@ impl NetworkingBundle {
             sent: SentHeaders::default(),
             ranging: RangingResults::default(),
             mesh_table: MeshTable::default(),
+            yaw_observations: YawObservationTable::default(),
             ring_index: RingIndex(ring_index),
             tracked_peers: TrackedPeers::default(),
             pairing: Pairing::default(),
@@ -266,8 +563,10 @@ impl NetworkingBundle {
 pub struct NetworkHeader {
     /// Sending drone's UUID.
     pub id: String,
-    /// Sender's position vector relative to the base.
+    /// Sender-local unit direction from the sender toward this direct peer.
     pub connected_antenna: Vec3,
+    /// Directly observed orientation offset from sender to receiver.
+    pub relative_yaw_rad: f32,
     /// Where the drone will be, relative to now, in `FLIGHT_LOOKAHEAD_SECS`
     /// (= velocity · lookahead). Zero while hovering.
     pub flight_direction: Vec3,
@@ -295,6 +594,7 @@ pub struct Packet {
     pub origin: Entity,
     /// Drone that echoes it back.
     pub responder: Entity,
+    pub responder_id: String,
     pub origin_pos: Vec3,
     /// The header itself — only meaningful for `PacketKind::Header`, but kept
     /// (cheaply cloned) on the echo too so ranging can read `time_received`
@@ -303,12 +603,11 @@ pub struct Packet {
     /// Sender's mesh body table (its non-self rows) — see module docs.
     /// Only sent with `PacketKind::Header`.
     pub body: Vec<MeshRow>,
-    /// UUIDs the sender is *directly* connected to right now — how the
-    /// receiver fills in `connections` for the sender's own upserted row.
-    pub origin_connections: Vec<String>,
-
+    /// Sender's directed yaw observations, rebased by the receiver on merge.
+    pub yaw_body: Vec<YawObservationMessage>,
     // Echo-only fields, filled by the responder.
     pub responder_pos: Vec3,
+    pub responder_connections: Vec<String>,
     pub responder_delay: f64,
     /// Modeled arrival time back at the originator, on the originator's clock.
     pub arrival_time: f64,
@@ -398,6 +697,41 @@ pub fn advance_clocks(time: Res<Time>, mut clocks: Query<&mut DroneClock>) {
     }
 }
 
+/// Seed the base-frame anchor once, then dead-reckon it from the drone's own
+/// kinematics. Only this sensor-boundary system reads world transforms.
+#[allow(clippy::type_complexity)]
+pub fn maintain_base_frame_references(
+    mut commands: Commands,
+    time: Res<Time>,
+    bases: Query<&Base>,
+    missing: Query<
+        (Entity, &GlobalTransform, &DroneKinematics),
+        (With<Drone>, Without<BaseFrameReference>),
+    >,
+    mut existing: Query<(&DroneKinematics, &mut BaseFrameReference), With<Drone>>,
+) {
+    let Some(base_pos) = bases.iter().next().map(|base| base.position) else {
+        return;
+    };
+    for (entity, transform, kinematics) in &missing {
+        let own_location_base = transform.translation() - base_pos;
+        let local_direction_to_base = Quat::from_rotation_y(-kinematics.heading_deg.to_radians())
+            * (-own_location_base).normalize_or_zero();
+        commands.entity(entity).insert(BaseFrameReference {
+            own_location_base,
+            local_direction_to_base,
+            gravity_up_local: Vec3::Y,
+        });
+    }
+    let dt = time.delta_secs();
+    for (kinematics, mut reference) in &mut existing {
+        reference.own_location_base += kinematics.velocity * dt;
+        reference.local_direction_to_base =
+            Quat::from_rotation_y(-kinematics.heading_deg.to_radians())
+                * (-reference.own_location_base).normalize_or_zero();
+    }
+}
+
 /// Detect peer radio links and, every `HEADER_INTERVAL_SECS` while a link
 /// stays up, emit a header and send it to the peer.
 ///
@@ -417,39 +751,38 @@ pub fn detect_links_and_send_headers(
         &mut LinkSet,
         &mut SentHeaders,
         &MeshTable,
+        &YawObservationTable,
     )>,
-    positions: Query<(Entity, &GlobalTransform), With<Drone>>,
+    positions: Query<(Entity, &GlobalTransform, &DroneKinematics), With<Drone>>,
     uuids: Query<&DroneUuid>,
-    bases: Query<&Base>,
 ) {
-    // `connected_antenna` is this drone's position vector relative to base —
-    // not the antenna's own pointing direction.
-    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
-
-    for (self_entity, self_gt, drone, kin, clock, uuid, mut links, mut sent, table) in &mut drones
+    for (self_entity, self_gt, drone, kin, clock, uuid, mut links, mut sent, table, yaw_table) in
+        &mut drones
     {
         let self_pos = self_gt.translation();
-        let vector_from_base = self_pos - base_pos;
-
         // All peers currently detected (regardless of resend cadence) — this
         // is what `connections` means for our own upserted row on the peer.
         let detected: Vec<Entity> = positions
             .iter()
-            .filter(|(peer_entity, peer_gt)| {
+            .filter(|(peer_entity, peer_gt, _)| {
                 *peer_entity != self_entity && {
                     let peer_pos = peer_gt.translation();
                     let distance_km = (peer_pos - self_pos).length();
                     drone.antennas.iter().any(|antenna| {
-                        let theta_tx = antenna.off_boresight_deg(kin.heading_deg, self_pos, peer_pos);
+                        let theta_tx =
+                            antenna.off_boresight_deg(kin.heading_deg, self_pos, peer_pos);
                         antenna.rssi_dbm(theta_tx, 0.0, distance_km) >= antenna.sensitivity_dbm
                     })
                 }
             })
-            .map(|(peer_entity, _)| peer_entity)
+            .map(|(peer_entity, _, _)| peer_entity)
             .collect();
-        let origin_connections: Vec<String> =
-            detected.iter().filter_map(|e| uuids.get(*e).ok().map(|u| u.0.clone())).collect();
         let body: Vec<MeshRow> = table.0.values().cloned().collect();
+        let yaw_body: Vec<YawObservationMessage> = yaw_table
+            .edges
+            .values()
+            .map(YawObservationMessage::from)
+            .collect();
 
         let mut detected_now: std::collections::HashMap<Entity, f64> =
             std::collections::HashMap::new();
@@ -467,9 +800,17 @@ pub fn detect_links_and_send_headers(
             }
             detected_now.insert(peer_entity, clock.now);
 
+            let Ok((_, peer_gt, peer_kin)) = positions.get(peer_entity) else {
+                continue;
+            };
+            let local_direction = Quat::from_rotation_y(-kin.heading_deg.to_radians())
+                * (peer_gt.translation() - self_pos).normalize_or_zero();
             let header = NetworkHeader {
                 id: uuid.0.clone(),
-                connected_antenna: vector_from_base,
+                connected_antenna: local_direction,
+                relative_yaw_rad: wrap_yaw_rad(
+                    peer_kin.heading_deg.to_radians() - kin.heading_deg.to_radians(),
+                ),
                 flight_direction: kin.velocity * FLIGHT_LOOKAHEAD_SECS,
                 time_received: clock.now,
             };
@@ -479,11 +820,13 @@ pub fn detect_links_and_send_headers(
                     kind: PacketKind::Header,
                     origin: self_entity,
                     responder: peer_entity,
+                    responder_id: uuids.get(peer_entity).unwrap().0.clone(),
                     origin_pos: self_pos,
                     header: header.clone(),
                     body: body.clone(),
-                    origin_connections: origin_connections.clone(),
+                    yaw_body: yaw_body.clone(),
                     responder_pos: Vec3::ZERO,
+                    responder_connections: Vec::new(),
                     responder_delay: 0.0,
                     arrival_time: 0.0,
                 },
@@ -498,17 +841,26 @@ pub fn detect_links_and_send_headers(
 
 /// Route packets: peers echo headers back (ranging) and merge the sender's
 /// mesh body table into their own (see module docs for the merge rule).
+#[allow(clippy::type_complexity)]
 pub fn route_packets(
     mut mailbox: ResMut<Mailbox>,
     mut drones: Query<(
+        Entity,
         &GlobalTransform,
         &mut RangingResults,
         &DroneUuid,
         &DroneClock,
+        &LinkSet,
         &mut MeshTable,
+        &mut YawObservationTable,
         &mut TrackedPeers,
+        Option<&BaseFrameReference>,
     )>,
 ) {
+    let uuid_by_entity: HashMap<Entity, String> = drones
+        .iter()
+        .map(|(entity, _, _, uuid, ..)| (entity, uuid.0.clone()))
+        .collect();
     let packets = std::mem::take(&mut mailbox.0);
     let mut outgoing: Vec<(Entity, Packet)> = Vec::new();
 
@@ -516,8 +868,18 @@ pub fn route_packets(
         match pkt.kind {
             PacketKind::Header => {
                 // `target` is the responder.
-                let Ok((resp_gt, _, resp_uuid, resp_clock, mut resp_table, mut resp_tracked)) =
-                    drones.get_mut(target)
+                let Ok((
+                    _,
+                    resp_gt,
+                    _,
+                    resp_uuid,
+                    resp_clock,
+                    resp_links,
+                    mut resp_table,
+                    mut resp_yaw,
+                    mut resp_tracked,
+                    _,
+                )) = drones.get_mut(target)
                 else {
                     continue;
                 };
@@ -530,46 +892,87 @@ pub fn route_packets(
                 // target instead of aiming at (comms-wise) unknowable live
                 // ground truth. This never touches the responder's own
                 // position/velocity.
-                resp_tracked.0.insert(pkt.origin, pkt.origin_pos + pkt.header.flight_direction);
+                resp_tracked
+                    .0
+                    .insert(pkt.origin, pkt.origin_pos + pkt.header.flight_direction);
 
                 // Relay-merge every third-party row: one hop further than it
                 // was from the sender, and only if that's an improvement.
-                // Timestamp is never touched here — only a direct connection
-                // (handled below) is allowed to stamp our own clock.
+                // Preserve the sender-relative age while rebasing the stored
+                // timestamp into this receiver's independent clock domain.
                 for row in &pkt.body {
                     if row.id == resp_uuid.0 || row.id == pkt.header.id {
                         continue;
                     }
-                    let candidate_distance = row.neighbour_distance + 1;
+                    let Some(candidate_distance) =
+                        relayed_neighbour_distance(row.neighbour_distance)
+                    else {
+                        continue;
+                    };
+                    let Some(timestamp) =
+                        rebase_timestamp(pkt.header.time_received, row.timestamp, resp_clock.now)
+                    else {
+                        continue;
+                    };
+                    let candidate = MeshRow {
+                        id: row.id.clone(),
+                        timestamp,
+                        location: row.location,
+                        neighbour_distance: candidate_distance,
+                        connections: row.connections.clone(),
+                    };
                     match resp_table.0.get_mut(&row.id) {
-                        Some(existing) if candidate_distance < existing.neighbour_distance => {
-                            existing.location = row.location;
-                            existing.connections = row.connections.clone();
-                            existing.neighbour_distance = candidate_distance;
-                            existing.timestamp = row.timestamp;
+                        Some(existing)
+                            if should_replace_row(existing, &candidate, resp_clock.now) =>
+                        {
+                            *existing = candidate;
                         }
                         Some(_) => {}
                         None => {
-                            resp_table.0.insert(row.id.clone(), MeshRow {
-                                id: row.id.clone(),
-                                timestamp: row.timestamp,
-                                location: row.location,
-                                neighbour_distance: candidate_distance,
-                                connections: row.connections.clone(),
-                            });
+                            if row_is_valid(&candidate) {
+                                resp_table.0.insert(row.id.clone(), candidate);
+                            }
                         }
                     }
                 }
 
-                // The sender is a live direct connection right now — always
-                // upsert at distance 0 with our own clock's current time.
-                resp_table.0.insert(pkt.header.id.clone(), MeshRow {
-                    id: pkt.header.id.clone(),
-                    timestamp: resp_clock.now,
-                    location: pkt.header.connected_antenna,
-                    neighbour_distance: 0,
-                    connections: pkt.origin_connections.clone(),
-                });
+                for incoming in &pkt.yaw_body {
+                    let Some(neighbour_distance) =
+                        relayed_neighbour_distance(incoming.neighbour_distance)
+                    else {
+                        continue;
+                    };
+                    let Some(timestamp) = rebase_timestamp(
+                        pkt.header.time_received,
+                        incoming.timestamp,
+                        resp_clock.now,
+                    ) else {
+                        continue;
+                    };
+                    let candidate = YawObservation {
+                        from: incoming.from.clone(),
+                        to: incoming.to.clone(),
+                        measured_yaw_rad: incoming.measured_yaw_rad,
+                        vector_length: incoming.vector_length,
+                        neighbour_distance,
+                        timestamp,
+                        corrected_yaw_rad: incoming.measured_yaw_rad,
+                        generation: incoming.generation,
+                    };
+                    let key = (candidate.from.clone(), candidate.to.clone());
+                    match resp_yaw.edges.get_mut(&key) {
+                        Some(existing)
+                            if should_replace_yaw(existing, &candidate, resp_clock.now) =>
+                        {
+                            *existing = candidate;
+                        }
+                        Some(_) => {}
+                        None if yaw_observation_is_valid(&candidate) => {
+                            resp_yaw.edges.insert(key, candidate);
+                        }
+                        None => {}
+                    }
+                }
 
                 // Send the header straight back for ranging.
                 let dist_km = (responder_pos - pkt.origin_pos).length() as f64;
@@ -578,6 +981,12 @@ pub fn route_packets(
                 let mut echo = pkt.clone();
                 echo.kind = PacketKind::Echo;
                 echo.responder_pos = responder_pos;
+                echo.responder_connections = resp_links
+                    .connected
+                    .keys()
+                    .filter_map(|entity| uuid_by_entity.get(entity).cloned())
+                    .collect();
+                echo.responder_connections.sort();
                 echo.responder_delay = TURNAROUND_DELAY_S;
                 // Modeled receive time on the originator's clock:
                 // send + round-trip propagation + responder turnaround.
@@ -586,18 +995,150 @@ pub fn route_packets(
             }
             PacketKind::Echo => {
                 // `target` is the originator — recover distance from timing.
-                let Ok((orig_gt, mut results, ..)) = drones.get_mut(target) else { continue };
+                let Ok((
+                    _,
+                    orig_gt,
+                    mut results,
+                    origin_uuid,
+                    origin_clock,
+                    _,
+                    mut table,
+                    mut yaw,
+                    _,
+                    base_reference,
+                )) = drones.get_mut(target)
+                else {
+                    continue;
+                };
                 let round_trip = pkt.arrival_time - pkt.header.time_received;
                 let distance_km =
                     ((round_trip - pkt.responder_delay) * SPEED_OF_LIGHT_KM_S / 2.0) as f32;
                 let range =
                     SphericalVec::toward(orig_gt.translation(), pkt.responder_pos, distance_km);
                 results.0.push((pkt.responder, range));
+                let Some(reference) = base_reference else {
+                    continue;
+                };
+                let Some(location) = project_direct_observation_to_base(
+                    pkt.header.connected_antenna,
+                    reference.gravity_up_local,
+                    reference.local_direction_to_base,
+                    reference.own_location_base,
+                    distance_km,
+                ) else {
+                    continue;
+                };
+                let responder_uuid = pkt.responder_id.clone();
+                table.0.insert(
+                    responder_uuid.clone(),
+                    MeshRow {
+                        id: responder_uuid.clone(),
+                        timestamp: origin_clock.now,
+                        location,
+                        neighbour_distance: 0,
+                        connections: pkt.responder_connections.clone(),
+                    },
+                );
+                let generation = yaw.next_generation();
+                yaw.edges.insert(
+                    (origin_uuid.0.clone(), responder_uuid.clone()),
+                    YawObservation {
+                        from: origin_uuid.0.clone(),
+                        to: responder_uuid,
+                        measured_yaw_rad: pkt.header.relative_yaw_rad,
+                        corrected_yaw_rad: pkt.header.relative_yaw_rad,
+                        vector_length: distance_km,
+                        neighbour_distance: 0,
+                        timestamp: origin_clock.now,
+                        generation,
+                    },
+                );
             }
         }
     }
 
     mailbox.0 = outgoing;
+}
+
+/// Recompute yaw-only loop closure from complete, fresh directed observations.
+/// Every pass resets obsolete corrections to the measured value; each valid
+/// loop is then committed atomically.
+pub fn apply_loop_closure(
+    mut drones: Query<(
+        &DroneClock,
+        Option<&DroneUuid>,
+        &MeshTable,
+        &mut YawObservationTable,
+    )>,
+) {
+    for (clock, owner_uuid, table, mut observations) in &mut drones {
+        let mut fresh = MeshTable(
+            table
+                .0
+                .iter()
+                .filter(|(_, row)| {
+                    let age = clock.now - row.timestamp;
+                    row_is_valid(row)
+                        && age >= 0.0
+                        && age <= HEADER_INTERVAL_SECS * (row.neighbour_distance as f64 + 1.0)
+                })
+                .map(|(id, row)| (id.clone(), row.clone()))
+                .collect(),
+        );
+        if let Some(owner_uuid) = owner_uuid {
+            let mut connections: Vec<String> = observations
+                .edges
+                .values()
+                .filter(|edge| edge.from == owner_uuid.0)
+                .map(|edge| edge.to.clone())
+                .collect();
+            connections.sort();
+            connections.dedup();
+            fresh.0.insert(
+                owner_uuid.0.clone(),
+                MeshRow {
+                    id: owner_uuid.0.clone(),
+                    timestamp: clock.now,
+                    location: Vec3::ZERO,
+                    neighbour_distance: 0,
+                    connections,
+                },
+            );
+        }
+        for edge in observations.edges.values_mut() {
+            edge.corrected_yaw_rad = edge.measured_yaw_rad;
+        }
+        for ids in discover_loops(&fresh) {
+            let mut edges = Vec::with_capacity(ids.len());
+            for index in 0..ids.len() {
+                let from = &ids[index];
+                let to = &ids[(index + 1) % ids.len()];
+                let Some(edge) = observations.edges.get(&(from.clone(), to.clone())) else {
+                    edges.clear();
+                    break;
+                };
+                let age = clock.now - edge.timestamp;
+                if !yaw_observation_is_valid(edge)
+                    || age < 0.0
+                    || age > HEADER_INTERVAL_SECS * (edge.neighbour_distance as f64 + 1.0)
+                {
+                    edges.clear();
+                    break;
+                }
+                edges.push(edge.clone());
+            }
+            if close_yaw_loop(&mut edges).is_some() {
+                for edge in edges {
+                    if let Some(stored) = observations
+                        .edges
+                        .get_mut(&(edge.from.clone(), edge.to.clone()))
+                    {
+                        stored.corrected_yaw_rad = edge.corrected_yaw_rad;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Drive the priority reconnection flood one hop per frame.
@@ -614,7 +1155,11 @@ pub fn process_reconnect(
     bases: Query<&Base>,
     mut drones: Query<(&DroneUuid, &GlobalTransform, &LinkSet, &mut Pairing)>,
 ) {
-    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+    let base_pos = bases
+        .iter()
+        .next()
+        .map(|b| b.position)
+        .unwrap_or(Vec3::ZERO);
     let incoming = std::mem::take(&mut bus.0);
     let mut outgoing: Vec<ReconnectMsg> = Vec::new();
 
@@ -648,7 +1193,9 @@ pub fn process_reconnect(
 
     // ── Process one hop of in-flight messages ───────────────────────────────
     for msg in incoming {
-        let Ok((uuid, gt, links, mut pairing)) = drones.get_mut(msg.to) else { continue };
+        let Ok((uuid, gt, links, mut pairing)) = drones.get_mut(msg.to) else {
+            continue;
+        };
 
         // Dedup on (id, phase): already handled → drop entirely.
         let key = (msg.request_id.clone(), msg.kind.phase());
@@ -706,7 +1253,9 @@ pub fn process_reconnect(
                         for &peer in links.connected.keys() {
                             outgoing.push(ReconnectMsg {
                                 request_id: msg.request_id.clone(),
-                                kind: ReconnectKind::Position { payload: pos_rel_base },
+                                kind: ReconnectKind::Position {
+                                    payload: pos_rel_base,
+                                },
                                 requester: msg.requester.clone(),
                                 target: msg.target.clone(),
                                 to: peer,
@@ -781,11 +1330,22 @@ fn format_uuid_v4(hi: u64, lo: u64) -> String {
     let b = |v: u64, shift: u32| ((v >> shift) & 0xff) as u8;
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b(hi, 56), b(hi, 48), b(hi, 40), b(hi, 32),
-        b(hi, 24), b(hi, 16),
-        b(hi, 8), b(hi, 0),
-        b(lo, 56), b(lo, 48),
-        b(lo, 40), b(lo, 32), b(lo, 24), b(lo, 16), b(lo, 8), b(lo, 0),
+        b(hi, 56),
+        b(hi, 48),
+        b(hi, 40),
+        b(hi, 32),
+        b(hi, 24),
+        b(hi, 16),
+        b(hi, 8),
+        b(hi, 0),
+        b(lo, 56),
+        b(lo, 48),
+        b(lo, 40),
+        b(lo, 32),
+        b(lo, 24),
+        b(lo, 16),
+        b(lo, 8),
+        b(lo, 0),
     )
 }
 
@@ -794,7 +1354,7 @@ mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
 
-    use crate::drone::{make_antenna, DroneType};
+    use crate::drone::{DroneType, make_antenna};
     use crate::tracking::maintain_mesh_antennas;
 
     /// A full drone with everything the networking + tracking systems need.
@@ -830,7 +1390,21 @@ mod tests {
     /// call this only for the pairs that are meant to already "know" each
     /// other going in — never for a pair whose relay-learning is itself
     /// under test.
-    fn seed_mesh_row(world: &mut World, base_pos: Vec3, owner: Entity, peer: Entity, peer_pos: Vec3) {
+    fn seed_mesh_row(
+        world: &mut World,
+        base_pos: Vec3,
+        owner: Entity,
+        peer: Entity,
+        peer_pos: Vec3,
+    ) {
+        if world.get::<BaseFrameReference>(owner).is_none() {
+            let owner_pos = world.get::<GlobalTransform>(owner).unwrap().translation();
+            world.entity_mut(owner).insert(BaseFrameReference {
+                own_location_base: owner_pos - base_pos,
+                local_direction_to_base: (base_pos - owner_pos).normalize_or_zero(),
+                gravity_up_local: Vec3::Y,
+            });
+        }
         let peer_uuid = uuid_of(world, peer);
         world.get_mut::<MeshTable>(owner).unwrap().0.insert(
             peer_uuid.clone(),
@@ -848,7 +1422,9 @@ mod tests {
     /// facing, should both end up with the other in their `LinkSet`.
     fn aim_and_detect(world: &mut World) {
         world.run_system_once(maintain_mesh_antennas).unwrap();
-        world.run_system_once(detect_links_and_send_headers).unwrap();
+        world
+            .run_system_once(detect_links_and_send_headers)
+            .unwrap();
     }
 
     #[test]
@@ -856,7 +1432,11 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base {
+            id: "base".into(),
+            position: base_pos,
+            antennas: vec![],
+        });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(1.0, 0.0, 0.0);
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -875,14 +1455,21 @@ mod tests {
             "B should have detected A"
         );
         // A header was queued for the peer.
-        assert!(!world.resource::<Mailbox>().0.is_empty(), "headers should be queued");
+        assert!(
+            !world.resource::<Mailbox>().0.is_empty(),
+            "headers should be queued"
+        );
     }
 
     #[test]
     fn out_of_range_drones_do_not_link() {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
-        world.spawn(Base { id: "base".into(), position: Vec3::new(0.0, 0.0, -5.0), antennas: vec![] });
+        world.spawn(Base {
+            id: "base".into(),
+            position: Vec3::new(0.0, 0.0, -5.0),
+            antennas: vec![],
+        });
         let a = spawn_drone(&mut world, Vec3::ZERO, 0);
         // 100 km apart — far past the ~3.5 km link budget.
         let b = spawn_drone(&mut world, Vec3::new(100.0, 0.0, 0.0), 1);
@@ -898,7 +1485,11 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base {
+            id: "base".into(),
+            position: base_pos,
+            antennas: vec![],
+        });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(1.0, 0.0, 0.0);
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -908,11 +1499,18 @@ mod tests {
         seed_mesh_row(&mut world, base_pos, b, a, a_pos);
 
         aim_and_detect(&mut world);
+        world.get_mut::<MeshTable>(a).unwrap().0.clear();
+        world.get_mut::<MeshTable>(b).unwrap().0.clear();
+        // Header handling only creates the echo. Direct lookup knowledge is
+        // committed after the echo-derived range is available.
+        world.run_system_once(route_packets).unwrap();
+        assert!(!world.get::<MeshTable>(b).unwrap().0.contains_key(&a_uuid));
         world.run_system_once(route_packets).unwrap();
 
         let b_table = world.get::<MeshTable>(b).unwrap();
         let row = b_table.0.get(&a_uuid).expect("B should have learned A");
         assert_eq!(row.neighbour_distance, 0, "a direct peer is distance 0");
+        assert!((row.location - (a_pos - base_pos)).length() < 1.0e-4);
     }
 
     #[test]
@@ -920,7 +1518,11 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base {
+            id: "base".into(),
+            position: base_pos,
+            antennas: vec![],
+        });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(2.0, 0.0, 0.0); // 2 km apart
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -935,7 +1537,11 @@ mod tests {
 
         let ranging = world.get::<RangingResults>(a).unwrap();
         let (_, sv) = ranging.0.last().expect("A should have a ranging result");
-        assert!((sv.length - 2.0).abs() < 0.01, "measured distance ~2 km, got {}", sv.length);
+        assert!(
+            (sv.length - 2.0).abs() < 0.01,
+            "measured distance ~2 km, got {}",
+            sv.length
+        );
     }
 
     /// One full round: advance every drone's clock past the resend interval,
@@ -945,7 +1551,9 @@ mod tests {
             world.get_mut::<DroneClock>(e).unwrap().now += 0.2;
         }
         world.run_system_once(maintain_mesh_antennas).unwrap();
-        world.run_system_once(detect_links_and_send_headers).unwrap();
+        world
+            .run_system_once(detect_links_and_send_headers)
+            .unwrap();
         world.run_system_once(route_packets).unwrap();
     }
 
@@ -957,7 +1565,11 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -8.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base {
+            id: "base".into(),
+            position: base_pos,
+            antennas: vec![],
+        });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(2.5, 0.0, 0.0);
         let c_pos = Vec3::new(5.0, 0.0, 0.0);
@@ -987,8 +1599,272 @@ mod tests {
         );
         // …but still learns of A, relayed, at one hop past its direct peer.
         let c_table = world.get::<MeshTable>(c).unwrap();
-        let row = c_table.0.get(&a_uuid).expect("C should have learned A by relay");
-        assert_eq!(row.neighbour_distance, 1, "relayed peer is one hop past the direct link");
+        let row = c_table
+            .0
+            .get(&a_uuid)
+            .expect("C should have learned A by relay");
+        assert_eq!(
+            row.neighbour_distance, 1,
+            "relayed peer is one hop past the direct link"
+        );
+    }
+
+    fn test_row(
+        id: &str,
+        timestamp: f64,
+        location: Vec3,
+        distance: u32,
+        connections: &[&str],
+    ) -> MeshRow {
+        MeshRow {
+            id: id.into(),
+            timestamp,
+            location,
+            neighbour_distance: distance,
+            connections: connections.iter().map(|id| (*id).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn direct_observation_is_projected_into_base_frame() {
+        // Receiver is east of base. In its local frame the base is forward
+        // and the observed peer is right; in the base frame that is +Z.
+        let projected = project_direct_observation_to_base(
+            Vec3::X,
+            Vec3::Y,
+            Vec3::Z,
+            Vec3::new(10.0, 2.0, 0.0),
+            3.0,
+        )
+        .unwrap();
+        assert!((projected - Vec3::new(10.0, 2.0, 3.0)).length() < 1.0e-5);
+    }
+
+    #[test]
+    fn direct_projection_is_independent_of_receiver_heading() {
+        let heading = 73.0_f32.to_radians();
+        let inverse_heading = Quat::from_rotation_y(-heading);
+        let own = Vec3::new(4.0, 1.0, -2.0);
+        let neighbour = Vec3::new(7.0, 3.0, 2.0);
+        let local_neighbour = inverse_heading * (neighbour - own).normalize();
+        let local_base = inverse_heading * (-own).normalize();
+        let projected = project_direct_observation_to_base(
+            local_neighbour,
+            Vec3::Y,
+            local_base,
+            own,
+            (neighbour - own).length(),
+        )
+        .unwrap();
+        assert!((projected - neighbour).length() < 1.0e-5);
+    }
+
+    #[test]
+    fn base_frame_reference_is_seeded_at_the_sensor_boundary() {
+        let mut world = World::new();
+        world.insert_resource(Time::<()>::default());
+        let base_pos = Vec3::new(-2.0, 0.0, 4.0);
+        world.spawn(Base {
+            id: "base".into(),
+            position: base_pos,
+            antennas: vec![],
+        });
+        let drone = spawn_drone(&mut world, Vec3::new(3.0, 1.0, 6.0), 0);
+        world
+            .run_system_once(maintain_base_frame_references)
+            .unwrap();
+        let reference = world.get::<BaseFrameReference>(drone).unwrap();
+        assert_eq!(reference.own_location_base, Vec3::new(5.0, 1.0, 2.0));
+        assert!(
+            (reference.local_direction_to_base - (-reference.own_location_base).normalize())
+                .length()
+                < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn relayed_base_frame_location_is_not_rotated_again() {
+        let relayed = test_row("remote", 2.0, Vec3::new(4.0, 5.0, 6.0), 1, &[]);
+        let candidate = MeshRow {
+            neighbour_distance: relayed.neighbour_distance + 1,
+            ..relayed.clone()
+        };
+        assert_eq!(candidate.location, relayed.location);
+    }
+
+    #[test]
+    fn lookup_replacement_prefers_distance_then_timeout_and_rejects_invalid() {
+        let existing = test_row("peer", 10.0, Vec3::X, 2, &[]);
+        let closer = test_row("peer", 10.01, Vec3::Z, 1, &[]);
+        let farther = test_row("peer", 10.01, Vec3::Y, 3, &[]);
+        assert!(should_replace_row(&existing, &closer, 10.01));
+        assert!(!should_replace_row(&existing, &farther, 10.29));
+        assert!(should_replace_row(&existing, &farther, 10.30));
+
+        let invalid = test_row("peer", 10.01, Vec3::splat(f32::NAN), 0, &[]);
+        assert!(!should_replace_row(&existing, &invalid, 100.0));
+    }
+
+    #[test]
+    fn relayed_timestamp_is_rebased_between_independent_clocks() {
+        // Sender saw the row 0.25 s ago on a clock near 10,000. Receiver's
+        // unrelated clock is near 3; only the age crosses the link.
+        let rebased = rebase_timestamp(10_000.0, 9_999.75, 3.0).unwrap();
+        assert!((rebased - 2.75).abs() < f64::EPSILON);
+        assert!(rebase_timestamp(10.0, 10.1, 3.0).is_none());
+    }
+
+    #[test]
+    fn maximum_neighbour_distance_is_rejected_instead_of_wrapping() {
+        assert_eq!(relayed_neighbour_distance(u32::MAX), None);
+    }
+
+    fn yaw_edge(from: &str, to: &str, yaw: f32, distance: u32) -> YawObservation {
+        YawObservation {
+            from: from.into(),
+            to: to.into(),
+            measured_yaw_rad: yaw,
+            corrected_yaw_rad: yaw,
+            vector_length: 3.5,
+            neighbour_distance: distance,
+            timestamp: 5.0,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn weighted_loop_closure_zeroes_residual_and_preserves_lengths() {
+        let mut edges = vec![
+            yaw_edge("a", "b", 0.0, 0),
+            yaw_edge("b", "c", 0.3, 1),
+            yaw_edge("c", "a", -0.1, 3),
+        ];
+        let lengths: Vec<f32> = edges.iter().map(|edge| edge.vector_length).collect();
+        let corrections = close_yaw_loop(&mut edges).unwrap();
+        let corrected_residual =
+            wrap_yaw_rad(edges.iter().map(|edge| edge.corrected_yaw_rad).sum());
+        assert!(corrected_residual.abs() <= LOOP_CLOSURE_TOLERANCE_RAD);
+        for (edge, length) in edges.iter().zip(lengths) {
+            assert_eq!(edge.vector_length, length);
+        }
+        assert!((corrections.iter().map(|c| c.delta_rad).sum::<f32>() + 0.2).abs() < 1.0e-5);
+        assert!((corrections[2].delta_rad / corrections[0].delta_rad - 4.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn perfect_and_full_turn_loops_receive_no_false_correction() {
+        for yaws in [[0.2, -0.7, 0.5], [std::f32::consts::TAU, 0.0, 0.0]] {
+            let mut edges = vec![
+                yaw_edge("a", "b", yaws[0], 0),
+                yaw_edge("b", "c", yaws[1], 1),
+                yaw_edge("c", "a", yaws[2], 2),
+            ];
+            let corrections = close_yaw_loop(&mut edges).unwrap();
+            assert!(
+                corrections
+                    .iter()
+                    .all(|correction| correction.delta_rad.abs() < 1.0e-5)
+            );
+            assert!(
+                wrap_yaw_rad(edges.iter().map(|edge| edge.corrected_yaw_rad).sum()).abs() < 1.0e-5
+            );
+        }
+    }
+
+    #[test]
+    fn wire_yaw_observation_carries_measurement_not_local_correction() {
+        let mut local = yaw_edge("a", "b", 0.25, 0);
+        local.corrected_yaw_rad = -0.5;
+        let message = YawObservationMessage::from(&local);
+        assert_eq!(message.measured_yaw_rad, 0.25);
+        let received = YawObservation {
+            from: message.from,
+            to: message.to,
+            measured_yaw_rad: message.measured_yaw_rad,
+            corrected_yaw_rad: message.measured_yaw_rad,
+            vector_length: message.vector_length,
+            neighbour_distance: message.neighbour_distance,
+            timestamp: message.timestamp,
+            generation: message.generation,
+        };
+        assert_eq!(received.corrected_yaw_rad, received.measured_yaw_rad);
+        assert_ne!(received.corrected_yaw_rad, local.corrected_yaw_rad);
+    }
+
+    #[test]
+    fn incomplete_loop_is_rejected_without_modification() {
+        let mut edges = vec![yaw_edge("a", "b", 0.0, 0), yaw_edge("b", "c", 0.2, 0)];
+        let before = edges.clone();
+        assert!(close_yaw_loop(&mut edges).is_none());
+        assert_eq!(edges, before);
+    }
+
+    #[test]
+    fn loops_are_discovered_once_and_incomplete_references_are_ignored() {
+        let table = MeshTable(HashMap::from([
+            ("a".into(), test_row("a", 1.0, Vec3::ZERO, 0, &["b", "c"])),
+            ("b".into(), test_row("b", 1.0, Vec3::X, 1, &["a", "c"])),
+            (
+                "c".into(),
+                test_row("c", 1.0, Vec3::Z, 2, &["a", "b", "d", "e"]),
+            ),
+            ("d".into(), test_row("d", 1.0, Vec3::X, 0, &["c", "e"])),
+            ("e".into(), test_row("e", 1.0, Vec3::Z, 0, &["c", "d"])),
+            (
+                "orphan".into(),
+                test_row("orphan", 1.0, Vec3::Y, 0, &["missing"]),
+            ),
+        ]));
+        assert_eq!(
+            discover_loops(&table),
+            vec![vec!["a", "b", "c"], vec!["c", "d", "e"]]
+        );
+    }
+
+    #[test]
+    fn loop_closure_system_resets_stale_corrections() {
+        let mut world = World::new();
+        let table = MeshTable(HashMap::from([
+            ("a".into(), test_row("a", 5.0, Vec3::ZERO, 0, &["b"])),
+            (
+                "b".into(),
+                test_row("b", 5.0, Vec3::new(1.0, 0.0, 1.0), 1, &["c"]),
+            ),
+            (
+                "c".into(),
+                test_row("c", 5.0, Vec3::new(-1.0, 0.0, 2.0), 2, &["a"]),
+            ),
+        ]));
+        let observations = YawObservationTable {
+            edges: HashMap::from([
+                (("a".into(), "b".into()), yaw_edge("a", "b", 0.2, 0)),
+                (("b".into(), "c".into()), yaw_edge("b", "c", 0.2, 0)),
+                (("c".into(), "a".into()), yaw_edge("c", "a", 0.2, 0)),
+            ]),
+            next_generation: 1,
+        };
+        let entity = world
+            .spawn((DroneClock { now: 5.0 }, table, observations))
+            .id();
+        world.run_system_once(apply_loop_closure).unwrap();
+        let corrected = world.get::<YawObservationTable>(entity).unwrap();
+        assert!(
+            corrected
+                .edges
+                .values()
+                .all(|edge| edge.corrected_yaw_rad.abs() < 1.0e-5)
+        );
+
+        // Stale topology must not keep applying an obsolete correction.
+        world.get_mut::<DroneClock>(entity).unwrap().now = 100.0;
+        world.run_system_once(apply_loop_closure).unwrap();
+        let reset = world.get::<YawObservationTable>(entity).unwrap();
+        assert!(
+            reset
+                .edges
+                .values()
+                .all(|edge| edge.corrected_yaw_rad == edge.measured_yaw_rad)
+        );
     }
 
     /// A header is not resent until `HEADER_INTERVAL_SECS` has passed on the
@@ -998,7 +1874,11 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base {
+            id: "base".into(),
+            position: base_pos,
+            antennas: vec![],
+        });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(1.0, 0.0, 0.0);
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -1007,11 +1887,16 @@ mod tests {
         seed_mesh_row(&mut world, base_pos, _b, a, a_pos);
 
         aim_and_detect(&mut world);
-        assert!(!world.resource::<Mailbox>().0.is_empty(), "first detect sends headers");
+        assert!(
+            !world.resource::<Mailbox>().0.is_empty(),
+            "first detect sends headers"
+        );
 
         // Drain, then detect again with the clock unchanged — nothing due yet.
         world.resource_mut::<Mailbox>().0.clear();
-        world.run_system_once(detect_links_and_send_headers).unwrap();
+        world
+            .run_system_once(detect_links_and_send_headers)
+            .unwrap();
         assert!(
             world.resource::<Mailbox>().0.is_empty(),
             "no resend before the interval elapses on the own clock"
@@ -1020,8 +1905,13 @@ mod tests {
         // Advance every clock past the interval → headers resend.
         world.get_mut::<DroneClock>(a).unwrap().now += HEADER_INTERVAL_SECS + 0.01;
         world.get_mut::<DroneClock>(_b).unwrap().now += HEADER_INTERVAL_SECS + 0.01;
-        world.run_system_once(detect_links_and_send_headers).unwrap();
-        assert!(!world.resource::<Mailbox>().0.is_empty(), "resend after interval elapses");
+        world
+            .run_system_once(detect_links_and_send_headers)
+            .unwrap();
+        assert!(
+            !world.resource::<Mailbox>().0.is_empty(),
+            "resend after interval elapses"
+        );
     }
 
     /// A link is dropped once the peer moves out of range — `LinkSet` reflects
@@ -1031,7 +1921,11 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base {
+            id: "base".into(),
+            position: base_pos,
+            antennas: vec![],
+        });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(1.0, 0.0, 0.0);
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -1040,7 +1934,10 @@ mod tests {
         seed_mesh_row(&mut world, base_pos, b, a, a_pos);
 
         aim_and_detect(&mut world);
-        assert!(world.get::<LinkSet>(a).unwrap().connected.contains_key(&b), "linked in range");
+        assert!(
+            world.get::<LinkSet>(a).unwrap().connected.contains_key(&b),
+            "linked in range"
+        );
 
         // Teleport B far out of range (update both transforms).
         let far = Vec3::new(100.0, 0.0, 0.0);

@@ -20,7 +20,9 @@ use bevy::prelude::*;
 use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
-use crate::networking::{DroneUuid, MeshTable, Pairing, RingIndex};
+use crate::networking::{
+    DroneUuid, MeshTable, Pairing, RingIndex, YawObservationTable, wrap_yaw_rad,
+};
 
 /// Where this drone currently believes a tracked peer *will be*, based
 /// purely on the last header that peer sent — never on omniscient ECS
@@ -62,8 +64,18 @@ pub struct TrackedPeers(pub HashMap<Entity, Vec3>);
 /// This overrides the fixed 120°-apart layout `world::setup` used to compute
 /// the initial angles; those were only ever a starting point.
 #[allow(dead_code)] // Implemented and tested, but live aiming is not yet enabled in main.
+#[allow(clippy::type_complexity)]
 pub fn maintain_mesh_antennas(
-    mut drones: Query<(&Transform, &mut Drone, &RingIndex, &TrackedPeers, &MeshTable, &Pairing)>,
+    mut drones: Query<(
+        &Transform,
+        &mut Drone,
+        &RingIndex,
+        &DroneUuid,
+        &TrackedPeers,
+        &MeshTable,
+        &YawObservationTable,
+        &Pairing,
+    )>,
     positions: Query<(Entity, &RingIndex, &DroneUuid), With<Drone>>,
     bases: Query<&Base>,
 ) {
@@ -72,12 +84,16 @@ pub fn maintain_mesh_antennas(
     // Ring neighbors, not "the other drone" — with N > 2 most pairs are
     // never mutually visible on purpose, so relayed (multi-hop) rows in the
     // mesh table actually get exercised.
-    let mut ring: Vec<(usize, Entity, String)> =
-        positions.iter().map(|(e, ri, uuid)| (ri.0, e, uuid.0.clone())).collect();
+    let mut ring: Vec<(usize, Entity, String)> = positions
+        .iter()
+        .map(|(e, ri, uuid)| (ri.0, e, uuid.0.clone()))
+        .collect();
     ring.sort_by_key(|(i, ..)| *i);
     let n = ring.len();
 
-    for (self_transform, mut drone, self_ring, tracked, table, pairing) in &mut drones {
+    for (self_transform, mut drone, self_ring, self_uuid, tracked, table, yaw_table, pairing) in
+        &mut drones
+    {
         if n == 0 {
             continue;
         }
@@ -92,10 +108,29 @@ pub fn maintain_mesh_antennas(
         // Predicted (from the peer's own last header) beats relayed mesh-table
         // last-known-position, which beats "no info, don't move".
         let mesh_pos = |uuid: &str| {
-            base_pos.zip(table.0.get(uuid)).map(|(base, row)| base + row.location)
+            base_pos.zip(table.0.get(uuid)).map(|(base, row)| {
+                let raw = base + row.location;
+                let key = (self_uuid.0.clone(), uuid.to_owned());
+                let Some(edge) = yaw_table.edges.get(&key) else {
+                    return raw;
+                };
+                let Some(corrected) = yaw_table.corrected_yaw(&self_uuid.0, uuid) else {
+                    return raw;
+                };
+                let correction = wrap_yaw_rad(corrected - edge.measured_yaw_rad);
+                self_pos + Quat::from_rotation_y(correction) * (raw - self_pos)
+            })
         };
-        let next_pos = tracked.0.get(next_entity).copied().or_else(|| mesh_pos(next_uuid));
-        let prev_pos = tracked.0.get(prev_entity).copied().or_else(|| mesh_pos(prev_uuid));
+        let next_pos = tracked
+            .0
+            .get(next_entity)
+            .copied()
+            .or_else(|| mesh_pos(next_uuid));
+        let prev_pos = tracked
+            .0
+            .get(prev_entity)
+            .copied()
+            .or_else(|| mesh_pos(prev_uuid));
 
         // TODO: error correction via conical scan.
         //
@@ -141,8 +176,8 @@ mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
 
-    use crate::drone::{make_antenna, DroneType};
-    use crate::networking::{DroneUuid, MeshRow, NetworkingBundle};
+    use crate::drone::{DroneType, make_antenna};
+    use crate::networking::{DroneUuid, MeshRow, NetworkingBundle, YawObservation};
 
     /// Spawn a drone at `pos` in ring slot `ring`, with 3 zeroed antennas the
     /// aiming system will retarget. Uses the real `NetworkingBundle` (which
@@ -169,7 +204,11 @@ mod tests {
     }
 
     fn spawn_base(world: &mut World, pos: Vec3) {
-        world.spawn(Base { id: "base".into(), position: pos, antennas: vec![] });
+        world.spawn(Base {
+            id: "base".into(),
+            position: pos,
+            antennas: vec![],
+        });
     }
 
     fn antenna0_az(world: &World, drone: Entity) -> f32 {
@@ -178,7 +217,11 @@ mod tests {
 
     /// Set drone `owner`'s tracked prediction for `peer`.
     fn set_tracked(world: &mut World, owner: Entity, peer: Entity, predicted: Vec3) {
-        world.get_mut::<TrackedPeers>(owner).unwrap().0.insert(peer, predicted);
+        world
+            .get_mut::<TrackedPeers>(owner)
+            .unwrap()
+            .0
+            .insert(peer, predicted);
     }
 
     /// Give `owner`'s mesh table a relayed/last-known row for `peer`, as if
@@ -212,8 +255,14 @@ mod tests {
         world.run_system_once(maintain_mesh_antennas).unwrap();
 
         let az = antenna0_az(&world, a);
-        assert!((az - 45.0).abs() < 0.5, "expected ~45° (predicted), got {az}");
-        assert!((az - 90.0).abs() > 10.0, "must not aim at true position (90°)");
+        assert!(
+            (az - 45.0).abs() < 0.5,
+            "expected ~45° (predicted), got {az}"
+        );
+        assert!(
+            (az - 90.0).abs() > 10.0,
+            "must not aim at true position (90°)"
+        );
     }
 
     /// As the tracked prediction moves, the antenna follows it — the whole
@@ -230,7 +279,10 @@ mod tests {
         // position.
         world.run_system_once(maintain_mesh_antennas).unwrap();
         let az_cold = antenna0_az(&world, a);
-        assert_eq!(az_cold, 0.0, "no info yet must leave antenna untouched, got {az_cold}");
+        assert_eq!(
+            az_cold, 0.0,
+            "no info yet must leave antenna untouched, got {az_cold}"
+        );
 
         // Prediction slides in +Z; azimuth should swing monotonically toward 45°.
         set_tracked(&mut world, a, b, Vec3::new(1.0, 0.0, 0.5));
@@ -247,12 +299,51 @@ mod tests {
             az_mid > az_far,
             "antenna should track the moving prediction: {az_mid} -> {az_far}"
         );
-        assert!((az_far - 45.0).abs() < 0.5, "final aim should reach ~45°, got {az_far}");
+        assert!(
+            (az_far - 45.0).abs() < 0.5,
+            "final aim should reach ~45°, got {az_far}"
+        );
     }
 
     /// With no direct prediction but a relayed mesh-table row, antenna #1
     /// aims at that row's base-relative location — comms-derived, never the
     /// peer's true ECS `Transform`.
+    #[test]
+    fn mesh_aim_consumes_corrected_yaw() {
+        let mut world = World::new();
+        let base_pos = Vec3::new(0.0, 0.0, -5.0);
+        spawn_base(&mut world, base_pos);
+        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
+        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
+        set_mesh_row(&mut world, a, b, Vec3::new(0.0, 0.0, 8.0));
+        let a_uuid = world.get::<DroneUuid>(a).unwrap().0.clone();
+        let b_uuid = world.get::<DroneUuid>(b).unwrap().0.clone();
+        world
+            .get_mut::<YawObservationTable>(a)
+            .unwrap()
+            .edges
+            .insert(
+                (a_uuid.clone(), b_uuid.clone()),
+                YawObservation {
+                    from: a_uuid,
+                    to: b_uuid,
+                    measured_yaw_rad: 0.0,
+                    corrected_yaw_rad: std::f32::consts::FRAC_PI_2,
+                    vector_length: 3.0,
+                    neighbour_distance: 0,
+                    timestamp: 0.0,
+                    generation: 1,
+                },
+            );
+
+        world.run_system_once(maintain_mesh_antennas).unwrap();
+        let az = antenna0_az(&world, a);
+        assert!(
+            (az - 90.0).abs() < 0.5,
+            "corrected yaw should rotate mesh aim, got {az}"
+        );
+    }
+
     #[test]
     fn falls_back_to_mesh_table_when_no_prediction() {
         let mut world = World::new();
@@ -269,7 +360,13 @@ mod tests {
         world.run_system_once(maintain_mesh_antennas).unwrap();
 
         let az = antenna0_az(&world, a);
-        assert!((az - 0.0).abs() < 0.5, "expected ~0° (mesh-table row), got {az}");
-        assert!((az - 90.0).abs() > 10.0, "must not aim at B's true position (90°)");
+        assert!(
+            (az - 0.0).abs() < 0.5,
+            "expected ~0° (mesh-table row), got {az}"
+        );
+        assert!(
+            (az - 90.0).abs() > 10.0,
+            "must not aim at B's true position (90°)"
+        );
     }
 }
