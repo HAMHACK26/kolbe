@@ -36,11 +36,13 @@
 //!     straight at full speed and overshooting, because a real autopilot
 //!     always plans a stopping distance.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
-use crate::world::DeploymentTarget;
+use crate::world::{DeploymentTarget, RELAY_WORKING_HOP_KM, RelayTopology};
 
 /// The flight envelope a drone is governed to. All limits are deliberately
 /// modest: real consumer/enterprise quads are electronically governed well
@@ -260,33 +262,59 @@ pub fn navigate(state: &mut DroneState, target: Vec3, limits: &FlightLimits, dt:
     }
 }
 
-/// Fly drones toward the selected area, then send each to its fixed 3 km
-/// survey slot as soon as it crosses the blue target polygon. This mission
-/// mode deliberately ignores all communication state; collision avoidance
-/// remains the layer that can deflect the course.
+/// Fly drones toward the selected area while preserving their protected
+/// upstream relay hop. Once inside, fixed survey slots fill the area and a
+/// local separation bias keeps peers from crowding closer than 2 km.
 pub fn go_to_network_area(
     time: Res<Time>,
     network_area: Res<crate::area::NetworkArea>,
     scenario: Res<crate::area::ScenarioArea>,
-    mut drones: Query<(&Transform, &mut DeploymentTarget, &mut DroneKinematics), With<Drone>>,
+    topology: Res<RelayTopology>,
+    positions: Query<(Entity, &Transform), Or<(With<Drone>, With<crate::base::Base>)>>,
+    mut drones: Query<
+        (Entity, &Transform, &mut DeploymentTarget, &mut DroneKinematics),
+        With<Drone>,
+    >,
 ) {
     let dt = time.delta_secs();
     let limits = FlightLimits::default().in_km();
+    let positions: HashMap<Entity, Vec3> = positions
+        .iter()
+        .map(|(entity, transform)| (entity, transform.translation))
+        .collect();
+    let peer_positions: Vec<(Entity, Vec3)> = positions
+        .iter()
+        .filter(|(entity, _)| topology.parent(**entity).is_some())
+        .map(|(&entity, &position)| (entity, position))
+        .collect();
 
-    for (transform, mut target, mut kin) in &mut drones {
+    for (entity, transform, mut target, mut kin) in &mut drones {
         if !target.spreading && inside_target_area(transform.translation, &network_area, &scenario) {
             target.spreading = true;
         }
-        let waypoint = if target.spreading {
-            repel_from_target_boundary(
+        let desired_waypoint = if target.spreading {
+            let slot = repel_from_target_boundary(
                 transform.translation,
                 clamp_to_target_area(target.slot, &network_area, &scenario),
+                &network_area,
+                &scenario,
+            );
+            repel_from_nearby_drones(
+                entity,
+                transform.translation,
+                slot,
+                &peer_positions,
                 &network_area,
                 &scenario,
             )
         } else {
             target.ingress
         };
+        let waypoint = topology
+            .parent(entity)
+            .and_then(|parent| positions.get(&parent).copied())
+            .map(|parent| clamp_to_relay_parent(desired_waypoint, parent))
+            .unwrap_or(transform.translation);
         let mut state = DroneState {
             position: transform.translation,
             velocity: kin.velocity,
@@ -295,6 +323,57 @@ pub fn go_to_network_area(
         navigate(&mut state, waypoint, &limits, dt);
         kin.velocity = state.velocity;
         kin.heading_deg = state.heading_deg;
+    }
+}
+
+fn clamp_to_relay_parent(waypoint: Vec3, parent: Vec3) -> Vec3 {
+    let offset = waypoint - parent;
+    let distance = offset.length();
+    if distance <= RELAY_WORKING_HOP_KM || distance <= f32::EPSILON {
+        waypoint
+    } else {
+        parent + offset / distance * RELAY_WORKING_HOP_KM
+    }
+}
+
+const AREA_MIN_SPACING_KM: f32 = 2.0;
+const AREA_PREFERRED_SPACING_KM: f32 = 2.5;
+
+fn repel_from_nearby_drones(
+    self_entity: Entity,
+    position: Vec3,
+    waypoint: Vec3,
+    peers: &[(Entity, Vec3)],
+    area: &crate::area::NetworkArea,
+    scenario: &crate::area::ScenarioArea,
+) -> Vec3 {
+    let mut push = Vec3::ZERO;
+    for &(peer, peer_position) in peers {
+        if peer == self_entity {
+            continue;
+        }
+        let offset = Vec3::new(position.x - peer_position.x, 0.0, position.z - peer_position.z);
+        let distance = offset.length();
+        if distance >= AREA_MIN_SPACING_KM {
+            continue;
+        }
+        let away = if distance > f32::EPSILON {
+            offset / distance
+        } else if self_entity.to_bits() & 1 == 0 {
+            Vec3::X
+        } else {
+            Vec3::Z
+        };
+        push += away * (1.0 - distance / AREA_MIN_SPACING_KM);
+    }
+    if push.length_squared() <= f32::EPSILON {
+        waypoint
+    } else {
+        clamp_to_target_area(
+            waypoint + push.normalize() * AREA_PREFERRED_SPACING_KM,
+            area,
+            scenario,
+        )
     }
 }
 
@@ -401,4 +480,67 @@ pub fn clamp_to_target_area(
     position.x = closest.x;
     position.z = closest.y;
     position
+}
+
+#[cfg(test)]
+mod relay_navigation_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn relay_waypoint_never_exceeds_working_hop() {
+        let parent = Vec3::new(1.0, 0.0, -2.0);
+        let waypoint = clamp_to_relay_parent(Vec3::new(20.0, 0.0, 5.0), parent);
+        assert!((waypoint.distance(parent) - RELAY_WORKING_HOP_KM).abs() < 1e-6);
+    }
+
+    #[test]
+    fn connected_drone_accelerates_toward_the_area() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default());
+        app.insert_resource(crate::area::NetworkArea::default());
+        app.insert_resource(crate::area::ScenarioArea::default());
+        let base = app
+            .world_mut()
+            .spawn((
+                crate::base::Base {
+                    id: "base".into(),
+                    position: Vec3::ZERO,
+                    antennas: Vec::new(),
+                },
+                Transform::default(),
+            ))
+            .id();
+        let drone = app
+            .world_mut()
+            .spawn((
+                Drone { id: "drone".into() },
+                Transform::from_xyz(0.1, 0.0, 0.0),
+                DeploymentTarget {
+                    ingress: Vec3::X,
+                    slot: Vec3::X,
+                    spreading: false,
+                },
+                DroneKinematics::default(),
+            ))
+            .id();
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![drone]);
+        app.insert_resource(topology);
+        app.add_systems(Update, go_to_network_area);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+
+        app.update();
+
+        let velocity = app
+            .world()
+            .entity(drone)
+            .get::<DroneKinematics>()
+            .unwrap()
+            .velocity;
+        assert!(velocity.x > 0.0);
+    }
 }

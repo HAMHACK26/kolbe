@@ -104,10 +104,8 @@ use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
 use crate::spherical::SphericalVec;
-/// Maximum candidate distance for the dormant reconnection protocol. The
-/// active deployment path does not use this communication limit.
-const MAX_NEIGHBOR_SPACING_KM: f32 = 3.0;
 use crate::tracking::TrackedPeers;
+use crate::world::{MAX_RELAY_HOP_KM, RelayTopology};
 use crate::terrain::{RadioCanopies, TerrainHeightMap, terrain_blocks_radio_path};
 
 /// How far ahead the flight-direction vector predicts (seconds).
@@ -460,6 +458,7 @@ pub fn advance_clocks(time: Res<Time>, mut clocks: Query<&mut DroneClock>) {
 #[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
 pub fn detect_links_and_send_headers(
     mut mailbox: ResMut<Mailbox>,
+    relay_topology: Option<Res<RelayTopology>>,
     mut nodes: Query<(
         Entity,
         &GlobalTransform,
@@ -502,6 +501,18 @@ pub fn detect_links_and_send_headers(
                 }
                 let peer_pos = peer_gt.translation();
                 let distance_km = (peer_pos - self_pos).length();
+                if let Some(topology) = relay_topology.as_deref() {
+                    let protected = topology.requires_link(self_entity, peer_entity);
+                    let launch_peer = topology.same_wave(self_entity, peer_entity);
+                    if protected || launch_peer {
+                        return (distance_km <= MAX_RELAY_HOP_KM)
+                            .then_some((peer_entity, 0));
+                    }
+                    // Only the current rear wave retains direct base links.
+                    if topology.involves_base(self_entity, peer_entity) {
+                        return None;
+                    }
+                }
                 if terrain_blocks_radio_path(&terrain, self_pos, peer_pos)
                     || canopies.as_ref().is_some_and(|trees| trees.blocks_path(self_pos, peer_pos))
                 {
@@ -871,7 +882,7 @@ fn reconnect_waiting(state: &PairingState) -> bool {
 /// A drone that has a free moment — no handshake in flight, not backed off
 /// from a failed one — looks through its mesh table for a drone it is *not*
 /// already linked to whose last known position is within
-/// [`MAX_NEIGHBOR_SPACING_KM`], and requests the closest one. That queues a
+/// [`MAX_RELAY_HOP_KM`], and requests the closest one. That queues a
 /// `Request` flood in [`ReconnectRequests`] for [`process_reconnect`] to
 /// originate on the next hop.
 ///
@@ -926,7 +937,7 @@ pub fn request_nearby_connections(
                 continue; // already connected — nothing to ask for.
             }
             let distance_km = (base_pos + row.location - self_pos).length();
-            if distance_km > MAX_NEIGHBOR_SPACING_KM {
+            if distance_km > MAX_RELAY_HOP_KM {
                 continue;
             }
             if nearest.is_none_or(|(best, _)| distance_km < best) {

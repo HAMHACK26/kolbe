@@ -181,7 +181,6 @@ fn main() {
         .add_systems(Update, radar::draw_mesh_links.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
-        .add_systems(Update, world::spawn_next_drone.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, terrain::draw_network_area.run_if(in_state(AppState::Simulation)))
         // Contours and trees are alternatives: a forest covers the ground the
         // contours describe, so only one of the two is drawn.
@@ -209,11 +208,18 @@ fn main() {
         )
         .add_systems(
             Update,
+            world::enforce_relay_hops
+                .after(factories::movement::apply_velocity)
+                .run_if(in_state(AppState::Simulation)),
+        )
+        .add_systems(
+            Update,
             networking::advance_clocks.run_if(in_state(AppState::Simulation)),
         )
         .add_systems(
             Update,
             (
+                world::spawn_next_drone,
                 navigation::go_to_network_area,
                 networking::request_nearby_connections,
                 networking::process_reconnect,

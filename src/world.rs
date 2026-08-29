@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use bevy::{picking::prelude::*, prelude::*};
 
 use crate::{
@@ -44,11 +46,15 @@ impl Default for WindSettings {
 }
 /// Clearance from the terrain to the underside of each drone, in km (50 m).
 pub const DRONE_GROUND_CLEARANCE_KM: f32 = 0.05;
-const DEPLOYMENT_INTERVAL_SECS: f32 = 10.0;
+pub const DEPLOYMENT_INTERVAL_SECS: f32 = 30.0;
 const DEPLOYMENT_BATCH_SIZE: usize = 3;
 /// Keeps launches clear of the base and of each other before navigation has
 /// had a chance to separate the formation.
 const LAUNCH_RING_RADIUS_KM: f32 = 0.10;
+/// Absolute communication limit for every protected relay hop.
+pub const MAX_RELAY_HOP_KM: f32 = 3.0;
+/// Navigation and integration target, leaving margin below the hard limit.
+pub const RELAY_WORKING_HOP_KM: f32 = 2.75;
 
 /// The individual destination assigned to a drone during deployment.
 #[derive(Component)]
@@ -64,8 +70,10 @@ pub struct DeploymentTarget {
 #[derive(Resource)]
 pub(crate) struct DeploymentQueue {
     target_slots: Vec<Vec3>,
+    total_count: usize,
     next_index: usize,
     timer: Timer,
+    base_entity: Entity,
     base_pos: Vec3,
     ingress: Vec3,
     drone_mesh: Handle<Mesh>,
@@ -73,6 +81,74 @@ pub(crate) struct DeploymentQueue {
     cone_mat: Handle<StandardMaterial>,
 }
 
+/// Protected upstream links created by wave deployment.
+///
+/// Every drone has exactly one parent closer to the base. Additional radio
+/// links may appear, but this tree is the path that movement must preserve.
+#[derive(Resource, Default)]
+pub(crate) struct RelayTopology {
+    base: Option<Entity>,
+    parents: HashMap<Entity, Entity>,
+    waves: Vec<Vec<Entity>>,
+}
+
+impl RelayTopology {
+    pub(crate) fn register_wave(&mut self, base: Entity, wave: Vec<Entity>) {
+        if wave.is_empty() {
+            return;
+        }
+        self.base = Some(base);
+
+        // The new wave takes over as the rear relay before the previous wave
+        // loses its direct base parent. Updating one map makes the handoff
+        // atomic from every reader's perspective.
+        if let Some(previous) = self.waves.last() {
+            for (index, &drone) in previous.iter().enumerate() {
+                self.parents.insert(drone, wave[index % wave.len()]);
+            }
+        }
+        for &drone in &wave {
+            self.parents.insert(drone, base);
+        }
+        self.waves.push(wave);
+    }
+
+    pub(crate) fn parent(&self, drone: Entity) -> Option<Entity> {
+        self.parents.get(&drone).copied()
+    }
+
+    pub(crate) fn requires_link(&self, a: Entity, b: Entity) -> bool {
+        self.parent(a) == Some(b) || self.parent(b) == Some(a)
+    }
+
+    pub(crate) fn same_wave(&self, a: Entity, b: Entity) -> bool {
+        self.waves.iter().any(|wave| wave.contains(&a) && wave.contains(&b))
+    }
+
+    pub(crate) fn involves_base(&self, a: Entity, b: Entity) -> bool {
+        self.base.is_some_and(|base| a == base || b == base)
+    }
+
+    #[cfg(test)]
+    fn all_paths_reach_base(&self) -> bool {
+        let Some(base) = self.base else {
+            return self.parents.is_empty();
+        };
+        self.parents.keys().all(|&drone| {
+            let mut cursor = drone;
+            for _ in 0..=self.parents.len() {
+                if cursor == base {
+                    return true;
+                }
+                let Some(parent) = self.parent(cursor) else {
+                    return false;
+                };
+                cursor = parent;
+            }
+            false
+        })
+    }
+}
 /// Radius each drone's coverage footprint must reach.
 pub const FORMATION_RADIUS_KM: f32 = 3.0;
 /// Fleet multiplier applied after computing the minimum gap-free coverage grid.
@@ -120,6 +196,17 @@ pub fn target_area_drone_count(area: &crate::area::NetworkArea) -> usize {
         .max(5.0) as usize
 }
 
+/// Extra rear waves needed so even the last area-assigned wave can reach its
+/// furthest slot without stretching any protected hop past its working range.
+fn relay_reserve_drone_count(base_pos: Vec3, target_slots: &[Vec3]) -> usize {
+    let furthest_slot_km = target_slots
+        .iter()
+        .map(|slot| slot.distance(base_pos))
+        .fold(0.0_f32, f32::max);
+    let required_hops = (furthest_slot_km / RELAY_WORKING_HOP_KM).ceil() as usize;
+    required_hops.saturating_sub(1) * DEPLOYMENT_BATCH_SIZE
+}
+
 fn launch_position(base_pos: Vec3, index: usize, count: usize) -> Vec3 {
     let count = count.max(1);
     let angle = index as f32 / count as f32 * std::f32::consts::TAU;
@@ -136,9 +223,8 @@ fn launch_position(base_pos: Vec3, index: usize, count: usize) -> Vec3 {
     )
 }
 
-/// Evenly distribute the swarm across a gap-free 3 km coverage grid inside the
-/// selected area. Communication range is intentionally not part of this
-/// deployment mode; each drone has a fixed survey cell.
+/// Evenly distribute area assignments across a gap-free 3 km coverage grid.
+/// Relay constraints are layered onto these fixed survey cells during flight.
 pub fn target_area_formation(
     area: &crate::area::NetworkArea,
     scenario: &crate::area::ScenarioArea,
@@ -215,7 +301,7 @@ pub fn setup(
     terrain: Res<crate::terrain::TerrainHeightMap>,
     theme: Res<Theme>,
     wind: Res<WindSettings>,
-    bases: Query<&Base>,
+    bases: Query<(Entity, &Base)>,
     network_area: Res<crate::area::NetworkArea>,
     scenario: Res<crate::area::ScenarioArea>,
 ) {
@@ -255,29 +341,37 @@ pub fn setup(
 
     // The base is the launch position. Drones deploy in batches of three,
     // then spread toward individual formation slots.
-    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+    let (base_entity, base) = bases.iter().next().expect("base is spawned before world setup");
+    let base_pos = base.position;
     let target_slots = target_area_formation(&network_area, &scenario, &terrain);
+    let total_count = target_slots.len() + relay_reserve_drone_count(base_pos, &target_slots);
     let ingress = target_area_center(&network_area, &scenario, &terrain);
-    let initial_count = target_slots.len().min(DEPLOYMENT_BATCH_SIZE);
+    let initial_count = total_count.min(DEPLOYMENT_BATCH_SIZE);
+    let mut initial_wave = Vec::with_capacity(initial_count);
     for index in 0..initial_count {
-        spawn_deployment_drone(
+        initial_wave.push(spawn_deployment_drone(
             &mut commands,
             &mut meshes,
             &drone_mesh,
             &drone_mat,
             &cone_mat,
-            launch_position(base_pos, index, target_slots.len()),
+            launch_position(base_pos, index, DEPLOYMENT_BATCH_SIZE),
             base_pos,
             ingress,
             &target_slots,
             index,
             wind.intensity,
-        );
+        ));
     }
+    let mut relay_topology = RelayTopology::default();
+    relay_topology.register_wave(base_entity, initial_wave);
+    commands.insert_resource(relay_topology);
     commands.insert_resource(DeploymentQueue {
         target_slots,
+        total_count,
         next_index: initial_count,
         timer: Timer::from_seconds(DEPLOYMENT_INTERVAL_SECS, TimerMode::Repeating),
+        base_entity,
         base_pos,
         ingress,
         drone_mesh,
@@ -384,38 +478,41 @@ pub fn setup(
         });
 }
 
-/// Launch the next batch of up to three nodes every ten seconds until the
+/// Launch the next batch of up to three nodes every thirty seconds until the
 /// initial deployment queue is exhausted.
 pub fn spawn_next_drone(
     time: Res<Time>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut deployment: ResMut<DeploymentQueue>,
+    mut relay_topology: ResMut<RelayTopology>,
     wind: Res<WindSettings>,
 ) {
-    if deployment.next_index >= deployment.target_slots.len()
+    if deployment.next_index >= deployment.total_count
         || !deployment.timer.tick(time.delta()).just_finished()
     {
         return;
     }
 
-    let end = (deployment.next_index + DEPLOYMENT_BATCH_SIZE).min(deployment.target_slots.len());
+    let end = (deployment.next_index + DEPLOYMENT_BATCH_SIZE).min(deployment.total_count);
+    let mut wave = Vec::with_capacity(end - deployment.next_index);
     for index in deployment.next_index..end {
-        spawn_deployment_drone(
+        wave.push(spawn_deployment_drone(
             &mut commands,
             &mut meshes,
             &deployment.drone_mesh.clone(),
             &deployment.drone_mat.clone(),
             &deployment.cone_mat.clone(),
-            launch_position(deployment.base_pos, index, deployment.target_slots.len()),
+            launch_position(deployment.base_pos, index % DEPLOYMENT_BATCH_SIZE, DEPLOYMENT_BATCH_SIZE),
             deployment.base_pos,
             deployment.ingress,
             &deployment.target_slots,
             index,
             wind.intensity,
-        );
+        ));
     }
     deployment.next_index = end;
+    relay_topology.register_wave(deployment.base_entity, wave);
 }
 
 fn spawn_deployment_drone(
@@ -430,8 +527,9 @@ fn spawn_deployment_drone(
     target_slots: &[Vec3],
     index: usize,
     wind_intensity: f32,
-) {
-    let antennas = formation_antennas(target_slots, index, base_pos);
+) -> Entity {
+    let slot_index = index % target_slots.len();
+    let antennas = formation_antennas(target_slots, slot_index, base_pos);
     let drone_entity = commands
         .spawn((
             Mesh3d(drone_mesh.clone()),
@@ -441,7 +539,7 @@ fn spawn_deployment_drone(
             Antennas(antennas.clone()),
             DeploymentTarget {
                 ingress,
-                slot: target_slots[index],
+                slot: target_slots[slot_index],
                 spreading: false,
             },
             DroneKinematics::default(),
@@ -475,6 +573,76 @@ fn spawn_deployment_drone(
             ThemeRole::DroneCone,
             crate::SimulationEntity,
         ));
+    }
+    drone_entity
+}
+
+fn clamp_to_relay_parent(position: Vec3, parent_position: Vec3) -> Vec3 {
+    let offset = position - parent_position;
+    let distance = offset.length();
+    if distance <= RELAY_WORKING_HOP_KM || distance <= f32::EPSILON {
+        position
+    } else {
+        parent_position + offset / distance * RELAY_WORKING_HOP_KM
+    }
+}
+
+/// Final hard guard for the protected relay tree. Connectivity outranks wind,
+/// collision avoidance, and the target geofence.
+pub fn enforce_relay_hops(
+    topology: Res<RelayTopology>,
+    mut queries: ParamSet<(
+        Query<(Entity, &Transform), Or<(With<Drone>, With<Base>)>>,
+        Query<(Entity, &mut Transform, &mut DroneKinematics), With<Drone>>,
+    )>,
+) {
+    let positions: HashMap<Entity, Vec3> = queries
+        .p0()
+        .iter()
+        .map(|(entity, transform)| (entity, transform.translation))
+        .collect();
+    let mut corrected = positions.clone();
+
+    // Resolve from the base-connected rear wave outward. Each child therefore
+    // clamps against its parent's corrected position, even when several hops
+    // overshoot during the same frame.
+    for wave in topology.waves.iter().rev() {
+        for &entity in wave {
+            let Some(parent_position) = topology
+                .parent(entity)
+                .and_then(|parent| corrected.get(&parent).copied())
+            else {
+                continue;
+            };
+            let Some(position) = corrected.get(&entity).copied() else {
+                continue;
+            };
+            corrected.insert(entity, clamp_to_relay_parent(position, parent_position));
+        }
+    }
+
+    for (entity, mut transform, mut kinematics) in &mut queries.p1() {
+        let Some(parent_position) = topology
+            .parent(entity)
+            .and_then(|parent| corrected.get(&parent).copied())
+        else {
+            kinematics.velocity = Vec3::ZERO;
+            continue;
+        };
+        let before = transform.translation;
+        let Some(clamped) = corrected.get(&entity).copied() else {
+            kinematics.velocity = Vec3::ZERO;
+            continue;
+        };
+        if clamped == before {
+            continue;
+        }
+        let outward = (before - parent_position).normalize_or_zero();
+        transform.translation = clamped;
+        let commanded_outward = kinematics.velocity.dot(outward).max(0.0);
+        let flown_outward = kinematics.flown_velocity.dot(outward).max(0.0);
+        kinematics.velocity -= outward * commanded_outward;
+        kinematics.flown_velocity -= outward * flown_outward;
     }
 }
 
@@ -511,12 +679,14 @@ pub fn draw_grid(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
     fn launch_pads_clear_each_other_and_the_base() {
         let base = Vec3::ZERO;
-        let count = 17;
+        let count = DEPLOYMENT_BATCH_SIZE;
         let pads: Vec<Vec3> = (0..count)
             .map(|index| launch_position(base, index, count))
             .collect();
@@ -551,5 +721,120 @@ mod tests {
         // The computed four is raised to the five-drone fleet minimum.
         assert_eq!(target_area_drone_count(&area), 5);
         assert_eq!((columns, rows), (3, 2));
+    }
+
+    #[test]
+    fn wave_handoff_keeps_every_drone_on_a_base_path() {
+        let entity = |id| Entity::from_raw_u32(id).expect("valid test entity");
+        let base = entity(1);
+        let first = vec![entity(10), entity(11), entity(12)];
+        let second = vec![entity(20), entity(21)];
+        let mut topology = RelayTopology::default();
+
+        topology.register_wave(base, first.clone());
+        assert!(first.iter().all(|&drone| topology.requires_link(drone, base)));
+        assert!(topology.same_wave(first[0], first[2]));
+
+        topology.register_wave(base, second.clone());
+        assert_eq!(topology.parent(first[0]), Some(second[0]));
+        assert_eq!(topology.parent(first[1]), Some(second[1]));
+        assert_eq!(topology.parent(first[2]), Some(second[0]));
+        assert!(second.iter().all(|&drone| topology.requires_link(drone, base)));
+        assert!(first.iter().all(|&drone| !topology.requires_link(drone, base)));
+        assert!(topology.all_paths_reach_base());
+    }
+
+    #[test]
+    fn deployment_timer_fires_once_every_thirty_seconds() {
+        let mut timer = Timer::from_seconds(DEPLOYMENT_INTERVAL_SECS, TimerMode::Repeating);
+        assert!(!timer.tick(Duration::from_secs(29)).just_finished());
+        assert!(timer.tick(Duration::from_secs(1)).just_finished());
+        assert!(!timer.tick(Duration::from_secs(29)).just_finished());
+        assert!(timer.tick(Duration::from_secs(1)).just_finished());
+    }
+
+    #[test]
+    fn distant_targets_add_only_the_required_relay_waves() {
+        let base = Vec3::ZERO;
+        assert_eq!(relay_reserve_drone_count(base, &[Vec3::new(2.7, 0.0, 0.0)]), 0);
+        assert_eq!(relay_reserve_drone_count(base, &[Vec3::new(5.0, 0.0, 0.0)]), 3);
+        assert_eq!(relay_reserve_drone_count(base, &[Vec3::new(8.0, 0.0, 0.0)]), 6);
+    }
+
+    #[test]
+    fn relay_clamp_preserves_margin_below_three_kilometres() {
+        let parent = Vec3::ZERO;
+        let clamped = clamp_to_relay_parent(Vec3::new(10.0, 0.0, 0.0), parent);
+        assert!((clamped.distance(parent) - RELAY_WORKING_HOP_KM).abs() < 1e-6);
+        assert!(clamped.distance(parent) < MAX_RELAY_HOP_KM);
+    }
+
+    #[test]
+    fn relay_guard_clamps_multiple_overshooting_hops_base_outward() {
+        let mut app = App::new();
+        let base = app
+            .world_mut()
+            .spawn((
+                Base { id: "base".into(), position: Vec3::ZERO, antennas: Vec::new() },
+                Transform::default(),
+            ))
+            .id();
+        let front = app
+            .world_mut()
+            .spawn((
+                Drone { id: "front".into() },
+                Transform::from_xyz(12.0, 0.0, 0.0),
+                DroneKinematics::default(),
+            ))
+            .id();
+        let rear = app
+            .world_mut()
+            .spawn((
+                Drone { id: "rear".into() },
+                Transform::from_xyz(10.0, 0.0, 0.0),
+                DroneKinematics::default(),
+            ))
+            .id();
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![front]);
+        topology.register_wave(base, vec![rear]);
+        app.insert_resource(topology);
+        app.add_systems(Update, enforce_relay_hops);
+
+        app.update();
+
+        let front_position = app.world().entity(front).get::<Transform>().unwrap().translation;
+        let rear_position = app.world().entity(rear).get::<Transform>().unwrap().translation;
+        assert!(rear_position.distance(Vec3::ZERO) <= RELAY_WORKING_HOP_KM);
+        assert!(front_position.distance(rear_position) <= RELAY_WORKING_HOP_KM);
+    }
+
+    #[test]
+    fn relay_guard_system_clamps_the_real_transform() {
+        let mut app = App::new();
+        let base = app
+            .world_mut()
+            .spawn((
+                Base { id: "base".into(), position: Vec3::ZERO, antennas: Vec::new() },
+                Transform::default(),
+            ))
+            .id();
+        let drone = app
+            .world_mut()
+            .spawn((
+                Drone { id: "drone".into() },
+                Transform::from_xyz(10.0, 0.0, 0.0),
+                DroneKinematics::default(),
+            ))
+            .id();
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![drone]);
+        app.insert_resource(topology);
+        app.add_systems(Update, enforce_relay_hops);
+
+        app.update();
+
+        let position = app.world().entity(drone).get::<Transform>().unwrap().translation;
+        assert!((position.length() - RELAY_WORKING_HOP_KM).abs() < 1e-6);
     }
 }
