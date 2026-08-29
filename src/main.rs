@@ -1,7 +1,9 @@
 mod antenna;
 mod area;
+mod avoidance;
 mod base;
 mod camera;
+mod demo;
 mod drone;
 mod factories;
 mod navigation;
@@ -31,6 +33,18 @@ enum AppState {
 }
 
 fn main() {
+    // Opt-in only: `KOLBE_DEMO=1 cargo run` launches the collision-avoidance
+    // demo (see src/demo.rs) instead of the simulator. A plain `cargo run`
+    // always takes the normal path below.
+    //
+    // Checked for a truthy *value*, not mere presence — `std::env::var(..)
+    // .is_ok()` would also fire on an empty `KOLBE_DEMO=`, which is how a
+    // stray line in a .env or CI config silently hijacks the real app.
+    if demo::requested() {
+        demo::run();
+        return;
+    }
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -48,6 +62,7 @@ fn main() {
         // the right volume — init it up front rather than having `world::setup`
         // race the first Update that reads it.
         .init_resource::<navigation::PatrolVolume>()
+        .init_resource::<navigation::MovementSpeed>()
         .insert_resource(SelectedDrone(None))
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
@@ -102,13 +117,14 @@ fn main() {
         .add_systems(OnExit(AppState::Simulation), terrain::cleanup_trees)
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
-        // Integration runs last in the movement chain: recovery and drift have
-        // both had their say on this frame's velocity by the time this steps
-        // the transforms.
+        // Integration runs last in the movement chain: every system that wants
+        // a say in this frame's velocity — navigation, recovery, then the
+        // proximity ring's veto — has already written it by the time this
+        // steps the transforms.
         .add_systems(
             Update,
             factories::movement::apply_velocity
-                .after(navigation::drift_navigate)
+                .after(avoidance::avoid_collisions)
                 .run_if(in_state(AppState::Simulation)),
         )
         .add_systems(
@@ -139,6 +155,10 @@ fn main() {
                 // (which owns velocity for the drones it is flying home).
                 navigation::reroll_drift_vectors,
                 navigation::drift_navigate,
+                // Last word on velocity: the proximity ring deflects whatever
+                // the navigators above just committed to, before
+                // `apply_velocity` integrates it.
+                avoidance::avoid_collisions,
             )
                 .chain()
                 .run_if(in_state(AppState::Simulation)),
