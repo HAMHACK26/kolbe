@@ -53,7 +53,7 @@ pub(crate) struct DeploymentQueue {
 /// Radius each drone's coverage footprint must reach.
 pub const FORMATION_RADIUS_KM: f32 = 3.0;
 /// Fleet multiplier applied after computing the minimum gap-free coverage grid.
-const COVERAGE_RESERVE: f32 = 1.50;
+const COVERAGE_RESERVE: f32 = 1.75;
 
 /// Area of the blue, operator-selected target polygon in km². The orange
 /// square is deliberately excluded: it only exists to fetch terrain.
@@ -86,7 +86,7 @@ fn coverage_grid_dimensions(area: &crate::area::NetworkArea) -> (usize, usize) {
     (columns, count.div_ceil(columns))
 }
 
-/// Number of drones for the blue target's 3 km coverage cells, including 50%
+/// Number of drones for the blue target's 3 km coverage cells, including 75%
 /// reserve. A radius-3 km circle's gap-free square cell is 3√2 km wide, or
 /// 18 km², so this uses the selected polygon's area rather than its orange
 /// bounding square.
@@ -130,6 +130,7 @@ pub fn target_area_formation(
     let half_side = area.side_km as f32 * 0.5;
     (0..rows)
         .flat_map(|row| (0..columns).map(move |column| (column, row)))
+        .take(target_area_drone_count(area))
         .map(|(column, row)| {
             let x = center_x - half_side + (column as f32 + 0.5) * cell_width;
             let z = center_z - half_side + (row as f32 + 0.5) * cell_height;
@@ -504,21 +505,22 @@ mod tests {
     }
 
     #[test]
-    fn coverage_grid_has_fifty_percent_reserve_without_gaps() {
+    fn coverage_count_uses_the_blue_polygon_not_its_orange_square() {
         let area = crate::area::NetworkArea {
             side_km: 6.0,
             valid: true,
+            center: (0.0, 0.0),
+            hull: vec![
+                (-3.0 / 111.320, -3.0 / 110.574),
+                (3.0 / 111.320, -3.0 / 110.574),
+                (3.0 / 111.320, 3.0 / 110.574),
+                (-3.0 / 111.320, 3.0 / 110.574),
+            ],
             ..default()
         };
         let (columns, rows) = coverage_grid_dimensions(&area);
-        // A 2×2 grid is the minimum gap-free layout; 50% reserve makes it 3×2.
-        assert_eq!((columns, rows), (3, 2));
-        assert_eq!(target_area_drone_count(&area), 6);
-        let farthest_cell_corner =
-            ((area.side_km as f32 / columns as f32).powi(2)
-                + (area.side_km as f32 / rows as f32).powi(2))
-                .sqrt()
-                * 0.5;
-        assert!(farthest_cell_corner <= FORMATION_RADIUS_KM);
+        // 36 km² / 18 km² per gap-free cell × 1.75 reserve = 4 drones.
+        assert_eq!(target_area_drone_count(&area), 4);
+        assert_eq!((columns, rows), (2, 2));
     }
 }

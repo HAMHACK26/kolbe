@@ -131,6 +131,7 @@ fn main() {
                 area::pan_zoom,
                 area::zoom_buttons,
                 area::track_viewport_size,
+                area::apply_map_theme,
                 tiles::poll_tile_fetches,
                 area::sync_map_tiles,
                 area::recompute_area_on_change,

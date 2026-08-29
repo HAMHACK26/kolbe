@@ -317,6 +317,12 @@ pub(crate) struct MapContent;
 #[derive(Component)]
 struct MapTile;
 
+/// A palette-matched veil over standard OSM raster tiles. The public OSM
+/// source has no dark variant, so this keeps its data and attribution while
+/// making the map legible within the selected dark UI mode.
+#[derive(Component)]
+pub(crate) struct MapShade;
+
 /// One spawned tile entity, and whether it's showing the real tile yet.
 struct SpawnedTile {
     entity: Entity,
@@ -780,15 +786,32 @@ fn spawn_map(body: &mut ChildSpawnerCommands, fonts: &crate::UiFonts, p: &Palett
         // in screen space from the current `MapView` (see
         // `lonlat_to_screen_px`) and rebuilt on pan/zoom/point changes rather
         // than carrying a scale/translate transform of their own.
-        viewport.spawn((
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                ..default()
-            },
-            MapContent,
-            Pickable::IGNORE,
-        ));
+        viewport
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                MapContent,
+                Pickable::IGNORE,
+            ))
+            .with_child((
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                BackgroundColor(if p.bg == (Theme { dark: true }).palette().bg {
+                    Color::BLACK.with_alpha(0.48)
+                } else {
+                    Color::NONE
+                }),
+                ZIndex(0),
+                MapShade,
+                Pickable::IGNORE,
+            ));
 
         for (right, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
             spawn_bracket(viewport, right, bottom, p.line);
@@ -1489,7 +1512,7 @@ pub fn sync_map_tiles(
             };
             let spawn_tile = |commands: &mut Commands, image: ImageNode, is_final: bool| {
                 let entity = commands
-                    .spawn((tile_node(), image, Pickable::IGNORE, MapTile))
+                    .spawn((tile_node(), image, ZIndex(-1), Pickable::IGNORE, MapTile))
                     .id();
                 commands.entity(content).add_child(entity);
                 SpawnedTile { entity, is_final }
@@ -1536,6 +1559,16 @@ pub fn sync_map_tiles(
             false
         }
     });
+}
+
+/// Darken OSM imagery in dark mode without changing its tile provider.
+pub fn apply_map_theme(theme: Res<Theme>, mut shades: Query<&mut BackgroundColor, With<MapShade>>) {
+    if !theme.is_changed() {
+        return;
+    }
+    for mut shade in &mut shades {
+        shade.0 = if theme.dark { Color::BLACK.with_alpha(0.48) } else { Color::NONE };
+    }
 }
 
 /// Recompute the network-area preview whenever the point list changes.

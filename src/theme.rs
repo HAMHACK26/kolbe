@@ -36,9 +36,15 @@ pub struct SunRays;
 #[derive(Component)]
 pub struct ThemeEmoji;
 
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct Theme {
     pub dark: bool,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self { dark: true }
+    }
 }
 
 /// Named Catppuccin colors used across the app.
