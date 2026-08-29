@@ -35,8 +35,8 @@ use crate::{
 /// radius from it so drones keep clear of the structure.
 pub const BASE_BOX_SIZE_KM: f32 = 0.075;
 /// Keep a compact launch and recovery pad clear of tree canopies around the
-/// station. This is 75% smaller than the previous 2.35 km clearing.
-pub const BASE_FOLIAGE_CLEARANCE_KM: f32 = 0.5875;
+/// station. Its area is 50% of the previous 0.5875 km-radius clearing.
+pub const BASE_FOLIAGE_CLEARANCE_KM: f32 = 0.4154;
 
 /// Marks the ground control station entity.
 #[derive(Component)]
