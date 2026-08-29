@@ -47,7 +47,6 @@ pub struct Palette {
     pub subtext: Color,  // dimmed body text (subtext0)
     pub accent: Color,   // blue — table header / highlights
     pub drone: Color,    // red
-    pub drone_cone: Color, // sapphire
     pub base: Color,     // yellow
     pub grid: Color,     // overlay0
     pub danger: Color,   // red — errors
@@ -66,7 +65,6 @@ impl Theme {
                 subtext: Color::srgb_u8(0xa6, 0xad, 0xc8),
                 accent: Color::srgb_u8(0x89, 0xb4, 0xfa),
                 drone: Color::srgb_u8(0xf3, 0x8b, 0xa8),
-                drone_cone: Color::srgb_u8(0x74, 0xc7, 0xec),
                 base: Color::srgb_u8(0xf9, 0xe2, 0xaf),
                 grid: Color::srgb_u8(0x6c, 0x70, 0x86),
                 danger: Color::srgb_u8(0xf3, 0x8b, 0xa8),
@@ -82,7 +80,6 @@ impl Theme {
                 subtext: Color::srgb_u8(0x6c, 0x6f, 0x85),
                 accent: Color::srgb_u8(0x1e, 0x66, 0xf5),
                 drone: Color::srgb_u8(0xd2, 0x0f, 0x39),
-                drone_cone: Color::srgb_u8(0x20, 0x9f, 0xb5),
                 base: Color::srgb_u8(0xdf, 0x8e, 0x1d),
                 grid: Color::srgb_u8(0x9c, 0xa0, 0xb0),
                 danger: Color::srgb_u8(0xd2, 0x0f, 0x39),
@@ -155,9 +152,11 @@ pub fn apply_theme(
                 mat.base_color = p.drone;
                 mat.emissive = glow(p.drone, 2.0);
             }
+            // Drone and base cones share the base's yellow — the whole radio
+            // side of the picture reads as one system.
             ThemeRole::DroneCone => {
-                mat.base_color = p.drone_cone.with_alpha(0.30);
-                mat.emissive = glow(p.drone_cone, 0.6);
+                mat.base_color = p.base.with_alpha(0.30);
+                mat.emissive = glow(p.base, 0.6);
             }
             ThemeRole::BaseMarker => {
                 mat.base_color = p.base;

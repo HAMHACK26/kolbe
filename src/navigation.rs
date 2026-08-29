@@ -38,6 +38,10 @@
 
 use bevy::prelude::*;
 
+use crate::base::Base;
+use crate::drone::Drone;
+use crate::factories::movement::DroneKinematics;
+
 /// The flight envelope a drone is governed to. All limits are deliberately
 /// modest: real consumer/enterprise quads are electronically governed well
 /// below their raw physical ceiling for stability, camera stability, and
@@ -253,5 +257,80 @@ pub fn navigate(state: &mut DroneState, target: Vec3, limits: &FlightLimits, dt:
         let max_delta_yaw = limits.max_yaw_rate_deg_s * dt;
         delta = delta.clamp(-max_delta_yaw, max_delta_yaw);
         state.heading_deg = (state.heading_deg + delta).rem_euclid(360.0);
+    }
+}
+
+// ─── Orbiting the base ─────────────────────────────────────────────────────────
+
+/// How far ahead on the circle each drone chases, in degrees of arc.
+///
+/// A carrot-on-a-stick waypoint: it sits on the ring, so steering at it is
+/// what holds the radius, and it moves with the drone, so the drone never
+/// arrives and never triggers [`navigate`]'s braking-on-approach. Small enough
+/// that the chord to it hugs the circle (at a 2.5 km radius, 5° cuts the arc
+/// by ~2 m) and far enough that it always stays outside the braking distance.
+const ORBIT_LEAD_DEG: f32 = 5.0;
+
+/// A drone's assigned circle around the base.
+///
+/// The radius is fixed at spawn from `world::ring_formation` rather than read
+/// back from the drone's live position, so a drone that gets pushed off the
+/// ring (an avoidance deflection, a recovery detour) flies back onto it
+/// instead of settling into a wrong orbit. Every drone shares the same radius,
+/// which is what keeps the formation's angular spacing — and therefore its
+/// mesh links — constant all the way around.
+#[derive(Component)]
+pub struct Orbit {
+    pub radius_km: f32,
+}
+
+/// Fly every drone around the base on its assigned circle.
+///
+/// The waypoint is `ORBIT_LEAD_DEG` further around the ring than the drone's
+/// own current bearing from the base, at terrain height plus the drone's
+/// hover offset — so the formation follows the ground rather than flying at a
+/// fixed altitude into a hillside. [`navigate`] does the actual steering, so
+/// the speed, acceleration, climb and yaw limits in [`FlightLimits`] all still
+/// bind.
+///
+/// Only [`DroneKinematics::velocity`] is written; `apply_velocity` integrates
+/// it. Everything downstream is free to override that command — most
+/// importantly `networking::halt_on_link_loss`, which zeroes it when a drone
+/// loses a neighbour, so a broken link stops the formation rather than letting
+/// it keep orbiting away from the drone it just lost.
+pub fn orbit_base(
+    time: Res<Time>,
+    bases: Query<&Base>,
+    terrain: Res<crate::terrain::TerrainHeightMap>,
+    mut drones: Query<(&Transform, &Orbit, &mut DroneKinematics), With<Drone>>,
+) {
+    let Some(base) = bases.iter().next() else {
+        return;
+    };
+    let dt = time.delta_secs();
+    let limits = FlightLimits::default().in_km();
+    let center = base.position;
+
+    for (transform, orbit, mut kin) in &mut drones {
+        let offset = transform.translation.xz() - center.xz();
+        if offset.length_squared() < f32::EPSILON {
+            continue; // sitting on the axis — no bearing to lead from.
+        }
+        // Bearing of this drone from the base, in the same (sin, cos)
+        // convention `world::ring_formation` lays the ring out with.
+        let bearing = offset.x.atan2(offset.y);
+        let lead = bearing + ORBIT_LEAD_DEG.to_radians();
+        let (x, z) =
+            (center.x + orbit.radius_km * lead.sin(), center.z + orbit.radius_km * lead.cos());
+        let target = Vec3::new(x, terrain.height_at(x, z) + crate::world::DRONE_RADIUS, z);
+
+        let mut state = DroneState {
+            position: transform.translation,
+            velocity: kin.velocity,
+            heading_deg: kin.heading_deg,
+        };
+        navigate(&mut state, target, &limits, dt);
+        kin.velocity = state.velocity;
+        kin.heading_deg = state.heading_deg;
     }
 }

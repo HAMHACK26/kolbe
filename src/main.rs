@@ -197,7 +197,17 @@ fn main() {
         .add_systems(
             Update,
             (
-                // Priority reconnection flood first, so a fresh slew-freeze is
+                // Navigator first: it commands this frame's velocity, and
+                // everything below — the link-loss halt, recovery, the
+                // proximity ring — gets to override it before
+                // `apply_velocity` integrates.
+                navigation::orbit_base,
+                // Handshake bookkeeping, then origination, then the flood
+                // itself — so a request that timed out this frame frees the
+                // drone to ask again in the same frame it becomes idle.
+                networking::expire_stale_handshakes,
+                networking::request_nearby_connections,
+                // Priority reconnection flood next, so a fresh slew-freeze is
                 // visible to the aiming systems this same frame.
                 networking::process_reconnect,
                 // Live antenna aiming, before link detection so this frame's

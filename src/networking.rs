@@ -104,6 +104,7 @@ use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
 use crate::spherical::SphericalVec;
+use crate::world::MAX_NEIGHBOR_SPACING_KM;
 use crate::tracking::TrackedPeers;
 
 /// How far ahead the flight-direction vector predicts (seconds).
@@ -118,6 +119,20 @@ pub const SPEED_OF_LIGHT_KM_S: f64 = 299_792.458;
 /// Responder turnaround: how long a drone takes to bounce the header back.
 /// Subtracted from the measured round trip before converting to distance.
 pub const TURNAROUND_DELAY_S: f64 = 1.0e-6;
+
+/// How long a drone waits on an unanswered handshake before giving up, on its
+/// own clock.
+///
+/// Without this a single unanswered `Request` wedges the requester in
+/// `AwaitingAccept` forever — it can never originate another — and an
+/// unanswered `Accept` leaves the target frozen with its antennas held. Both
+/// are dead ends the protocol has no other way out of.
+pub const RECONNECT_TIMEOUT_SECS: f64 = 5.0;
+
+/// How long a drone holds off after a failed handshake before asking again,
+/// on its own clock. Stops a drone that keeps failing from re-flooding the
+/// mesh every frame.
+pub const RECONNECT_RETRY_SECS: f64 = 10.0;
 
 // ─── Per-drone identity & clock ────────────────────────────────────────────────
 
@@ -228,6 +243,13 @@ pub struct Pairing {
     pub seen: HashSet<(String, u8)>,
     pub frozen: bool,
     pub paired_peer_pos: Option<Vec3>,
+    /// When the current state was entered, on this drone's own clock. Only
+    /// meaningful while waiting on a reply — see [`expire_stale_handshakes`].
+    pub state_since: f64,
+    /// Earliest own-clock time this drone may originate another request. Set
+    /// when a handshake times out, so a repeatedly failing drone backs off
+    /// instead of re-flooding every frame.
+    pub retry_after: f64,
 }
 
 /// Everything a *radio node* needs to take part in the mesh — carried by the
@@ -637,7 +659,7 @@ pub fn process_reconnect(
     mut bus: ResMut<ReconnectBus>,
     mut requests: ResMut<ReconnectRequests>,
     bases: Query<&Base>,
-    mut drones: Query<(&DroneUuid, &GlobalTransform, &LinkSet, &mut Pairing)>,
+    mut drones: Query<(&DroneUuid, &GlobalTransform, &LinkSet, &DroneClock, &mut Pairing)>,
 ) {
     let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
     let incoming = std::mem::take(&mut bus.0);
@@ -645,7 +667,7 @@ pub fn process_reconnect(
 
     // ── Originate new requests ──────────────────────────────────────────────
     for (requester_entity, target_uuid) in std::mem::take(&mut requests.0) {
-        let Ok((uuid, _gt, links, mut pairing)) = drones.get_mut(requester_entity) else {
+        let Ok((uuid, _gt, links, clock, mut pairing)) = drones.get_mut(requester_entity) else {
             continue;
         };
         // One handshake at a time — ignore new attempts while mid-flight.
@@ -658,6 +680,7 @@ pub fn process_reconnect(
             request_id: request_id.clone(),
             target: target_uuid.clone(),
         };
+        pairing.state_since = clock.now;
         // Flood the Request out every live link.
         for &peer in links.connected.keys() {
             outgoing.push(ReconnectMsg {
@@ -673,7 +696,7 @@ pub fn process_reconnect(
 
     // ── Process one hop of in-flight messages ───────────────────────────────
     for msg in incoming {
-        let Ok((uuid, gt, links, mut pairing)) = drones.get_mut(msg.to) else { continue };
+        let Ok((uuid, gt, links, clock, mut pairing)) = drones.get_mut(msg.to) else { continue };
 
         // Dedup on (id, phase): already handled → drop entirely.
         let key = (msg.request_id.clone(), msg.kind.phase());
@@ -698,6 +721,7 @@ pub fn process_reconnect(
                             request_id: msg.request_id.clone(),
                             requester: msg.requester.clone(),
                         };
+                        pairing.state_since = clock.now;
                         // Originate the Accept flood back out every live link.
                         for &peer in links.connected.keys() {
                             outgoing.push(ReconnectMsg {
@@ -727,6 +751,7 @@ pub fn process_reconnect(
                             request_id: msg.request_id.clone(),
                             peer: msg.target.clone(),
                         };
+                        pairing.state_since = clock.now;
                         let pos_rel_base = gt.translation() - base_pos;
                         for &peer in links.connected.keys() {
                             outgoing.push(ReconnectMsg {
@@ -747,6 +772,7 @@ pub fn process_reconnect(
                         request_id: msg.request_id.clone(),
                         peer: msg.requester.clone(),
                     };
+                    pairing.state_since = clock.now;
                     // Terminal for this message — don't forward past the target.
                 }
             }
@@ -808,6 +834,104 @@ pub fn halt_on_link_loss(
         if !linked(next) || !linked(prev) {
             kin.velocity = Vec3::ZERO;
         }
+    }
+}
+
+/// Ask a nearby drone for a connection.
+///
+/// A drone that has a free moment — no handshake in flight, not backed off
+/// from a failed one — looks through its mesh table for a drone it is *not*
+/// already linked to whose last known position is within
+/// [`MAX_NEIGHBOR_SPACING_KM`], and requests the closest one. That queues a
+/// `Request` flood in [`ReconnectRequests`] for [`process_reconnect`] to
+/// originate on the next hop.
+///
+/// The distance is measured against the mesh table's `base_pos + row.location`
+/// — comms-derived, possibly relayed, possibly stale — not the peer's true
+/// transform. That is the same estimate `seeking` aims at, and it is all a
+/// real drone would have.
+///
+/// "Available" is not something the requester can see: a peer's handshake
+/// state is its own. The requester only screens for *plausible* — known about,
+/// in range, not already connected — and the target arbitrates for real, since
+/// [`process_reconnect`] accepts a `Request` only when the target is
+/// [`PairingState::Idle`].
+///
+/// A drone with no live links is skipped: the flood travels over live links,
+/// so it would reach nobody and only burn a timeout. Those drones are the ones
+/// `seeking` lets search on their own initiative instead.
+pub fn request_nearby_connections(
+    mut requests: ResMut<ReconnectRequests>,
+    bases: Query<&Base>,
+    drones: Query<
+        (Entity, &GlobalTransform, &DroneClock, &LinkSet, &MeshTable, &Pairing),
+        With<Drone>,
+    >,
+    uuids: Query<&DroneUuid>,
+) {
+    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+
+    for (entity, gt, clock, links, table, pairing) in &drones {
+        // One handshake at a time, and honor the back-off after a failure.
+        if !matches!(pairing.state, PairingState::Idle) || clock.now < pairing.retry_after {
+            continue;
+        }
+        if links.connected.is_empty() {
+            continue;
+        }
+
+        let linked: HashSet<&str> = links
+            .connected
+            .keys()
+            .filter_map(|&peer| uuids.get(peer).ok())
+            .map(|uuid| uuid.0.as_str())
+            .collect();
+
+        let self_pos = gt.translation();
+        let mut nearest: Option<(f32, &str)> = None;
+        for (peer_uuid, row) in &table.0 {
+            if linked.contains(peer_uuid.as_str()) {
+                continue; // already connected — nothing to ask for.
+            }
+            let distance_km = (base_pos + row.location - self_pos).length();
+            if distance_km > MAX_NEIGHBOR_SPACING_KM {
+                continue;
+            }
+            if nearest.is_none_or(|(best, _)| distance_km < best) {
+                nearest = Some((distance_km, peer_uuid.as_str()));
+            }
+        }
+
+        if let Some((_, target_uuid)) = nearest {
+            requests.0.push((entity, target_uuid.to_string()));
+        }
+    }
+}
+
+/// Give up on a handshake nobody answered.
+///
+/// `AwaitingAccept` and `AcceptedAwaitingPosition` both wait on a reply that
+/// may never come — the peer moved out of range, the flood never reached it,
+/// it committed to someone else. Left alone, the requester can never ask again
+/// and the target stays frozen with its antennas held, so both fall back to
+/// `Idle` after [`RECONNECT_TIMEOUT_SECS`] on the waiting drone's own clock,
+/// and back off for [`RECONNECT_RETRY_SECS`] before trying again.
+///
+/// `Paired` is deliberately not expired: it is the handshake's success state,
+/// not a wait.
+pub fn expire_stale_handshakes(mut nodes: Query<(&DroneClock, &mut Pairing)>) {
+    for (clock, mut pairing) in &mut nodes {
+        let waiting = matches!(
+            pairing.state,
+            PairingState::AwaitingAccept { .. } | PairingState::AcceptedAwaitingPosition { .. }
+        );
+        if !waiting || clock.now - pairing.state_since < RECONNECT_TIMEOUT_SECS {
+            continue;
+        }
+        pairing.state = PairingState::Idle;
+        pairing.frozen = false; // release the slew freeze taken for the handshake.
+        pairing.state_since = clock.now;
+        pairing.retry_after = clock.now + RECONNECT_RETRY_SECS;
     }
 }
 

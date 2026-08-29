@@ -33,7 +33,7 @@ use crate::{
 /// Edge length of the cube the ground station is drawn as, km. Doubles as its
 /// physical footprint — [`crate::avoidance`] derives the base's bounding
 /// radius from it so drones keep clear of the structure.
-pub const BASE_BOX_SIZE_KM: f32 = 0.075;
+pub const BASE_BOX_SIZE_KM: f32 = 0.01875;
 
 /// Marks the ground control station entity.
 #[derive(Component)]

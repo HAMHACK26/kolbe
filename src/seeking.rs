@@ -70,7 +70,9 @@ use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
 use crate::navigation::FlightLimits;
-use crate::networking::{DroneClock, DroneUuid, LinkSet, MeshTable, Pairing, RingIndex};
+use crate::networking::{
+    DroneClock, DroneUuid, LinkSet, MeshTable, Pairing, PairingState, RingIndex,
+};
 
 /// Mechanical/electronic scan speed floor, rad/s (~4.8 rpm).
 pub const OMEGA_MIN_RAD_S: f32 = 0.5;
@@ -202,6 +204,22 @@ pub struct SeekState {
 /// antennas #1/#3 have gone unlinked with a spiral offset on top of the
 /// same "aim straight at the last-known point" baseline tracking would
 /// otherwise leave them at.
+///
+/// ## When a drone is allowed to search at all
+///
+/// A dark slot is not on its own a reason to start sweeping. Searching means
+/// slewing a 1°-wide beam away from where it is currently pointing, which
+/// risks the links the drone still has, so it only happens when the drone has
+/// actually been asked to make a connection: an in-flight reconnection
+/// handshake, i.e. [`Pairing::state`] is anything other than
+/// [`PairingState::Idle`] (see the "Reconnection handshake" section of the
+/// `networking` module docs).
+///
+/// The one exception is a drone that is completely dark — no antenna linked to
+/// anything, not even the base. It has no live link to lose by sweeping, and
+/// no path left for a request to reach it on, so it searches on its own
+/// initiative. Anything with at least one link holds its aim and waits to be
+/// asked.
 #[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
 pub fn seek_lost_links(
     time: Res<Time>,
@@ -253,6 +271,13 @@ pub fn seek_lost_links(
         // "Stopped" for a reconnection handshake — hold antenna slew steady,
         // don't spiral-search this frame.
         if pairing.frozen {
+            continue;
+        }
+        // No request to connect, and still linked to something? Then don't
+        // sweep — see this function's docs.
+        let requested = !matches!(pairing.state, PairingState::Idle);
+        let completely_dark = links.connected.is_empty();
+        if !requested && !completely_dark {
             continue;
         }
         let self_pos = self_transform.translation;

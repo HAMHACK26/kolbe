@@ -2,7 +2,6 @@ use bevy::{mesh::primitives::ConeAnchor, prelude::*};
 
 use crate::{
     antenna::{Antenna, Antennas, radar_direction},
-    base::Base,
     drone::SelectedDrone,
     factories::movement::DroneKinematics,
     networking::LinkSet,
@@ -84,24 +83,21 @@ pub fn sync_radar_transforms(
 pub fn draw_mesh_links(
     mut gizmos: Gizmos,
     theme: Res<crate::theme::Theme>,
-    nodes: Query<(Entity, &Transform, &LinkSet, Option<&Base>), With<Antennas>>,
+    nodes: Query<(Entity, &Transform, &LinkSet), With<Antennas>>,
 ) {
-    let pal = theme.palette();
+    // One color for every hop, base or drone — the mesh is one system, and the
+    // cones the links come out of are drawn in the same yellow.
+    let color = theme.palette().base;
     let nodes: Vec<RadioNode> = nodes
         .iter()
-        .map(|(entity, transform, links, base)| RadioNode {
+        .map(|(entity, transform, links)| RadioNode {
             entity,
             position: transform.translation,
             links,
-            is_base: base.is_some(),
         })
         .collect();
-    for segment in mutual_link_segments(&nodes) {
-        // Base links are the ground station's reach into the mesh, drawn in
-        // the base's own color so they read apart from the drone-to-drone
-        // hops at a glance.
-        let color = if segment.touches_base { pal.base } else { pal.drone_cone };
-        gizmos.line(segment.from, segment.to, color);
+    for (from, to) in mutual_link_segments(&nodes) {
+        gizmos.line(from, to, color);
     }
 }
 
@@ -110,32 +106,18 @@ struct RadioNode<'a> {
     entity: Entity,
     position: Vec3,
     links: &'a LinkSet,
-    is_base: bool,
-}
-
-/// One line to draw.
-#[derive(Debug, PartialEq)]
-struct LinkSegment {
-    from: Vec3,
-    to: Vec3,
-    /// Either endpoint is the base, which selects the segment's color.
-    touches_base: bool,
 }
 
 /// The undirected segments of [`draw_mesh_links`]: one per pair that appears
 /// in *both* nodes' link sets, each pair yielded exactly once.
-fn mutual_link_segments(nodes: &[RadioNode]) -> Vec<LinkSegment> {
+fn mutual_link_segments(nodes: &[RadioNode]) -> Vec<(Vec3, Vec3)> {
     let mut segments = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
         for peer in &nodes[i + 1..] {
             let mutual = node.links.connected.contains_key(&peer.entity)
                 && peer.links.connected.contains_key(&node.entity);
             if mutual {
-                segments.push(LinkSegment {
-                    from: node.position,
-                    to: peer.position,
-                    touches_base: node.is_base || peer.is_base,
-                });
+                segments.push((node.position, peer.position));
             }
         }
     }

@@ -6,6 +6,7 @@ use crate::{
     camera::OrbitCamera,
     drone::{Drone, DroneType, SelectedDrone, drone_id, make_antenna},
     factories::{DroneAi, movement::DroneKinematics},
+    navigation::Orbit,
     networking::NetworkingBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     recovery::{ContactMemory, RecoveryState},
@@ -18,7 +19,7 @@ use crate::{
 };
 
 pub const DRONE_COUNT: usize = 5;
-pub const DRONE_RADIUS: f32 = 0.045;
+pub const DRONE_RADIUS: f32 = 0.01125;
 
 /// Hard cap on the distance between two ring neighbors, km.
 ///
@@ -67,27 +68,40 @@ pub fn ring_formation(
         base_pos.z.clamp(-center_limit, center_limit),
     );
 
-    let ring_at = |radius: f32, i: usize| {
-        let angle = i as f32 / n * std::f32::consts::TAU;
+    let point_at = |radius: f32, angle: f32| {
         let (x, z) = (center.x + radius * angle.sin(), center.y + radius * angle.cos());
         Vec3::new(x, height_at(x, z) + DRONE_RADIUS, z)
     };
+    let slot_angle = |i: usize| i as f32 / n * std::f32::consts::TAU;
 
     // The chord above is a *flat* distance, but the drones sit on the terrain,
     // so relief stretches the real 3-D neighbor distance past the cap. Shrink
     // until the true spacing is inside it — iteratively, because moving the
     // ring inward also changes which terrain it lands on.
+    //
+    // Checked at *every* rotation of the formation, not just the spawn
+    // angles: the drones orbit the base (`navigation::orbit_base`), so a pair
+    // of hills anywhere on the circle would otherwise break the link the
+    // moment the ring turned onto them.
+    const SAMPLES_PER_SLOT: usize = 12;
+    let worst_over_the_orbit = |radius: f32| {
+        let samples = DRONE_COUNT * SAMPLES_PER_SLOT;
+        (0..samples)
+            .map(|k| {
+                let angle = k as f32 / samples as f32 * std::f32::consts::TAU;
+                point_at(radius, angle).distance(point_at(radius, angle + slot_angle(1)))
+            })
+            .fold(0.0f32, f32::max)
+    };
     for _ in 0..32 {
-        let worst = (0..DRONE_COUNT)
-            .map(|i| ring_at(radius, i).distance(ring_at(radius, (i + 1) % DRONE_COUNT)))
-            .fold(0.0f32, f32::max);
+        let worst = worst_over_the_orbit(radius);
         if worst <= MAX_NEIGHBOR_SPACING_KM {
             break;
         }
         radius *= (MAX_NEIGHBOR_SPACING_KM / worst) * 0.999;
     }
 
-    (0..DRONE_COUNT).map(|i| ring_at(radius, i)).collect()
+    (0..DRONE_COUNT).map(|i| point_at(radius, slot_angle(i))).collect()
 }
 
 /// The three antennas drone `i` spawns with, already aimed at its mesh
@@ -148,9 +162,11 @@ pub fn setup(
         emissive: LinearRgba::new(2.0, 0.0, 0.0, 1.0),
         ..default()
     });
+    // Same yellow as the base's cones — `apply_theme` keeps it in sync via
+    // `ThemeRole::DroneCone`.
     let cone_mat = materials.add(StandardMaterial {
-        base_color: pal.drone_cone.with_alpha(0.30),
-        emissive: LinearRgba::new(0.0, 0.4, 0.8, 0.0),
+        base_color: pal.base.with_alpha(0.30),
+        emissive: LinearRgba::new(0.6, 0.5, 0.0, 0.0),
         alpha_mode: AlphaMode::Blend,
         double_sided: true,
         cull_mode: None,
@@ -176,6 +192,10 @@ pub fn setup(
                 Drone { id: drone_id(i), drone_type },
                 Antennas(antennas.clone()),
                 DroneKinematics::default(),
+                // Every drone orbits the base on the same circle it spawned
+                // on, so the formation's angular spacing — and its links —
+                // stay put all the way around.
+                Orbit { radius_km: (drone_pos.xz() - base_pos.xz()).length() },
                 DroneAi::default(),
                 CommandQueue::default(),
                 NetworkingBundle::random(i),
