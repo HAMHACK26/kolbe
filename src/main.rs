@@ -182,7 +182,8 @@ fn main() {
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
         .add_systems(Update, theme::apply_loading_theme)
-        // Integration runs after navigation/recovery and the final avoidance
+        // Integration runs last in the movement chain: every system that wants
+        // a say in this frame's velocity — navigation, recovery, then the
         // proximity ring's veto — has already written it by the time this
         // steps the transforms.
         .add_systems(
@@ -220,7 +221,9 @@ fn main() {
                 // (which owns velocity for the drones it is flying home).
                 navigation::reroll_drift_vectors,
                 navigation::drift_navigate,
-                // Last word on velocity before integration.
+                // Last word on velocity: the proximity ring deflects whatever
+                // the navigators above just committed to, before
+                // `apply_velocity` integrates it.
                 avoidance::avoid_collisions,
             )
                 .chain()
