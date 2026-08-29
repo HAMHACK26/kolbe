@@ -101,6 +101,11 @@ fn main() {
         .init_state::<AppState>()
         .init_resource::<area::ScenarioArea>()
         .init_resource::<terrain::VegetationSettings>()
+        // The patrol box is derived from WORLD_SIZE, so its Default is already
+        // the right volume — init it up front rather than having `world::setup`
+        // race the first Update that reads it.
+        .init_resource::<navigation::PatrolVolume>()
+        .init_resource::<navigation::MovementSpeed>()
         .insert_resource(SelectedDrone(None))
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
@@ -163,6 +168,7 @@ fn main() {
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, terrain::draw_network_area.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, world::draw_patrol_volume.run_if(in_state(AppState::Simulation)))
         // Contours and trees are alternatives: a forest covers the ground the
         // contours describe, so only one of the two is drawn.
         .add_systems(
@@ -176,8 +182,7 @@ fn main() {
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
         .add_systems(Update, theme::apply_loading_theme)
-        // Integration runs last in the movement chain: every system that wants
-        // a say in this frame's velocity — navigators first, then the
+        // Integration runs after navigation/recovery and the final avoidance
         // proximity ring's veto — has already written it by the time this
         // steps the transforms.
         .add_systems(
@@ -196,19 +201,26 @@ fn main() {
                 // Priority reconnection flood first, so a fresh slew-freeze is
                 // visible to the aiming systems this same frame.
                 networking::process_reconnect,
-                // Antenna aiming (tracking::maintain_mesh_antennas,
-                // seeking::seek_lost_links) is disabled for now — antennas and
-                // radar cones stay at their spawn angles. Wiring live aiming
-                // back in is a future PR.
+                // Aim live links at their ring neighbours, then spiral-search
+                // whichever antenna slots have gone unlinked. Order matters:
+                // seeking only overrides slots tracking left without a lock.
+                tracking::maintain_mesh_antennas,
+                seeking::seek_lost_links,
                 networking::detect_links_and_send_headers,
                 networking::route_packets,
+                base::update_base_comms,
                 // Partition detection + recovery run last — they need the
                 // freshly (re)detected links and updated mesh table.
                 recovery::detect_partitions,
                 recovery::run_recovery,
-                // Last word on velocity: the proximity ring deflects whatever
-                // the navigators above just committed to, before
-                // `apply_velocity` integrates it.
+                // Queue link swaps off the mesh table now that it's current.
+                seeking::reconnect_to_closest,
+                // Flight comes last: re-roll expired drift headings, then fly
+                // them. Both write velocity, so they must land after recovery
+                // (which owns velocity for the drones it is flying home).
+                navigation::reroll_drift_vectors,
+                navigation::drift_navigate,
+                // Last word on velocity before integration.
                 avoidance::avoid_collisions,
             )
                 .chain()
