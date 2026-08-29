@@ -14,15 +14,31 @@ mod spherical;
 mod sweden_geo;
 mod terrain;
 mod theme;
+mod tiles;
 mod tracking;
 mod ui;
 mod world;
 
-use bevy::{picking::prelude::MeshPickingPlugin, prelude::*};
+use bevy::{asset::AssetId, picking::prelude::MeshPickingPlugin, prelude::*};
 
 use camera::OrbitCamera;
 use drone::SelectedDrone;
 use theme::Theme;
+
+/// Fira Sans (OFL-licensed, bundled from Bevy's own example assets) — has
+/// full Latin/Scandinavian coverage. Bevy's *actual* built-in default font is
+/// a stripped-down subset (`FiraMono-subset.ttf`, enabled by the
+/// `default_font` feature) that's missing å/ä/ö, rendering them as a tofu
+/// (□) box — every city label and the "Östersund"/"Åre"-style names in this
+/// app hit that immediately. Overwriting the default font *asset*, rather
+/// than touching every `TextFont { .. }` call site, fixes every one of them
+/// at once — see `bevy_text::TextPlugin::build`, which does the exact same
+/// `Assets<Font>::insert(AssetId::default(), ..)` trick to install its own.
+const DEFAULT_UI_FONT: &[u8] = include_bytes!("../assets/fonts/FiraSans-Bold.ttf");
+
+fn install_default_font(mut fonts: ResMut<Assets<Font>>) {
+    let _ = fonts.insert(AssetId::<Font>::default(), Font::from_bytes(DEFAULT_UI_FONT.to_vec()));
+}
 
 #[derive(States, Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 enum AppState {
@@ -80,7 +96,8 @@ fn main() {
         .init_resource::<networking::ReconnectBus>()
         .init_resource::<networking::ReconnectRequests>()
         .init_resource::<ui::NetworkTablePanelOpen>()
-        .add_systems(Startup, (ui::setup_camera, theme::setup_moon))
+        .init_resource::<tiles::TileCache>()
+        .add_systems(Startup, (install_default_font, ui::setup_camera, theme::setup_moon))
         .add_systems(OnEnter(AppState::AreaSelection), area::setup)
         .add_systems(
             Update,
@@ -90,7 +107,8 @@ fn main() {
                 area::point_table_and_buttons,
                 area::pan_zoom,
                 area::zoom_buttons,
-                area::apply_pan_zoom,
+                tiles::poll_tile_fetches,
+                area::sync_map_tiles,
                 area::recompute_area_on_change,
                 area::redraw_polygon,
                 area::redraw_table,

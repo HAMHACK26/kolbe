@@ -1,26 +1,52 @@
+use std::collections::{HashMap, HashSet};
+
 use bevy::{
-    asset::RenderAssetUsages,
-    image::Image,
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
     prelude::*,
-    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
-    ui::{RelativeCursorPosition, UiTransform, Val2},
+    ui::RelativeCursorPosition,
 };
 
-use crate::{polygon, sweden_geo, theme::Theme, AppState};
+use crate::{polygon, sweden_geo, theme::Theme, tiles, AppState};
 
 /// Kept for existing callers (terrain fetch math) — the network-area picker
 /// now drives `ScenarioArea.size_km` dynamically instead.
 pub const AREA_SIZE_KM: f32 = 20.0;
 
+/// On-screen size of the map viewport. No longer tied to any fixed source
+/// image (the map is live OSM tiles, effectively infinite) — this is just
+/// how big a window into the world the panel gives you.
+const MAP_VIEWPORT_W: f32 = 343.0;
+const MAP_VIEWPORT_H: f32 = 760.0;
+
+fn viewport_size() -> Vec2 {
+    Vec2::new(MAP_VIEWPORT_W, MAP_VIEWPORT_H)
+}
+
 const MIN_POINTS: usize = 3;
 const MAX_SIDE_KM: f64 = 50.0;
 const POINT_DOT_SIZE: f32 = 9.0;
-const CITY_DOT_SIZE: f32 = 5.0;
 const EDGE_THICKNESS: f32 = 2.0;
 const SQUARE_THICKNESS: f32 = 2.0;
-const ZOOM_MIN: f32 = 1.0;
-const ZOOM_MAX: f32 = 5.0;
+
+/// Sweden's rough centroid — the default view on first opening the picker.
+const DEFAULT_CENTER_LON: f64 = 17.65;
+const DEFAULT_CENTER_LAT: f64 = 62.15;
+/// Shows roughly the whole country in `MAP_VIEWPORT_W`/`H`.
+const DEFAULT_ZOOM: u8 = 5;
+
+/// Sweden's bounding box, with a little slack. Clamps `MapView::center` so
+/// panning can't wander off into Norway/Finland/Denmark — this only pins the
+/// *viewport center*, though: OSM tiles don't respect political borders, so
+/// any tile straddling the border still shows both sides regardless of this
+/// clamp, and zoomed out enough you'll still see neighboring coastline at
+/// the edge of the viewport. There's no way around that with raster tiles;
+/// this just stops you from being able to scroll away and look at Oslo.
+const SWEDEN_LON_RANGE: (f64, f64) = (10.8, 24.5);
+const SWEDEN_LAT_RANGE: (f64, f64) = (55.0, 69.4);
+
+fn clamp_to_sweden(center: (f64, f64)) -> (f64, f64) {
+    (center.0.clamp(SWEDEN_LON_RANGE.0, SWEDEN_LON_RANGE.1), center.1.clamp(SWEDEN_LAT_RANGE.0, SWEDEN_LAT_RANGE.1))
+}
 
 #[derive(Resource, Clone, Debug)]
 pub struct ScenarioArea {
@@ -60,7 +86,7 @@ impl ScenarioArea {
 #[derive(Resource, Default, Clone)]
 pub struct PendingPoints(pub Vec<(f64, f64)>);
 
-#[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PickMode {
     #[default]
     Adding,
@@ -101,7 +127,15 @@ impl NetworkArea {
         if !self.valid {
             return f64::INFINITY;
         }
-        let (clat, clon) = self.center;
+        // `center` is `(lon, lat)` — the order `recompute_network_area`
+        // actually produces it in (via `polygon::unproject`, which returns
+        // `(lon, lat)`). Destructuring it as `(lat, lon)` here used to feed
+        // `project` a reference point with lon/lat swapped, which for a
+        // point ~63°N ~17°E silently computed a "distance" around 7,000 km
+        // instead of the real few-km distance — this is what made "click to
+        // place the base" always land outside `MAX_BASE_DISTANCE_KM` and
+        // appear to do nothing.
+        let (clon, clat) = self.center;
         let local = polygon::project(clon, clat, lon, lat);
         let (s, c) = self.rotation_deg.to_radians().sin_cos();
         // Rotate into the square's own axes.
@@ -166,34 +200,28 @@ fn recompute_network_area(points: &[(f64, f64)]) -> NetworkArea {
     }
 }
 
-/// Current pan/zoom of the map content, relative to its base 1:1 layout.
-/// `zoom` must never be 0 — `apply_pan_zoom` applies it directly as the
-/// content node's scale, and `#[derive(Default)]` would give `0.0` here,
-/// collapsing the whole map (image, cities, points) to nothing on the very
-/// first frame after `MapView::default()` is inserted.
+/// What part of the world the map viewport currently shows: an OSM integer
+/// zoom level and the lon/lat shown at the viewport's own center. Unlike the
+/// old fixed-image map, there's no "whole map" bounds to clamp against — OSM
+/// tiles cover the world, so panning/zooming is unbounded (bounded only by
+/// `tiles::MIN_ZOOM`/`MAX_ZOOM`).
 #[derive(Resource)]
 pub(crate) struct MapView {
-    pub zoom: f32,
-    pub pan: Vec2,
+    pub zoom: u8,
+    pub center: (f64, f64),
 }
 
 impl Default for MapView {
     fn default() -> Self {
-        Self { zoom: ZOOM_MIN, pan: Vec2::ZERO }
+        Self { zoom: DEFAULT_ZOOM, center: (DEFAULT_CENTER_LON, DEFAULT_CENTER_LAT) }
     }
 }
 
 impl MapView {
     fn reset(&mut self) {
-        self.zoom = ZOOM_MIN;
-        self.pan = Vec2::ZERO;
+        *self = Self::default();
     }
 }
-
-/// Handle to the rasterized outline texture, kept around so the theme
-/// toggle can re-rasterize it with the other palette's colors.
-#[derive(Resource)]
-pub(crate) struct SwedenMapHandle(pub Handle<Image>);
 
 #[derive(Component)]
 pub(crate) struct AreaSelectionRoot;
@@ -207,11 +235,34 @@ pub(crate) struct MapViewport;
 #[derive(Component)]
 pub(crate) struct MapContent;
 
+/// Marks a spawned OSM tile image entity.
 #[derive(Component)]
-pub(crate) struct PolygonVisual;
+struct MapTile;
+
+/// One spawned tile entity, and whether it's showing the real tile yet.
+struct SpawnedTile {
+    entity: Entity,
+    /// `false` while this is a temporary placeholder — a crop of an
+    /// already-cached, coarser ancestor tile shown so zooming in doesn't
+    /// leave a blank gap while the real tile loads (see `cached_ancestor`).
+    /// Swapped for the real tile the moment it's ready.
+    is_final: bool,
+}
+
+/// Currently-spawned tile entities, so `sync_map_tiles` can diff against
+/// "what's actually needed this frame" instead of despawning/respawning
+/// everything every frame.
+#[derive(Resource, Default)]
+pub(crate) struct SpawnedTiles {
+    entities: HashMap<tiles::TileKey, SpawnedTile>,
+    /// Zoom the spawned tiles were fetched at — every tile must be dropped
+    /// and refetched on a zoom change (a different zoom is a different
+    /// pixel grid entirely, not a resize of the same one).
+    zoom: Option<u8>,
+}
 
 #[derive(Component)]
-pub(crate) struct CityDot;
+pub(crate) struct PolygonVisual;
 
 #[derive(Component)]
 pub(crate) struct HeadingText;
@@ -289,7 +340,6 @@ fn spawn_zoom_button(
 
 pub fn setup(
     mut commands: Commands,
-    mut images: ResMut<Assets<Image>>,
     load_error: Option<Res<crate::terrain::TerrainLoadError>>,
     theme: Res<Theme>,
 ) {
@@ -298,21 +348,9 @@ pub fn setup(
     commands.insert_resource(recompute_network_area(&[]));
     commands.insert_resource(MapView::default());
     commands.insert_resource(BasePosition::default());
+    commands.insert_resource(SpawnedTiles::default());
 
     let p = theme.palette();
-
-    let map_handle = images.add(Image::new(
-        Extent3d {
-            width: sweden_geo::IMG_W,
-            height: sweden_geo::IMG_H,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        sweden_geo::rasterize(theme.dark),
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    ));
-    commands.insert_resource(SwedenMapHandle(map_handle.clone()));
 
     commands
         .spawn((
@@ -330,79 +368,40 @@ pub fn setup(
         ))
         .with_children(|root| {
             // Clipped viewport: fixed size, click target for adding points.
-            // Its child `MapContent` carries the pan/zoom transform used in
-            // review mode, so points/edges/city dots zoom along with the map.
+            // `MapContent` holds every OSM tile plus the point/polygon/base
+            // overlay — all positioned directly in screen space from the
+            // current `MapView` (see `lonlat_to_screen_px`), rebuilt
+            // whenever pan/zoom/points change rather than carrying any
+            // scale/translate transform of its own.
             root.spawn((
                 Node {
-                    width: Val::Px(sweden_geo::IMG_W as f32),
-                    height: Val::Px(sweden_geo::IMG_H as f32),
+                    width: Val::Px(MAP_VIEWPORT_W),
+                    height: Val::Px(MAP_VIEWPORT_H),
                     overflow: Overflow::clip(),
                     position_type: PositionType::Relative,
                     ..default()
                 },
+                BackgroundColor(p.surface),
                 Interaction::None,
                 RelativeCursorPosition::default(),
                 MapViewport,
             ))
             .with_children(|viewport| {
-                viewport
-                    .spawn((
-                        Node {
-                            width: Val::Px(sweden_geo::IMG_W as f32),
-                            height: Val::Px(sweden_geo::IMG_H as f32),
-                            ..default()
-                        },
-                        UiTransform::IDENTITY,
-                        MapContent,
-                        Pickable::IGNORE,
-                    ))
-                    .with_children(|content| {
-                        content.spawn((
-                            Node {
-                                width: Val::Px(sweden_geo::IMG_W as f32),
-                                height: Val::Px(sweden_geo::IMG_H as f32),
-                                ..default()
-                            },
-                            ImageNode::new(map_handle),
-                            Pickable::IGNORE,
-                        ));
-
-                        for (name, lat, lon) in sweden_geo::CITIES {
-                            let (x, y) = sweden_geo::lonlat_to_pixel(*lon, *lat);
-                            content.spawn((
-                                Node {
-                                    position_type: PositionType::Absolute,
-                                    left: Val::Px(x - CITY_DOT_SIZE * 0.5),
-                                    top: Val::Px(y - CITY_DOT_SIZE * 0.5),
-                                    width: Val::Px(CITY_DOT_SIZE),
-                                    height: Val::Px(CITY_DOT_SIZE),
-                                    border_radius: BorderRadius::MAX,
-                                    ..default()
-                                },
-                                BackgroundColor(p.accent),
-                                Pickable::IGNORE,
-                                CityDot,
-                            ));
-                            content.spawn((
-                                Node {
-                                    position_type: PositionType::Absolute,
-                                    left: Val::Px(x + CITY_DOT_SIZE),
-                                    top: Val::Px(y - 7.0),
-                                    ..default()
-                                },
-                                Text::new(*name),
-                                TextFont { font_size: FontSize::Px(11.0), ..default() },
-                                TextColor(p.text.with_alpha(0.85)),
-                                Pickable::IGNORE,
-                            ));
-                        }
-                    });
+                viewport.spawn((
+                    Node {
+                        width: Val::Px(MAP_VIEWPORT_W),
+                        height: Val::Px(MAP_VIEWPORT_H),
+                        ..default()
+                    },
+                    MapContent,
+                    Pickable::IGNORE,
+                ));
 
                 // Zoom controls — scroll-wheel zoom is unreliable on macOS
                 // trackpads, so these buttons (Google Maps-style) are the
                 // primary way to zoom. Siblings of `MapContent`, not
                 // children, so they stay fixed in the corner instead of
-                // scaling/panning with the map.
+                // panning with the map.
                 viewport
                     .spawn((
                         Node {
@@ -419,11 +418,31 @@ pub fn setup(
                         controls.spawn(Node { height: Val::Px(2.0), ..default() });
                         spawn_zoom_button(controls, "\u{2212}", ZoomOutButton, p.surface, p.text);
                     });
+
+                // OpenStreetMap's tile usage policy requires visible
+                // attribution wherever the tiles are displayed:
+                // https://operations.osmfoundation.org/policies/tiles/
+                viewport.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(4.0),
+                        bottom: Val::Px(2.0),
+                        padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::BLACK.with_alpha(0.35)),
+                    Pickable::IGNORE,
+                    children![(
+                        Text::new("\u{00A9} OpenStreetMap contributors"),
+                        TextFont { font_size: FontSize::Px(9.0), ..default() },
+                        TextColor(Color::WHITE.with_alpha(0.85)),
+                    )],
+                ));
             });
 
             root.spawn(Node {
                 width: Val::Px(440.0),
-                height: Val::Px(sweden_geo::IMG_H as f32),
+                height: Val::Px(MAP_VIEWPORT_H),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(14.0),
                 overflow: Overflow::clip_y(),
@@ -571,10 +590,29 @@ pub fn setup(
         });
 }
 
+/// Project lon/lat to a screen position (px, relative to the viewport's own
+/// top-left — the same frame `RelativeCursorPosition::normalized` uses) at
+/// the current pan/zoom. The inverse of `cursor_to_lonlat`.
+fn lonlat_to_screen_px(lon: f64, lat: f64, view: &MapView) -> Vec2 {
+    let world = tiles::lonlat_to_world_px(lon, lat, view.zoom);
+    let center_world = tiles::lonlat_to_world_px(view.center.0, view.center.1, view.zoom);
+    world - center_world + viewport_size() * 0.5
+}
+
+/// Turn a click's viewport-relative `normalized` position into lon/lat at
+/// the current pan/zoom — the inverse of `lonlat_to_screen_px`.
+fn cursor_to_lonlat(normalized: Vec2, view: &MapView) -> (f64, f64) {
+    let screen = (normalized + Vec2::splat(0.5)) * viewport_size();
+    let center_world = tiles::lonlat_to_world_px(view.center.0, view.center.1, view.zoom);
+    let world = center_world + screen - viewport_size() * 0.5;
+    tiles::world_px_to_lonlat(world, view.zoom)
+}
+
 /// Add a point when the map is clicked in `Adding` mode.
 pub fn add_point_on_click(
     map_q: Query<(&Interaction, &RelativeCursorPosition), (With<MapViewport>, Changed<Interaction>)>,
     mode: Res<PickMode>,
+    view: Res<MapView>,
     mut points: ResMut<PendingPoints>,
     mut base: ResMut<BasePosition>,
 ) {
@@ -588,9 +626,7 @@ pub fn add_point_on_click(
         let Some(normalized) = cursor.normalized else {
             continue;
         };
-        let px = (normalized.x + 0.5) * sweden_geo::IMG_W as f32;
-        let py = (normalized.y + 0.5) * sweden_geo::IMG_H as f32;
-        let (lon, lat) = sweden_geo::pixel_to_lonlat(px, py);
+        let (lon, lat) = cursor_to_lonlat(normalized, &view);
         if sweden_geo::point_in_sweden(lon, lat) {
             points.0.push((lat, lon));
             // The shape changed — a previously chosen base may no longer sit
@@ -609,22 +645,27 @@ pub fn place_base_on_click(
     map_q: Query<(&Interaction, &RelativeCursorPosition), (With<MapViewport>, Changed<Interaction>)>,
     mut mode: ResMut<PickMode>,
     net: Res<NetworkArea>,
+    view: Res<MapView>,
     mut base: ResMut<BasePosition>,
 ) {
     if *mode != PickMode::PlacingBase {
         return;
     }
     for (interaction, cursor) in &map_q {
+        info!("[base] viewport interaction changed to {interaction:?} while placing base");
         if *interaction != Interaction::Pressed {
             continue;
         }
         let Some(normalized) = cursor.normalized else {
+            warn!("[base] click registered but cursor.normalized was None — no position to place at");
             continue;
         };
-        let px = (normalized.x + 0.5) * sweden_geo::IMG_W as f32;
-        let py = (normalized.y + 0.5) * sweden_geo::IMG_H as f32;
-        let (lon, lat) = sweden_geo::pixel_to_lonlat(px, py);
-        if net.distance_to_square_km(lat, lon) <= MAX_BASE_DISTANCE_KM {
+        let (lon, lat) = cursor_to_lonlat(normalized, &view);
+        let distance = net.distance_to_square_km(lat, lon);
+        info!(
+            "[base] click at normalized {normalized:?} -> lon={lon:.5} lat={lat:.5}, {distance:.3} km from area (limit {MAX_BASE_DISTANCE_KM})"
+        );
+        if distance <= MAX_BASE_DISTANCE_KM {
             base.0 = Some((lat, lon));
             *mode = PickMode::Reviewing;
         }
@@ -649,25 +690,30 @@ pub fn point_table_and_buttons(
         }
     }
 
+    // Mode toggles deliberately leave `view` (zoom/pan) alone — switching
+    // modes shouldn't throw away where you were looking, especially right
+    // before placing the base, which usually wants to stay zoomed in for
+    // precision.
     if add_stop.iter().any(|i| *i == Interaction::Pressed) {
         *mode = match *mode {
-            PickMode::Adding => {
-                view.reset();
-                PickMode::Reviewing
-            }
+            PickMode::Adding => PickMode::Reviewing,
             PickMode::Reviewing | PickMode::PlacingBase => PickMode::Adding,
         };
     }
 
     if set_base.iter().any(|i| *i == Interaction::Pressed) {
+        let before = *mode;
         *mode = match *mode {
             PickMode::PlacingBase => PickMode::Reviewing,
             PickMode::Adding | PickMode::Reviewing if net.valid && !net.over_limit => {
-                view.reset();
                 PickMode::PlacingBase
             }
             other => other,
         };
+        info!(
+            "[base] Set base location pressed: {before:?} -> {:?} (net.valid={}, net.over_limit={})",
+            *mode, net.valid, net.over_limit
+        );
     }
 
     if clear.iter().any(|i| *i == Interaction::Pressed) {
@@ -678,9 +724,24 @@ pub fn point_table_and_buttons(
     }
 }
 
-/// Zoom (scroll) works in any mode; pan (drag) only while reviewing, so it
-/// doesn't fight click-to-place-a-point. Both only act while the cursor is
-/// over the viewport.
+/// Adjust `view` so the lon/lat currently under `anchor_px` (screen space,
+/// relative to the viewport's own top-left) stays visually fixed while zoom
+/// changes to `new_zoom`. This is what makes zoom feel anchored to the
+/// cursor (or the viewport's center, for the +/- buttons) instead of always
+/// re-centering on whatever `view.center` already was.
+fn rezoom_around(view: &mut MapView, anchor_px: Vec2, new_zoom: u8) {
+    let (lon, lat) = cursor_to_lonlat(anchor_px / viewport_size() - Vec2::splat(0.5), view);
+    view.zoom = new_zoom;
+    let anchor_world = tiles::lonlat_to_world_px(lon, lat, new_zoom);
+    let new_center_world = anchor_world - anchor_px + viewport_size() * 0.5;
+    view.center = clamp_to_sweden(tiles::world_px_to_lonlat(new_center_world, new_zoom));
+}
+
+/// Zoom (scroll) works in any mode. Pan works two ways: left-drag while
+/// reviewing (kept for continuity with the old behavior), and right-drag in
+/// *any* mode — including `Adding`, where left-drag is reserved for
+/// click-to-place-a-point — so panning is always available regardless of
+/// what you're doing. Both only act while the cursor is over the viewport.
 pub fn pan_zoom(
     mode: Res<PickMode>,
     viewport_q: Query<&RelativeCursorPosition, With<MapViewport>>,
@@ -697,42 +758,191 @@ pub fn pan_zoom(
     }
 
     if scroll.delta.y != 0.0 {
-        view.zoom = (view.zoom + scroll.delta.y * 0.15).clamp(ZOOM_MIN, ZOOM_MAX);
+        // One tile zoom level per notch — OSM tiles only exist at integer
+        // zooms, so (unlike the old continuous multiplier) this steps by
+        // exactly ±1 regardless of how big one frame's scroll delta is.
+        let step: i16 = if scroll.delta.y > 0.0 { 1 } else { -1 };
+        let new_zoom = (view.zoom as i16 + step).clamp(tiles::MIN_ZOOM as i16, tiles::MAX_ZOOM as i16) as u8;
+        if new_zoom != view.zoom {
+            // `normalized` is in [-0.5, 0.5] over the viewport's own box —
+            // zoom around wherever the cursor actually is.
+            if let Some(normalized) = cursor.normalized {
+                let anchor = (normalized + Vec2::splat(0.5)) * viewport_size();
+                rezoom_around(&mut view, anchor, new_zoom);
+            } else {
+                view.zoom = new_zoom;
+            }
+        }
     }
-    if *mode == PickMode::Reviewing
-        && mouse_button.pressed(MouseButton::Left)
-        && motion.delta != Vec2::ZERO
-    {
-        view.pan += motion.delta;
+    let panning = (*mode == PickMode::Reviewing && mouse_button.pressed(MouseButton::Left))
+        || mouse_button.pressed(MouseButton::Right);
+    if panning && motion.delta != Vec2::ZERO {
+        let center_world = tiles::lonlat_to_world_px(view.center.0, view.center.1, view.zoom);
+        view.center = clamp_to_sweden(tiles::world_px_to_lonlat(center_world - motion.delta, view.zoom));
     }
 }
 
-const ZOOM_STEP: f32 = 0.5;
-
 /// Google Maps-style +/- buttons — the reliable zoom path, since scroll-wheel
 /// zoom is flaky on macOS trackpads (two-finger scroll doesn't consistently
-/// reach `AccumulatedMouseScroll`).
+/// reach `AccumulatedMouseScroll`). Zooms around the viewport's center, since
+/// there's no cursor-hover point to anchor to for a button press.
 pub fn zoom_buttons(
     zoom_in: Query<&Interaction, (Changed<Interaction>, With<ZoomInButton>)>,
     zoom_out: Query<&Interaction, (Changed<Interaction>, With<ZoomOutButton>)>,
     mut view: ResMut<MapView>,
 ) {
-    if zoom_in.iter().any(|i| *i == Interaction::Pressed) {
-        view.zoom = (view.zoom + ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+    let center = viewport_size() * 0.5;
+    if zoom_in.iter().any(|i| *i == Interaction::Pressed) && view.zoom < tiles::MAX_ZOOM {
+        let new_zoom = view.zoom + 1;
+        rezoom_around(&mut view, center, new_zoom);
     }
-    if zoom_out.iter().any(|i| *i == Interaction::Pressed) {
-        view.zoom = (view.zoom - ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+    if zoom_out.iter().any(|i| *i == Interaction::Pressed) && view.zoom > tiles::MIN_ZOOM {
+        let new_zoom = view.zoom - 1;
+        rezoom_around(&mut view, center, new_zoom);
     }
 }
 
-pub fn apply_pan_zoom(view: Res<MapView>, mut content_q: Query<&mut UiTransform, With<MapContent>>) {
-    if !view.is_changed() {
+/// How many zoom levels up `cached_ancestor` is willing to search for a
+/// placeholder. Ordinary ±1-step zooming only ever needs 1 (you were just
+/// there), but this covers e.g. a `Clear` that jumps back to the default
+/// zoom, or one zoom level's fetch failing outright.
+const MAX_PLACEHOLDER_ANCESTOR_STEPS: u8 = 6;
+
+/// Find the nearest already-cached ancestor of `key` (by successively
+/// halving zoom) and the sub-rectangle of that ancestor's tile image
+/// corresponding to `key`'s coverage — a coarser, already-loaded crop to
+/// show in place of `key` while its own fetch is still in flight, the same
+/// "blurry-then-sharp" placeholder every slippy map uses instead of leaving
+/// a blank gap during a zoom-in. `None` if no ancestor within
+/// `MAX_PLACEHOLDER_ANCESTOR_STEPS` levels is cached yet.
+fn cached_ancestor(cache: &tiles::TileCache, key: tiles::TileKey) -> Option<(Handle<Image>, Rect)> {
+    let (mut z, mut x, mut y) = (key.z, key.x, key.y);
+    for steps in 1..=MAX_PLACEHOLDER_ANCESTOR_STEPS {
+        if z == 0 {
+            break;
+        }
+        z -= 1;
+        x /= 2;
+        y /= 2;
+        let Some(handle) = cache.ready.get(&tiles::TileKey { z, x, y }) else { continue };
+        // `key` is one `1 / 2^steps`-sized cell of the ancestor's tile,
+        // positioned by the low `steps` bits of its original x/y.
+        let n = 1u32 << steps;
+        let cell = tiles::TILE_SIZE / n as f32;
+        let (cx, cy) = ((key.x % n) as f32, (key.y % n) as f32);
+        let rect = Rect::new(cx * cell, cy * cell, (cx + 1.0) * cell, (cy + 1.0) * cell);
+        return Some((handle.clone(), rect));
+    }
+    None
+}
+
+/// Spawn/reposition/despawn OSM tile images to match the current `MapView`.
+/// Runs every frame — cheap at this scale (usually a couple dozen tiles
+/// visible at once): on a zoom change every tile is dropped and refetched at
+/// the new pixel grid; on a pure pan, tiles already spawned are just
+/// repositioned and only the ones newly scrolled into view get requested.
+pub fn sync_map_tiles(
+    mut commands: Commands,
+    mut cache: ResMut<tiles::TileCache>,
+    mut spawned: ResMut<SpawnedTiles>,
+    view: Res<MapView>,
+    content_q: Query<Entity, With<MapContent>>,
+) {
+    let Ok(content) = content_q.single() else {
         return;
+    };
+
+    if spawned.zoom != Some(view.zoom) {
+        for (_, tile) in spawned.entities.drain() {
+            commands.entity(tile.entity).despawn();
+        }
+        spawned.zoom = Some(view.zoom);
     }
-    if let Ok(mut transform) = content_q.single_mut() {
-        transform.scale = Vec2::splat(view.zoom.max(0.01));
-        transform.translation = Val2::px(view.pan.x, view.pan.y);
+
+    let center_world = tiles::lonlat_to_world_px(view.center.0, view.center.1, view.zoom);
+    let top_left_world = center_world - viewport_size() * 0.5;
+    let bottom_right_world = center_world + viewport_size() * 0.5;
+
+    // One tile of margin on every side so tiles are already loaded by the
+    // time a pan scrolls them into view, not popping in at the edge.
+    let x0 = (top_left_world.x / tiles::TILE_SIZE).floor() as i64 - 1;
+    let x1 = (bottom_right_world.x / tiles::TILE_SIZE).floor() as i64 + 1;
+    let y0 = (top_left_world.y / tiles::TILE_SIZE).floor() as i64 - 1;
+    let y1 = (bottom_right_world.y / tiles::TILE_SIZE).floor() as i64 + 1;
+
+    let mut wanted: HashSet<tiles::TileKey> = HashSet::new();
+    for ty in y0..=y1 {
+        if ty < 0 {
+            continue;
+        }
+        for tx in x0..=x1 {
+            if tx < 0 {
+                continue;
+            }
+            let key = tiles::TileKey { z: view.zoom, x: tx as u32, y: ty as u32 };
+            if !key.in_range() {
+                continue;
+            }
+            wanted.insert(key);
+
+            let tile_screen = Vec2::new(tx as f32, ty as f32) * tiles::TILE_SIZE - top_left_world;
+            let tile_node = || Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(tile_screen.x),
+                top: Val::Px(tile_screen.y),
+                width: Val::Px(tiles::TILE_SIZE),
+                height: Val::Px(tiles::TILE_SIZE),
+                ..default()
+            };
+            let spawn_tile = |commands: &mut Commands, image: ImageNode, is_final: bool| {
+                let entity = commands
+                    .spawn((tile_node(), image, Pickable::IGNORE, MapTile))
+                    .id();
+                commands.entity(content).add_child(entity);
+                SpawnedTile { entity, is_final }
+            };
+
+            match spawned.entities.get(&key) {
+                Some(existing) if existing.is_final => {
+                    // Already showing the real tile — just reposition (a
+                    // pan may have moved it).
+                    commands.entity(existing.entity).insert(tile_node());
+                }
+                Some(existing) => {
+                    // Still a placeholder — reposition it, and swap for the
+                    // real tile the instant it's ready.
+                    commands.entity(existing.entity).insert(tile_node());
+                    if let Some(handle) = cache.ready.get(&key).cloned() {
+                        commands.entity(existing.entity).despawn();
+                        let image = ImageNode::new(handle).with_mode(NodeImageMode::Stretch);
+                        spawned.entities.insert(key, spawn_tile(&mut commands, image, true));
+                    }
+                }
+                None => {
+                    if let Some(handle) = cache.ready.get(&key).cloned() {
+                        let image = ImageNode::new(handle).with_mode(NodeImageMode::Stretch);
+                        spawned.entities.insert(key, spawn_tile(&mut commands, image, true));
+                    } else {
+                        cache.request(key);
+                        if let Some((handle, rect)) = cached_ancestor(&cache, key) {
+                            let image =
+                                ImageNode::new(handle).with_mode(NodeImageMode::Stretch).with_rect(rect);
+                            spawned.entities.insert(key, spawn_tile(&mut commands, image, false));
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    spawned.entities.retain(|key, tile| {
+        if wanted.contains(key) {
+            true
+        } else {
+            commands.entity(tile.entity).despawn();
+            false
+        }
+    });
 }
 
 /// Recompute the network-area preview whenever the point list changes.
@@ -744,21 +954,27 @@ pub fn recompute_area_on_change(points: Res<PendingPoints>, mut area: ResMut<Net
 }
 
 /// Rebuild the point dots, polygon edges, and bounding-square outline
-/// whenever the point list (or the computed square) changes.
+/// whenever the point list, view (pan/zoom), or theme changes.
+///
+/// Every entity spawned here carries `ZIndex(1)` so it draws above `MapTile`
+/// images regardless of spawn order — `sync_map_tiles` runs every frame and
+/// keeps appending newly-loaded tiles as later `MapContent` children, so
+/// relying on "points were spawned after the tiles" (true only the instant
+/// this system last ran) would let a tile that finishes loading a few
+/// frames later cover the points back up.
 pub fn redraw_polygon(
     mut commands: Commands,
     points: Res<PendingPoints>,
     net: Res<NetworkArea>,
     base: Res<BasePosition>,
     theme: Res<Theme>,
+    view: Res<MapView>,
     content_q: Query<Entity, With<MapContent>>,
     visuals: Query<Entity, With<PolygonVisual>>,
-    mut last_len: Local<usize>,
 ) {
-    if !points.is_changed() && !theme.is_changed() && !base.is_changed() {
+    if !points.is_changed() && !theme.is_changed() && !base.is_changed() && !view.is_changed() {
         return;
     }
-    *last_len = points.0.len();
 
     for entity in &visuals {
         commands.entity(entity).despawn();
@@ -768,11 +984,8 @@ pub fn redraw_polygon(
     };
 
     let pal = theme.palette();
-    let pixels: Vec<Vec2> = points
-        .0
-        .iter()
-        .map(|&(lat, lon)| sweden_geo::lonlat_to_pixel(lon, lat).into())
-        .collect();
+    let pixels: Vec<Vec2> =
+        points.0.iter().map(|&(lat, lon)| lonlat_to_screen_px(lon, lat, &view)).collect();
 
     commands.entity(content).with_children(|parent| {
         // Polygon edges (only meaningful once the shape is closed, 3+ points).
@@ -791,7 +1004,7 @@ pub fn redraw_polygon(
             let fetch_px: Vec<Vec2> = net
                 .fetch_corners
                 .iter()
-                .map(|&(lat, lon)| sweden_geo::lonlat_to_pixel(lon, lat).into())
+                .map(|&(lat, lon)| lonlat_to_screen_px(lon, lat, &view))
                 .collect();
             for i in 0..4 {
                 spawn_edge(parent, fetch_px[i], fetch_px[(i + 1) % 4], pal.text.with_alpha(0.35), 1.0);
@@ -804,7 +1017,7 @@ pub fn redraw_polygon(
             let corners_px: Vec<Vec2> = net
                 .corners
                 .iter()
-                .map(|&(lat, lon)| sweden_geo::lonlat_to_pixel(lon, lat).into())
+                .map(|&(lat, lon)| lonlat_to_screen_px(lon, lat, &view))
                 .collect();
             for i in 0..4 {
                 spawn_edge(parent, corners_px[i], corners_px[(i + 1) % 4], square_color, SQUARE_THICKNESS);
@@ -813,7 +1026,7 @@ pub fn redraw_polygon(
 
         // Base marker.
         if let Some((lat, lon)) = base.0 {
-            let p: Vec2 = sweden_geo::lonlat_to_pixel(lon, lat).into();
+            let p: Vec2 = lonlat_to_screen_px(lon, lat, &view);
             const BASE_SIZE: f32 = 11.0;
             parent.spawn((
                 Node {
@@ -827,6 +1040,7 @@ pub fn redraw_polygon(
                 BackgroundColor(pal.base),
                 Pickable::IGNORE,
                 PolygonVisual,
+                ZIndex(1),
             ));
             parent.spawn((
                 Node {
@@ -840,10 +1054,11 @@ pub fn redraw_polygon(
                 TextColor(pal.base),
                 Pickable::IGNORE,
                 PolygonVisual,
+                ZIndex(1),
             ));
         }
 
-        // Point dots + index labels, drawn last so they sit on top.
+        // Point dots + index labels.
         for (i, &p) in pixels.iter().enumerate() {
             parent.spawn((
                 Node {
@@ -858,6 +1073,7 @@ pub fn redraw_polygon(
                 BackgroundColor(pal.drone),
                 Pickable::IGNORE,
                 PolygonVisual,
+                ZIndex(1),
             ));
             parent.spawn((
                 Node {
@@ -871,6 +1087,7 @@ pub fn redraw_polygon(
                 TextColor(pal.text),
                 Pickable::IGNORE,
                 PolygonVisual,
+                ZIndex(1),
             ));
         }
     });
@@ -893,10 +1110,11 @@ fn spawn_edge(parent: &mut ChildSpawnerCommands, from: Vec2, to: Vec2, color: Co
             height: Val::Px(thickness),
             ..default()
         },
-        UiTransform::from_rotation(Rot2::radians(angle)),
+        bevy::ui::UiTransform::from_rotation(Rot2::radians(angle)),
         BackgroundColor(color),
         Pickable::IGNORE,
         PolygonVisual,
+        ZIndex(1),
     ));
 }
 
@@ -1039,8 +1257,9 @@ pub fn generate_terrain(
         return;
     }
     area.name = "Network area";
-    area.latitude = net.center.0;
-    area.longitude = net.center.1;
+    // `net.center` is `(lon, lat)` — see the comment on `distance_to_square_km`.
+    area.latitude = net.center.1;
+    area.longitude = net.center.0;
     area.size_km = net.fetch_size_km.max(1.0);
     commands.remove_resource::<crate::terrain::TerrainLoadError>();
     next_state.set(AppState::LoadingTerrain);
@@ -1050,7 +1269,7 @@ pub fn cleanup(mut commands: Commands, roots: Query<Entity, With<AreaSelectionRo
     for entity in &roots {
         commands.entity(entity).despawn();
     }
-    commands.remove_resource::<SwedenMapHandle>();
+    commands.remove_resource::<SpawnedTiles>();
 }
 
 #[cfg(test)]
@@ -1097,5 +1316,81 @@ mod tests {
         let net = recompute_network_area(&[(58.0, 17.0), (60.0, 19.0), (58.0, 19.0)]);
         assert!(net.valid);
         assert!(net.over_limit);
+    }
+
+    /// `lonlat_to_screen_px`/`cursor_to_lonlat` must invert each other at any
+    /// pan/zoom, or clicks stop landing where they visually appear to (the
+    /// bug that made point-adding and base-placement feel broken once zoom
+    /// started working). Tolerance is ~11 m (1e-4°) at Sweden's latitude —
+    /// not exact, since the round trip goes through `Vec2` (f32) pixel
+    /// coordinates like the real UI does, but well inside what matters for
+    /// clicking a point on a map (`MAX_BASE_DISTANCE_KM` is 3 km).
+    #[test]
+    fn screen_lonlat_roundtrip_is_close_at_any_zoom() {
+        let cases = [(17.65, 62.15, 5u8), (18.0686, 59.3293, 12), (11.0, 68.0, 9)];
+        for (lon, lat, zoom) in cases {
+            let view = MapView { zoom, center: (lon + 0.4, lat - 0.3) };
+            let screen = lonlat_to_screen_px(lon, lat, &view);
+            let normalized = screen / viewport_size() - Vec2::splat(0.5);
+            let (back_lon, back_lat) = cursor_to_lonlat(normalized, &view);
+            assert!((back_lon - lon).abs() < 1e-4, "lon {back_lon} vs {lon} at zoom {zoom}");
+            assert!((back_lat - lat).abs() < 1e-4, "lat {back_lat} vs {lat} at zoom {zoom}");
+        }
+    }
+
+    /// Zooming in/out around an anchor point must leave the lon/lat under
+    /// that anchor unchanged — the actual fix for "zoom doesn't follow the
+    /// cursor" / "goes through the map".
+    #[test]
+    fn rezoom_keeps_the_anchor_point_fixed() {
+        let mut view = MapView { zoom: 6, center: (17.65, 62.15) };
+        let anchor = Vec2::new(100.0, 300.0);
+        let (lon_before, lat_before) =
+            cursor_to_lonlat(anchor / viewport_size() - Vec2::splat(0.5), &view);
+
+        rezoom_around(&mut view, anchor, 10);
+
+        let (lon_after, lat_after) =
+            cursor_to_lonlat(anchor / viewport_size() - Vec2::splat(0.5), &view);
+        assert!((lon_after - lon_before).abs() < 1e-4);
+        assert!((lat_after - lat_before).abs() < 1e-4);
+    }
+
+    /// End-to-end simulation of `place_base_on_click`'s actual condition:
+    /// pick 3 points, compute the network area exactly like
+    /// `recompute_area_on_change` does, then click the square's own center
+    /// at a deeply-zoomed-in view (placing the base usually happens zoomed
+    /// in for precision, per `point_table_and_buttons`'s comment) — the
+    /// resulting `distance_to_square_km` must clear
+    /// `MAX_BASE_DISTANCE_KM`, or `place_base_on_click` would reject a click
+    /// that's visually dead-center on the area.
+    #[test]
+    fn clicking_the_network_areas_own_center_places_the_base() {
+        let points = [(59.0, 18.0), (59.05, 18.05), (58.98, 18.06)];
+        let net = recompute_network_area(&points);
+        assert!(net.valid, "test setup: 3 points should form a valid area");
+
+        // Ground truth independent of `distance_to_square_km`'s own
+        // (lon, lat)-vs-(lat, lon) convention: `center` must land near the
+        // picked points' own coordinates, not off by a lat/lon swap. This
+        // is what would have caught the real bug — that test previously
+        // destructured `net.center` the same wrong way `distance_to_square_km`
+        // did internally, so both sides shared the same mistake and it
+        // passed anyway.
+        let (center_lon, center_lat) = net.center;
+        assert!((center_lon - 18.03).abs() < 0.5, "center_lon {center_lon} looks swapped with lat");
+        assert!((center_lat - 59.0).abs() < 0.5, "center_lat {center_lat} looks swapped with lon");
+
+        for zoom in [5u8, 10, 15, 19] {
+            // Zoomed in tight on the area's own center, same as a user
+            // would do to place the base precisely.
+            let view = MapView { zoom, center: (center_lon, center_lat) };
+            let (lon, lat) = cursor_to_lonlat(Vec2::ZERO, &view); // dead center of the viewport
+            let distance = net.distance_to_square_km(lat, lon);
+            assert!(
+                distance <= MAX_BASE_DISTANCE_KM,
+                "clicking the area's own center at zoom {zoom} landed {distance:.4} km away — should be ~0"
+            );
+        }
     }
 }

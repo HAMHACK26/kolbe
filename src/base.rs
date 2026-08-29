@@ -28,7 +28,7 @@ use crate::{
     },
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     theme::ThemeRole,
-    world::{DRONE_RADIUS, WORLD_SIZE},
+    world::DRONE_RADIUS,
 };
 
 // ─── Base entity ──────────────────────────────────────────────────────────────
@@ -100,7 +100,7 @@ pub fn spawn_base(
             ((lon - area.longitude) * 111.320 * area.latitude.to_radians().cos()) as f32,
             ((lat - area.latitude) * 110.574) as f32,
         ),
-        None => (0.0, -WORLD_SIZE / 2.0 + 1.0),
+        None => (0.0, -terrain.size_km() / 2.0 + 1.0),
     };
     let pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
 

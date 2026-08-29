@@ -7,8 +7,7 @@
 use bevy::prelude::*;
 
 use crate::{
-    area::{AreaBg, BodyText, CityDot, HeadingText, SourceText, SwedenMapHandle},
-    sweden_geo,
+    area::{AreaBg, BodyText, HeadingText, SourceText},
     terrain::{LoadingBarFill, LoadingHeading, LoadingRoot, LoadingStatus, LoadingTrack},
     ui::{InfoPopup, InfoPopupTitle},
 };
@@ -110,24 +109,21 @@ pub fn apply_theme(
     theme: Res<Theme>,
     mut clear: ResMut<ClearColor>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
     roles: Query<(&MeshMaterial3d<StandardMaterial>, &ThemeRole)>,
-    mut popup_bg: Query<&mut BackgroundColor, (With<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>, Without<AreaBg>, Without<CityDot>)>,
+    mut popup_bg: Query<&mut BackgroundColor, (With<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>, Without<AreaBg>)>,
     mut title: Query<&mut TextColor, (With<InfoPopupTitle>, Without<HeadingText>, Without<BodyText>, Without<SourceText>)>,
-    mut moon_btn: Query<&mut BackgroundColor, (With<MoonButton>, Without<InfoPopup>, Without<MoonCrescent>, Without<AreaBg>, Without<CityDot>)>,
+    mut moon_btn: Query<&mut BackgroundColor, (With<MoonButton>, Without<InfoPopup>, Without<MoonCrescent>, Without<AreaBg>)>,
     mut crescent: Query<&mut Visibility, (With<MoonCrescent>, Without<SunRays>)>,
     mut rays: Query<&mut Visibility, (With<SunRays>, Without<MoonCrescent>)>,
-    mut crescent_bg: Query<&mut BackgroundColor, (With<MoonCrescent>, Without<MoonButton>, Without<InfoPopup>, Without<AreaBg>, Without<CityDot>)>,
-    map_handle: Option<Res<SwedenMapHandle>>,
+    mut crescent_bg: Query<&mut BackgroundColor, (With<MoonCrescent>, Without<MoonButton>, Without<InfoPopup>, Without<AreaBg>)>,
     area_ui: (
-        Query<&mut BackgroundColor, (With<AreaBg>, Without<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>, Without<CityDot>)>,
+        Query<&mut BackgroundColor, (With<AreaBg>, Without<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>)>,
         Query<&mut TextColor, (With<HeadingText>, Without<InfoPopupTitle>, Without<BodyText>, Without<SourceText>)>,
         Query<&mut TextColor, (With<BodyText>, Without<HeadingText>, Without<InfoPopupTitle>, Without<SourceText>)>,
         Query<&mut TextColor, (With<SourceText>, Without<HeadingText>, Without<BodyText>, Without<InfoPopupTitle>)>,
-        Query<&mut BackgroundColor, (With<CityDot>, Without<AreaBg>, Without<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>)>,
     ),
 ) {
-    let (mut area_bg, mut headings, mut bodies, mut sources, mut city_dots) = area_ui;
+    let (mut area_bg, mut headings, mut bodies, mut sources) = area_ui;
 
     if !theme.is_changed() {
         return;
@@ -136,11 +132,6 @@ pub fn apply_theme(
 
     clear.0 = p.bg;
 
-    if let Some(handle) = map_handle.as_ref() {
-        if let Some(mut image) = images.get_mut(&handle.0) {
-            image.data = Some(sweden_geo::rasterize(theme.dark));
-        }
-    }
     for mut bg in &mut area_bg {
         bg.0 = p.bg;
     }
@@ -152,9 +143,6 @@ pub fn apply_theme(
     }
     for mut tc in &mut sources {
         tc.0 = p.text.with_alpha(0.6);
-    }
-    for mut bg in &mut city_dots {
-        bg.0 = p.accent;
     }
 
     for (mat_handle, role) in &roles {

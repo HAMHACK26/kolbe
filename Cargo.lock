@@ -2917,6 +2917,7 @@ dependencies = [
  "bevy",
  "dotenvy",
  "flate2",
+ "image",
  "proj4rs",
  "pyo3",
  "reqwest",
