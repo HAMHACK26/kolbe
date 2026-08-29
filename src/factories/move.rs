@@ -4,8 +4,8 @@
 //! Two layers:
 //!   1. `apply_velocity`      — real integration loop; runs every frame, moves drones.
 //!   2. `MovementLogic::update` — per-drone velocity planner (stub/Python); combines
-//!                              seek direction with avoidance forces before handing
-//!                              the final velocity to the integrator.
+//!      seek direction with avoidance forces before handing the final velocity to
+//!      the integrator.
 //!
 //! Typical pipeline per frame (all per-drone, no shared state):
 //!   SeekLogic  → desired_direction
@@ -51,7 +51,7 @@ pub trait MovementLogic: Send + Sync {
         &mut self,
         self_pos: Vec3,
         self_velocity: Vec3,
-        desired_velocity: Vec3,
+        _desired_velocity: Vec3,
         obstacles: &[ObstacleInfo],
     ) -> Vec3;
 }
@@ -94,7 +94,7 @@ impl MovementLogic for RustMove {
         &mut self,
         _self_pos: Vec3,
         _self_velocity: Vec3,
-        desired_velocity: Vec3,
+        _desired_velocity: Vec3,
         _obstacles: &[ObstacleInfo],
     ) -> Vec3 {
         todo!(
@@ -104,7 +104,7 @@ impl MovementLogic for RustMove {
         );
         // Placeholder so the compiler knows the return type:
         #[allow(unreachable_code)]
-        desired_velocity
+        _desired_velocity
     }
 }
 

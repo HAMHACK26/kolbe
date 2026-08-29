@@ -17,11 +17,13 @@ pub struct SphericalVec {
 }
 
 impl SphericalVec {
+    #[allow(dead_code)]
     pub fn new(azimuth_deg: f32, elevation_deg: f32, length: f32) -> Self {
         Self { azimuth_deg, elevation_deg, length }
     }
 
     /// From a cartesian offset: angles from its direction, length from its norm.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_cartesian(v: Vec3) -> Self {
         let (azimuth_deg, elevation_deg) = angles_toward(Vec3::ZERO, v);
         Self { azimuth_deg, elevation_deg, length: v.length() }
@@ -35,6 +37,7 @@ impl SphericalVec {
     }
 
     /// Back to a cartesian vector of magnitude `length`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_cartesian(self) -> Vec3 {
         radar_direction(self.azimuth_deg, self.elevation_deg) * self.length
     }

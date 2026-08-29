@@ -1,5 +1,5 @@
 [package]
-name = "hackathon_hamburg"
+name = "kolbe"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,6 +9,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 pyo3 = { version = "0.22", optional = true, features = ["auto-initialize"] }
 serde_json = "1.0.151"
 flate2 = "1.1.10"
+tiff = "0.10"
 proj4rs = "0.1.10"
 dotenvy = "0.15.7"
 # Decodes OSM tile PNGs fetched over HTTP (see src/tiles.rs). Already in the

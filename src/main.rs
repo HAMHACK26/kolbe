@@ -86,6 +86,7 @@ fn main() {
         .add_plugins(MeshPickingPlugin)
         .init_state::<AppState>()
         .init_resource::<area::ScenarioArea>()
+        .init_resource::<terrain::VegetationSettings>()
         .insert_resource(SelectedDrone(None))
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
@@ -113,6 +114,8 @@ fn main() {
                 area::redraw_polygon,
                 area::redraw_table,
                 area::update_status_text,
+                area::trees_toggle_interactions,
+                area::refresh_vegetation_controls,
                 area::generate_terrain,
             )
                 .chain()
@@ -131,6 +134,7 @@ fn main() {
             (
                 terrain::spawn_mesh,
                 terrain::spawn_water,
+                terrain::spawn_trees,
                 world::setup,
                 base::spawn_base,
                 ui::make_camera_overlay,
@@ -144,8 +148,17 @@ fn main() {
         .add_systems(Update, radar::sync_radar_visibility.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
-        .add_systems(Update, terrain::draw_contours.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, terrain::draw_network_area.run_if(in_state(AppState::Simulation)))
+        // Contours and trees are alternatives: a forest covers the ground the
+        // contours describe, so only one of the two is drawn.
+        .add_systems(
+            Update,
+            terrain::draw_contours.run_if(
+                in_state(AppState::Simulation)
+                    .and_then(|vegetation: Res<terrain::VegetationSettings>| !vegetation.enabled),
+            ),
+        )
+        .add_systems(OnExit(AppState::Simulation), terrain::cleanup_trees)
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
         .add_systems(Update, theme::apply_loading_theme)

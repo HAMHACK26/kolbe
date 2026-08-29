@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Search is implemented and tested, but not yet enabled in the app schedule.
+
 //! Spiral search: reacquiring a peer whose direct link has dropped.
 //!
 //! [`crate::tracking`] keeps a *live* link aimed correctly by leading the
@@ -199,6 +201,7 @@ pub struct SeekState {
 /// antennas #1/#3 have gone unlinked with a spiral offset on top of the
 /// same "aim straight at the last-known point" baseline tracking would
 /// otherwise leave them at.
+#[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
 pub fn seek_lost_links(
     time: Res<Time>,
     mut drones: Query<(
@@ -435,7 +438,7 @@ mod tests {
     fn scan_speed_stays_within_bounds() {
         for id in 0..100u64 {
             let omega = scan_angular_speed_rad_s(id, OMEGA_MIN_RAD_S, OMEGA_MAX_RAD_S);
-            assert!(omega >= OMEGA_MIN_RAD_S && omega <= OMEGA_MAX_RAD_S);
+            assert!((OMEGA_MIN_RAD_S..=OMEGA_MAX_RAD_S).contains(&omega));
         }
     }
 

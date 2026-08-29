@@ -32,6 +32,7 @@ use crate::factories::{
 //     }
 
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct DroneAi {
     pub track:    Box<dyn TrackLogic>,
     pub seek:     Box<dyn SeekLogic>,

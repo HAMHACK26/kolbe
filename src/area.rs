@@ -4,9 +4,14 @@ use bevy::{
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
     prelude::*,
     ui::RelativeCursorPosition,
+    ui_widgets::{Slider, SliderPrecision, SliderRange, SliderStep, SliderValue, TrackClick, ValueChange},
 };
 
-use crate::{polygon, sweden_geo, theme::Theme, tiles, AppState};
+use crate::{
+    polygon, sweden_geo,
+    terrain::{DENSITY_STEP, MAX_DENSITY, MIN_DENSITY, VegetationSettings},
+    theme::Theme, tiles, AppState,
+};
 
 /// Kept for existing callers (terrain fetch math) — the network-area picker
 /// now drives `ScenarioArea.size_km` dynamically instead.
@@ -69,6 +74,7 @@ impl Default for ScenarioArea {
 
 impl ScenarioArea {
     /// STAC searches use WGS84 longitude/latitude bounds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn wgs84_bbox(&self) -> [f64; 4] {
         let half_km = self.size_km as f64 * 0.5;
         let lat_delta = half_km / 110.574;
@@ -338,8 +344,23 @@ fn spawn_zoom_button(
         ));
 }
 
+/// Button that turns the procedural forest on and off.
+#[derive(Component)]
+pub(crate) struct TreesToggle;
+
+#[derive(Component)]
+pub(crate) struct TreesToggleLabel;
+
+#[derive(Component)]
+pub(crate) struct DensityLabel;
+
+/// Filled portion of the density slider track.
+#[derive(Component)]
+pub(crate) struct DensityFill;
+
 pub fn setup(
     mut commands: Commands,
+    vegetation: Res<VegetationSettings>,
     load_error: Option<Res<crate::terrain::TerrainLoadError>>,
     theme: Res<Theme>,
 ) {
@@ -554,6 +575,8 @@ pub fn setup(
                         SetBaseLabel,
                     ));
 
+                spawn_vegetation_controls(panel, &vegetation, &p);
+
                 panel
                     .spawn((
                         Button,
@@ -588,6 +611,106 @@ pub fn setup(
                 }
             });
         });
+}
+
+/// Trees toggle plus the density slider it controls.
+fn spawn_vegetation_controls(
+    panel: &mut ChildSpawnerCommands,
+    vegetation: &VegetationSettings,
+    p: &crate::theme::Palette,
+) {
+    let (accent, text, subtext) = (p.accent, p.text, p.subtext);
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|group| {
+            group
+                .spawn((
+                    Button,
+                    Node {
+                        width: Val::Px(230.0),
+                        height: Val::Px(38.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border_radius: BorderRadius::all(Val::Px(7.0)),
+                        ..default()
+                    },
+                    BackgroundColor(toggle_fill(vegetation.enabled, accent, text)),
+                    TreesToggle,
+                ))
+                .with_child((
+                    Text::new(trees_text(vegetation)),
+                    TextFont { font_size: FontSize::Px(16.0), ..default() },
+                    TextColor(text),
+                    TreesToggleLabel,
+                ));
+
+            group.spawn((
+                Text::new(density_text(vegetation)),
+                TextFont { font_size: FontSize::Px(14.0), ..default() },
+                TextColor(subtext),
+                DensityLabel,
+            ));
+
+            // Headless slider: the widget reports a new value, we own the state.
+            // With no `SliderThumb` in the subtree the usable travel is the full
+            // track width, which is exactly what the percentage fill draws.
+            group
+                .spawn((
+                    Node {
+                        width: Val::Px(230.0),
+                        height: Val::Px(14.0),
+                        border_radius: BorderRadius::all(Val::Px(7.0)),
+                        ..default()
+                    },
+                    BackgroundColor(text.with_alpha(0.15)),
+                    Slider { track_click: TrackClick::Snap, ..default() },
+                    SliderValue(vegetation.density),
+                    SliderRange::new(MIN_DENSITY, MAX_DENSITY),
+                    SliderStep(DENSITY_STEP),
+                    SliderPrecision(2),
+                ))
+                .observe(
+                    |change: On<ValueChange<f32>>,
+                     mut commands: Commands,
+                     mut vegetation: ResMut<VegetationSettings>| {
+                        let value = change.value.clamp(MIN_DENSITY, MAX_DENSITY);
+                        commands.entity(change.source).insert(SliderValue(value));
+                        vegetation.density = value;
+                    },
+                )
+                .with_child((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(0.0),
+                        top: Val::Px(0.0),
+                        width: Val::Percent(density_fraction(vegetation.density) * 100.0),
+                        height: Val::Percent(100.0),
+                        border_radius: BorderRadius::all(Val::Px(7.0)),
+                        ..default()
+                    },
+                    BackgroundColor(accent),
+                    // The fill covers the whole track, so it has to be
+                    // invisible to the pointer or it eats every click.
+                    Pickable::IGNORE,
+                    DensityFill,
+                ));
+        });
+}
+
+/// Turns the trees toggle on/off in response to a button press. Split out of
+/// (what was, on `main`) a combined `interactions` system, since this branch's
+/// picker flow already owns click handling for everything else on this screen.
+pub fn trees_toggle_interactions(
+    trees_toggle: Query<&Interaction, (Changed<Interaction>, With<TreesToggle>)>,
+    mut vegetation: ResMut<VegetationSettings>,
+) {
+    if trees_toggle.iter().any(|interaction| *interaction == Interaction::Pressed) {
+        vegetation.enabled = !vegetation.enabled;
+    }
 }
 
 /// Project lon/lat to a screen position (px, relative to the viewport's own
@@ -1265,11 +1388,75 @@ pub fn generate_terrain(
     next_state.set(AppState::LoadingTerrain);
 }
 
+/// Redraw the vegetation controls whenever the settings change, whichever
+/// widget did the changing.
+pub fn refresh_vegetation_controls(
+    vegetation: Res<VegetationSettings>,
+    theme: Res<crate::theme::Theme>,
+    mut toggle_labels: Query<&mut Text, With<TreesToggleLabel>>,
+    mut density_labels: Query<&mut Text, (With<DensityLabel>, Without<TreesToggleLabel>)>,
+    mut toggles: Query<&mut BackgroundColor, With<TreesToggle>>,
+    mut fills: Query<(&mut Node, &mut BackgroundColor), (With<DensityFill>, Without<TreesToggle>)>,
+) {
+    if !vegetation.is_changed() && !theme.is_changed() {
+        return;
+    }
+    let p = theme.palette();
+
+    for mut label in &mut toggle_labels {
+        **label = trees_text(&vegetation);
+    }
+    for mut label in &mut density_labels {
+        **label = density_text(&vegetation);
+    }
+    for mut color in &mut toggles {
+        *color = BackgroundColor(toggle_fill(vegetation.enabled, p.accent, p.text));
+    }
+    for (mut node, mut color) in &mut fills {
+        node.width = Val::Percent(density_fraction(vegetation.density) * 100.0);
+        // Dim the fill when the slider drives nothing.
+        *color = BackgroundColor(if vegetation.enabled {
+            p.accent
+        } else {
+            p.accent.with_alpha(0.25)
+        });
+    }
+}
+
 pub fn cleanup(mut commands: Commands, roots: Query<Entity, With<AreaSelectionRoot>>) {
     for entity in &roots {
         commands.entity(entity).despawn();
     }
     commands.remove_resource::<SpawnedTiles>();
+}
+
+fn trees_text(vegetation: &VegetationSettings) -> String {
+    if vegetation.enabled {
+        "Trees: on  (contours off)".into()
+    } else {
+        "Trees: off  (contours on)".into()
+    }
+}
+
+fn density_text(vegetation: &VegetationSettings) -> String {
+    if vegetation.enabled {
+        format!("Tree density: {:.2}x", vegetation.density)
+    } else {
+        format!("Tree density: {:.2}x (trees off)", vegetation.density)
+    }
+}
+
+/// Slider value as a 0-1 position along its range.
+fn density_fraction(density: f32) -> f32 {
+    ((density - MIN_DENSITY) / (MAX_DENSITY - MIN_DENSITY)).clamp(0.0, 1.0)
+}
+
+fn toggle_fill(enabled: bool, accent: Color, text: Color) -> Color {
+    if enabled {
+        accent.with_alpha(0.35)
+    } else {
+        text.with_alpha(0.12)
+    }
 }
 
 #[cfg(test)]

@@ -21,11 +21,7 @@ use crate::{
     antenna::Antenna,
     camera::OrbitCamera,
     drone::{Drone, SelectedDrone, make_antenna},
-    factories::{
-        movement::DroneKinematics,
-        seek::SeekTarget,
-        track::{Track, TrackingActive},
-    },
+    factories::{movement::DroneKinematics, track::Track},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     theme::ThemeRole,
     world::DRONE_RADIUS,
@@ -169,8 +165,8 @@ pub fn spawn_base(
 /// world-frame — then `antenna.rssi_dbm(θ_tx, 0.0, d)` (θ_rx = 0 until drones
 /// expose their own antenna direction to the base).
 pub fn update_base_comms(
-    mut bases: Query<(&Base, &mut BaseNetworkState)>,
-    drones: Query<(Entity, &GlobalTransform), With<Drone>>,
+    _bases: Query<(&Base, &mut BaseNetworkState)>,
+    _drones: Query<(Entity, &GlobalTransform), With<Drone>>,
 ) {
     todo!(
         "For each (base, antenna) × drone: \
@@ -185,8 +181,8 @@ pub fn update_base_comms(
 /// Push commands onto the `CommandQueue` of every reachable drone.
 /// Only drones in `BaseNetworkState::reachable_drones` receive commands.
 pub fn dispatch_commands(
-    bases: Query<&BaseNetworkState>,
-    mut drones: Query<(Entity, &mut CommandQueue)>,
+    _bases: Query<&BaseNetworkState>,
+    _drones: Query<(Entity, &mut CommandQueue)>,
 ) {
     todo!(
         "Iterate bases; for each reachable drone entity \
@@ -204,14 +200,14 @@ pub fn dispatch_commands(
 ///   ReturnToBase      → GoTo(base.position)
 ///   Abort             → remove SeekTarget + TrackingActive; zero velocity
 pub fn process_drone_commands(
-    mut commands: Commands,
-    mut drones: Query<(
+    _commands: Commands,
+    _drones: Query<(
         Entity,
         &mut CommandQueue,
         &mut DroneKinematics,
         Option<&mut Track>,
     )>,
-    bases: Query<&Base>,
+    _bases: Query<&Base>,
 ) {
     todo!(
         "For each drone with a non-empty CommandQueue: \

@@ -57,6 +57,7 @@ impl Antenna {
 
     /// Range at which rssi_dbm(0, 0, d) == sensitivity_dbm.
     /// Solved by bisection because α·d makes the equation transcendental.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn max_range_km(&self) -> f32 {
         let target =
             self.p_tx_dbm + self.g_peak_dbi + self.g_rx_dbi - self.sensitivity_dbm;

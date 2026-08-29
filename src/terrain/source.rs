@@ -22,6 +22,26 @@ use std::sync::{Arc, Mutex};
 
 use bevy::log::{info, warn};
 
+/// Where one phase sits on the single overall progress bar, as fractions of
+/// the whole load. The phases below are contiguous and cover elevation *and*
+/// vegetation, so the bar fills once end-to-end instead of each phase
+/// restarting it from zero.
+#[derive(Clone, Copy, Default)]
+pub struct PhaseWeight {
+    pub start: f32,
+    pub width: f32,
+}
+
+const fn weight(start: f32, width: f32) -> PhaseWeight {
+    PhaseWeight { start, width }
+}
+
+const PHASE_AUTH: PhaseWeight = weight(0.00, 0.03);
+const PHASE_SEARCH: PhaseWeight = weight(0.03, 0.05);
+const PHASE_DOWNLOAD: PhaseWeight = weight(0.08, 0.42);
+const PHASE_REPROJECT: PhaseWeight = weight(0.50, 0.48);
+const PHASE_TERRAIN_READY: PhaseWeight = weight(1.0, 0.0);
+
 /// Live progress shared between the fetch task and the loading UI.
 #[derive(Clone, Default)]
 pub struct Progress {
@@ -29,16 +49,37 @@ pub struct Progress {
     pub done: usize,
     pub total: usize,
     pub current: String,
+    pub weight: PhaseWeight,
+}
+
+impl Progress {
+    /// Position on the single overall bar, in 0..=1. Phases with no known
+    /// total sit at their own start offset rather than reading as empty.
+    pub fn overall_fraction(&self) -> f32 {
+        let within = if self.total > 0 {
+            (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (self.weight.start + self.weight.width * within).clamp(0.0, 1.0)
+    }
 }
 
 pub type ProgressHandle = Arc<Mutex<Progress>>;
 
-fn set_phase(progress: &ProgressHandle, phase: &str, done: usize, total: usize) {
+fn set_phase(
+    progress: &ProgressHandle,
+    phase: &str,
+    done: usize,
+    total: usize,
+    weight: PhaseWeight,
+) {
     if let Ok(mut p) = progress.lock() {
         p.phase = phase.to_string();
         p.done = done;
         p.total = total;
         p.current = String::new();
+        p.weight = weight;
     }
 }
 
@@ -105,7 +146,7 @@ fn get_token(client: &reqwest::blocking::Client, config: &FetchConfig) -> Result
 
 // ─── STAC search ────────────────────────────────────────────────────────────
 
-fn bbox_from_center(lat: f64, lon: f64, radius_km: f64) -> Result<(f64, f64, f64, f64), String> {
+pub(super) fn bbox_from_center(lat: f64, lon: f64, radius_km: f64) -> Result<(f64, f64, f64, f64), String> {
     if !(54.0..=70.0).contains(&lat) || !(10.0..=25.0).contains(&lon) {
         return Err("coordinates must be inside Sweden".to_string());
     }
@@ -483,10 +524,10 @@ fn apply_predictor(raw: &mut [u8], width: usize, bits: u16, predictor: u16, le: 
 /// Convert raw sample bytes to f32 given the TIFF sample type.
 fn raw_to_f32(raw: &[u8], bits: u16, sample_format: u16, le: bool) -> Vec<f32> {
     match (bits, sample_format) {
-        (32, 3) => raw.chunks_exact(4).map(|c| rd_f32(c, 0, le)).collect(),
-        (32, _) => raw.chunks_exact(4).map(|c| rd_u32(c, 0, le) as f32).collect(),
-        (16, 2) => raw.chunks_exact(2).map(|c| rd_u16(c, 0, le) as i16 as f32).collect(),
-        (16, _) => raw.chunks_exact(2).map(|c| rd_u16(c, 0, le) as f32).collect(),
+        (32, 3) => raw.as_chunks::<4>().0.iter().map(|c| rd_f32(c, 0, le)).collect(),
+        (32, _) => raw.as_chunks::<4>().0.iter().map(|c| rd_u32(c, 0, le) as f32).collect(),
+        (16, 2) => raw.as_chunks::<2>().0.iter().map(|c| rd_u16(c, 0, le) as i16 as f32).collect(),
+        (16, _) => raw.as_chunks::<2>().0.iter().map(|c| rd_u16(c, 0, le) as f32).collect(),
         (8, _) => raw.iter().map(|&b| b as f32).collect(),
         _ => vec![],
     }
@@ -721,9 +762,11 @@ fn fetch_cog(
 
 /// proj4 strings for the EPSG codes seen in Scandinavian elevation data.
 /// `proj4rs` uses radians for geographic (+proj=longlat) input/output.
-fn epsg_to_proj4(epsg: u32) -> Option<&'static str> {
+pub(super) fn epsg_to_proj4(epsg: u32) -> Option<&'static str> {
     Some(match epsg {
         4326 | 4258 => "+proj=longlat +datum=WGS84 +no_defs",
+        // WGS84 / Pseudo-Mercator — the canopy-height tiles' CRS.
+        3857 => "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +no_defs",
         // SWEREF99 TM — Swedish national grid. 5845 = SWEREF99 TM + RH2000
         // height (compound); the horizontal component is identical to 3006.
         3006 | 5845 => "+proj=utm +zone=33 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs",
@@ -773,7 +816,7 @@ fn merge_and_reproject(
         .map_err(|e| format!("WGS84 proj init: {e}"))?;
 
     for (tile_index, tile) in tiles.iter().enumerate() {
-        set_phase(progress, "Reprojecting terrain", tile_index, tiles.len());
+        set_phase(progress, "Reprojecting terrain", tile_index, tiles.len(), PHASE_REPROJECT);
 
         let is_geographic = matches!(tile.epsg, 4326 | 4258 | 0);
         let native_proj: Option<Proj> = if is_geographic {
@@ -896,10 +939,10 @@ pub fn fetch_terrain(
         .build()
         .map_err(|e| e.to_string())?;
 
-    set_phase(progress, "Authenticating with Lantmateriet", 0, 0);
+    set_phase(progress, "Authenticating with Lantmateriet", 0, 0, PHASE_AUTH);
     let token = get_token(&client, &config)?;
 
-    set_phase(progress, "Searching elevation catalogue", 0, 0);
+    set_phase(progress, "Searching elevation catalogue", 0, 0, PHASE_SEARCH);
     let bbox = bbox_from_center(lat, lon, radius_km)?;
     let urls = stac_search(&client, &config, &token, bbox)?;
     if urls.is_empty() {
@@ -913,7 +956,7 @@ pub fn fetch_terrain(
     // overlap priority) deterministic. reqwest::blocking::Client is Send + Sync.
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    set_phase(progress, "Downloading elevation tiles", 0, urls.len());
+    set_phase(progress, "Downloading elevation tiles", 0, urls.len(), PHASE_DOWNLOAD);
     let workers = urls.len().min(config.download_workers);
     let output_size = config.output_size;
     let next = AtomicUsize::new(0);
@@ -977,7 +1020,7 @@ pub fn fetch_terrain(
         max_h,
     );
 
-    set_phase(progress, "Terrain ready", 1, 1);
+    set_phase(progress, "Terrain ready", 1, 1, PHASE_TERRAIN_READY);
     Ok(TerrainGrid { heights_m: heights, size: config.output_size })
 }
 

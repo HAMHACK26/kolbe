@@ -32,15 +32,9 @@ pub struct MoonCrescent;
 #[derive(Component)]
 pub struct SunRays;
 
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct Theme {
     pub dark: bool,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self { dark: false }
-    }
 }
 
 /// Named Catppuccin colors used across the app.
@@ -105,6 +99,7 @@ fn glow(c: Color, k: f32) -> LinearRgba {
 }
 
 /// Recolor everything whenever `Theme` changes (also runs on first frame).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // Queries are distinct Bevy system inputs.
 pub fn apply_theme(
     theme: Res<Theme>,
     mut clear: ResMut<ClearColor>,
