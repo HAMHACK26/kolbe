@@ -6,10 +6,12 @@ mod drone;
 mod factories;
 mod navigation;
 mod networking;
+mod polygon;
 mod radar;
 mod recovery;
 mod seeking;
 mod spherical;
+mod sweden_geo;
 mod terrain;
 mod theme;
 mod tracking;
@@ -28,6 +30,31 @@ enum AppState {
     AreaSelection,
     LoadingTerrain,
     Simulation,
+}
+
+/// Marks every top-level entity spawned while entering `Simulation`, so
+/// leaving it (via the reset button) can tear the whole scene back down.
+#[derive(Component)]
+pub struct SimulationEntity;
+
+/// Despawn the simulated world and reset the resources it accumulated, so
+/// the next area selection starts from a clean slate.
+fn teardown_simulation(
+    mut commands: Commands,
+    entities: Query<Entity, With<SimulationEntity>>,
+    mut selected: ResMut<SelectedDrone>,
+    mut table_open: ResMut<ui::NetworkTablePanelOpen>,
+) {
+    for entity in &entities {
+        commands.entity(entity).despawn();
+    }
+    commands.remove_resource::<terrain::TerrainHeightMap>();
+    selected.0 = None;
+    table_open.0 = false;
+    commands.insert_resource(OrbitCamera::default());
+    commands.insert_resource(networking::Mailbox::default());
+    commands.insert_resource(networking::ReconnectBus::default());
+    commands.insert_resource(networking::ReconnectRequests::default());
 }
 
 fn main() {
@@ -55,7 +82,23 @@ fn main() {
         .init_resource::<ui::NetworkTablePanelOpen>()
         .add_systems(Startup, (ui::setup_camera, theme::setup_moon))
         .add_systems(OnEnter(AppState::AreaSelection), area::setup)
-        .add_systems(Update, area::interactions.run_if(in_state(AppState::AreaSelection)))
+        .add_systems(
+            Update,
+            (
+                area::add_point_on_click,
+                area::place_base_on_click,
+                area::point_table_and_buttons,
+                area::pan_zoom,
+                area::apply_pan_zoom,
+                area::recompute_area_on_change,
+                area::redraw_polygon,
+                area::redraw_table,
+                area::update_status_text,
+                area::generate_terrain,
+            )
+                .chain()
+                .run_if(in_state(AppState::AreaSelection)),
+        )
         .add_systems(OnExit(AppState::AreaSelection), area::cleanup)
         .add_systems(OnEnter(AppState::LoadingTerrain), terrain::start_loading)
         .add_systems(
@@ -68,19 +111,25 @@ fn main() {
             OnEnter(AppState::Simulation),
             (
                 terrain::spawn_mesh,
+                terrain::spawn_water,
                 world::setup,
                 base::spawn_base,
                 ui::make_camera_overlay,
+                ui::spawn_reset_button,
             )
                 .chain(),
         )
+        .add_systems(OnExit(AppState::Simulation), teardown_simulation)
+        .add_systems(Update, ui::reset_button_interactions.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, camera::orbit_camera.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, radar::sync_radar_visibility.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, terrain::draw_contours.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, terrain::draw_network_area.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
+        .add_systems(Update, theme::apply_loading_theme)
         .add_systems(Update, factories::movement::apply_velocity.run_if(in_state(AppState::Simulation)))
         .add_systems(
             Update,

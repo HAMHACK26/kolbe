@@ -56,7 +56,6 @@ struct FetchConfig {
     secret: String,
     search_url: String,
     collection: String,
-    radius_km: f64,
     output_size: usize,
     timeout_secs: u64,
     download_workers: usize,
@@ -70,10 +69,6 @@ impl FetchConfig {
             secret: var("SECRET")?,
             search_url: var("STAC_SEARCH_URL")?,
             collection: std::env::var("STAC_COLLECTION").unwrap_or_else(|_| "dtm-cog".to_string()),
-            radius_km: std::env::var("RADIUS_KM")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10.0),
             output_size: std::env::var("OUTPUT_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -887,7 +882,12 @@ fn merge_and_reproject(
 
 /// Fetch, decode, and reproject terrain for a point. Runs synchronously; call
 /// from a background task. Reports progress via `progress`.
-pub fn fetch_terrain(lat: f64, lon: f64, progress: &ProgressHandle) -> Result<TerrainGrid, String> {
+pub fn fetch_terrain(
+    lat: f64,
+    lon: f64,
+    radius_km: f64,
+    progress: &ProgressHandle,
+) -> Result<TerrainGrid, String> {
     let _ = dotenvy::dotenv();
     let config = FetchConfig::from_env()?;
 
@@ -900,7 +900,7 @@ pub fn fetch_terrain(lat: f64, lon: f64, progress: &ProgressHandle) -> Result<Te
     let token = get_token(&client, &config)?;
 
     set_phase(progress, "Searching elevation catalogue", 0, 0);
-    let bbox = bbox_from_center(lat, lon, config.radius_km)?;
+    let bbox = bbox_from_center(lat, lon, radius_km)?;
     let urls = stac_search(&client, &config, &token, bbox)?;
     if urls.is_empty() {
         return Err("no elevation raster covers the selected area".to_string());
@@ -991,7 +991,7 @@ mod tests {
     #[ignore]
     fn smoke_fetch_stockholm() {
         let progress: ProgressHandle = Arc::new(Mutex::new(Progress::default()));
-        let grid = fetch_terrain(59.3293, 18.0686, &progress).expect("fetch");
+        let grid = fetch_terrain(59.3293, 18.0686, 10.0, &progress).expect("fetch");
         let finite: Vec<f32> = grid.heights_m.iter().copied().filter(|v| v.is_finite()).collect();
         let covered = finite.len();
         let max = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);

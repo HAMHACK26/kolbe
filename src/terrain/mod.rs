@@ -21,7 +21,7 @@ mod source;
 use source::{Progress, ProgressHandle};
 
 const DEFAULT_VERTICAL_EXAGGERATION: f32 = 1.0;
-const CONTOUR_INTERVAL_KM: f32 = 0.020;
+const CONTOUR_INTERVAL_KM: f32 = 0.005;
 const CONTOUR_SURFACE_OFFSET: f32 = 0.008;
 
 fn parse_vertical_exaggeration(value: Option<&str>) -> f32 {
@@ -76,7 +76,13 @@ pub struct TerrainLoadError(pub String);
 pub(crate) struct LoadingRoot;
 
 #[derive(Component)]
+pub(crate) struct LoadingHeading;
+
+#[derive(Component)]
 pub(crate) struct LoadingStatus;
+
+#[derive(Component)]
+pub(crate) struct LoadingTrack;
 
 #[derive(Component)]
 pub(crate) struct LoadingBarFill;
@@ -117,6 +123,7 @@ pub fn start_loading(
                     ..default()
                 },
                 TextColor(p.text),
+                LoadingHeading,
             ));
             root.spawn((
                 Text::new("Querying Lantmateriet and building the height map..."),
@@ -136,6 +143,7 @@ pub fn start_loading(
                     ..default()
                 },
                 BackgroundColor(p.surface),
+                LoadingTrack,
             ))
             .with_child((
                 Node {
@@ -238,6 +246,7 @@ pub fn spawn_mesh(
             })),
             Transform::IDENTITY,
             ThemeRole::Ground,
+            crate::SimulationEntity,
         ))
         .observe(
             |_: On<Pointer<Click>>, orbit: Res<OrbitCamera>, mut selected: ResMut<SelectedDrone>| {
@@ -246,6 +255,110 @@ pub fn spawn_mesh(
                 }
             },
         );
+}
+
+/// A thin sea-level reference plane at the data's zero elevation (the lowest
+/// point in the fetched area) — flat terrain near that level is otherwise
+/// indistinguishable from flat terrain sitting on a raised plateau.
+const WATER_SURFACE_OFFSET: f32 = 0.004;
+
+pub fn spawn_water(
+    mut commands: Commands,
+    height_map: Res<TerrainHeightMap>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let half = height_map.size_km * 0.5;
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![
+            [-half, 0.0, -half],
+            [half, 0.0, -half],
+            [half, 0.0, half],
+            [-half, 0.0, half],
+        ],
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4]);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+    mesh.insert_indices(Indices::U32(vec![0, 2, 1, 0, 3, 2]));
+
+    commands.spawn((
+        Mesh3d(meshes.add(mesh)),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            perceptual_roughness: 0.05,
+            alpha_mode: AlphaMode::Blend,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        })),
+        Transform::from_xyz(0.0, WATER_SURFACE_OFFSET, 0.0),
+        ThemeRole::Water,
+        Pickable::IGNORE,
+        crate::SimulationEntity,
+    ));
+}
+
+/// Marks the picked polygon, its (possibly rotated) minimum bounding square
+/// — the network area — and the larger axis-aligned box actually fetched.
+/// Lines are subdivided and dropped onto the height field so they follow
+/// the terrain instead of floating as flat chords over sloped ground.
+pub fn draw_network_area(
+    mut gizmos: Gizmos,
+    net: Option<Res<crate::area::NetworkArea>>,
+    area: Res<crate::area::ScenarioArea>,
+    terrain: Res<TerrainHeightMap>,
+) {
+    let Some(net) = net else { return };
+    if !net.valid {
+        return;
+    }
+
+    let to_local = |lat: f64, lon: f64| -> (f32, f32) {
+        let x = ((lon - area.longitude) * 111.320 * area.latitude.to_radians().cos()) as f32;
+        let z = ((lat - area.latitude) * 110.574) as f32;
+        (x, z)
+    };
+
+    let fetch_color = Color::srgba(1.0, 1.0, 1.0, 0.25);
+    let square_color = Color::srgb(1.0, 0.85, 0.2);
+    let polygon_color = Color::srgb(0.3, 0.9, 1.0);
+
+    draw_ring(&mut gizmos, &terrain, net.fetch_corners.map(|(lat, lon)| to_local(lat, lon)), fetch_color);
+    draw_ring(&mut gizmos, &terrain, net.corners.map(|(lat, lon)| to_local(lat, lon)), square_color);
+    let points: Vec<(f32, f32)> = net.points.iter().map(|&(lat, lon)| to_local(lat, lon)).collect();
+    draw_ring(&mut gizmos, &terrain, points, polygon_color);
+}
+
+fn draw_ring(
+    gizmos: &mut Gizmos,
+    terrain: &TerrainHeightMap,
+    points: impl IntoIterator<Item = (f32, f32)>,
+    color: Color,
+) {
+    const SEGMENTS: usize = 12;
+    const SURFACE_OFFSET: f32 = 0.02;
+
+    let points: Vec<(f32, f32)> = points.into_iter().collect();
+    if points.len() < 2 {
+        return;
+    }
+    let n = points.len();
+    for i in 0..n {
+        let (x0, z0) = points[i];
+        let (x1, z1) = points[(i + 1) % n];
+        for s in 0..SEGMENTS {
+            let ta = s as f32 / SEGMENTS as f32;
+            let tb = (s + 1) as f32 / SEGMENTS as f32;
+            let (ax, az) = (x0.lerp(x1, ta), z0.lerp(z1, ta));
+            let (bx, bz) = (x0.lerp(x1, tb), z0.lerp(z1, tb));
+            gizmos.line(
+                Vec3::new(ax, terrain.height_at(ax, az) + SURFACE_OFFSET, az),
+                Vec3::new(bx, terrain.height_at(bx, bz) + SURFACE_OFFSET, bz),
+                color,
+            );
+        }
+    }
 }
 
 /// Draw 20 m contour lines from the local height grid. Heights in the grid are
@@ -330,7 +443,8 @@ fn fetch_height_map(
     area: &ScenarioArea,
     progress: &ProgressHandle,
 ) -> Result<TerrainHeightMap, String> {
-    let grid = source::fetch_terrain(area.latitude, area.longitude, progress)?;
+    let radius_km = area.size_km as f64 * 0.5;
+    let grid = source::fetch_terrain(area.latitude, area.longitude, radius_km, progress)?;
     let size = grid.size;
     if size < 2 {
         return Err(format!("terrain grid too small: {size}x{size}"));

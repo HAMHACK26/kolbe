@@ -28,12 +28,13 @@ pub fn setup(
     theme: Res<Theme>,
 ) {
     let pal = theme.palette();
-    commands.spawn((Camera3d::default(), Transform::default()));
+    commands.spawn((Camera3d::default(), Transform::default(), crate::SimulationEntity));
 
-    commands.spawn(AmbientLight { brightness: 300.0, ..default() });
+    commands.spawn((AmbientLight { brightness: 300.0, ..default() }, crate::SimulationEntity));
     commands.spawn((
         DirectionalLight { illuminance: 8000.0, shadow_maps_enabled: false, ..default() },
         Transform::from_xyz(8.0, 16.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        crate::SimulationEntity,
     ));
 
     let positions: [(f32, f32); 12] = [
@@ -93,6 +94,7 @@ pub fn setup(
                 RecoveryState::default(),
                 ContactMemory::default(),
                 ThemeRole::Drone,
+                crate::SimulationEntity,
             ))
             .observe(
                 |mut t: On<Pointer<Click>>,
@@ -117,6 +119,7 @@ pub fn setup(
                 Visibility::Hidden,
                 RadarCone { drone_entity },
                 ThemeRole::DroneCone,
+                crate::SimulationEntity,
             ));
         }
     }
@@ -137,6 +140,7 @@ pub fn setup(
             BackgroundColor(pal.surface.with_alpha(0.88)),
             Visibility::Hidden,
             InfoPopup,
+            crate::SimulationEntity,
         ))
         .with_children(|p| {
             p.spawn((
@@ -202,6 +206,7 @@ pub fn setup(
             BackgroundColor(pal.surface.with_alpha(0.88)),
             Visibility::Hidden,
             NetworkTablePopup,
+            crate::SimulationEntity,
         ))
         .with_children(|p| {
             p.spawn((
