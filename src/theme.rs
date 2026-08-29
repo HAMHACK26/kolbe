@@ -1,14 +1,16 @@
 //! Catppuccin theming — Mocha (dark) / Latte (light) with a runtime toggle.
 //!
-//! Entities carry a `ThemeRole` marker; `apply_theme` recolors their shared
-//! material whenever the `Theme` resource changes. UI colors (popup, moon)
-//! are driven the same way.
+//! Two mechanisms consume the palette. 3D entities carry a [`ThemeRole`] and
+//! get their shared material recolored by [`apply_theme`]. UI nodes carry
+//! [`UiFill`] / [`UiStroke`] / [`UiInk`] naming a [`Slot`], and
+//! [`apply_ui_slots`] repaints all of them in one pass — so a screen that
+//! spawns its own chrome only has to name the slot each node belongs to
+//! instead of growing another query in `apply_theme`.
 
 use bevy::prelude::*;
 
 use crate::{
-    area::{AreaBg, BodyText, HeadingText, SourceText},
-    terrain::{LoadingBarFill, LoadingEyebrow, LoadingHeading, LoadingPanel, LoadingRoot, LoadingStatus, LoadingTrack},
+    terrain::{LoadingBarFill, LoadingHeading, LoadingRoot, LoadingStatus, LoadingTrack},
     ui::{InfoPopup, InfoPopupTitle},
 };
 
@@ -38,19 +40,69 @@ pub struct Theme {
 }
 
 /// Named Catppuccin colors used across the app.
+///
+/// Grouped by what a color *means* rather than what it looks like, so the
+/// Mocha/Latte swap below stays one decision per role instead of one per
+/// widget.
 pub struct Palette {
+    // ── Chassis ────────────────────────────────────────────────────────────
     pub bg: Color,       // window clear color (base)
-    pub ground: Color,   // green
-    pub water: Color,    // sea-level reference plane
-    pub surface: Color,  // popup background (surface0)
+    pub panel: Color,    // an instrument panel sitting on `bg` (surface0)
+    pub raised: Color,   // a control sitting on a panel (surface1)
+    pub line: Color,     // hairline rules and control borders (overlay0)
+    pub surface: Color,  // popup background (surface2)
+
+    // ── Type ───────────────────────────────────────────────────────────────
     pub text: Color,     // text
     pub subtext: Color,  // dimmed body text (subtext0)
-    pub accent: Color,   // blue — table header / highlights
+
+    // ── Meaning ────────────────────────────────────────────────────────────
+    pub accent: Color,   // blue — table header / highlights / live data
+    /// Yellow. The operator's own marks: the selected area, the primary
+    /// action, the ground station. Shares its value with `base` on purpose —
+    /// the square on the map and the station inside it are one idea.
+    pub signal: Color,
+    pub danger: Color,   // red — errors
+
+    // ── Scene ──────────────────────────────────────────────────────────────
+    pub ground: Color,   // green
+    pub water: Color,    // sea-level reference plane
     pub drone: Color,    // red
+    pub drone_cone: Color, // sapphire
     pub base: Color,     // yellow
     pub grid: Color,     // overlay0
-    pub danger: Color,   // red — errors
     pub moon: Color,     // yellow
+}
+
+/// A palette entry, addressable at runtime so a UI node can name its color
+/// instead of carrying one. See [`UiFill`], [`UiStroke`], [`UiInk`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Slot {
+    Bg,
+    Panel,
+    Raised,
+    Line,
+    Text,
+    Subtext,
+    Accent,
+    Signal,
+    Danger,
+}
+
+impl Palette {
+    pub fn slot(&self, slot: Slot) -> Color {
+        match slot {
+            Slot::Bg => self.bg,
+            Slot::Panel => self.panel,
+            Slot::Raised => self.raised,
+            Slot::Line => self.line,
+            Slot::Text => self.text,
+            Slot::Subtext => self.subtext,
+            Slot::Accent => self.accent,
+            Slot::Signal => self.signal,
+            Slot::Danger => self.danger,
+        }
+    }
 }
 
 impl Theme {
@@ -58,34 +110,104 @@ impl Theme {
         if self.dark {
             Palette {
                 bg: Color::srgb_u8(0x1e, 0x1e, 0x2e),
-                ground: Color::srgb_u8(0x45, 0x47, 0x5a), // surface1 — gray
-                water: Color::srgb_u8(0x74, 0xc7, 0xec),  // sapphire
+                panel: Color::srgb_u8(0x31, 0x32, 0x44), // surface0
+                raised: Color::srgb_u8(0x45, 0x47, 0x5a), // surface1
+                line: Color::srgb_u8(0x6c, 0x70, 0x86),  // overlay0
                 surface: Color::srgb_u8(0x58, 0x5b, 0x70), // surface2 — popup, distinct
                 text: Color::srgb_u8(0xcd, 0xd6, 0xf4),
                 subtext: Color::srgb_u8(0xa6, 0xad, 0xc8),
                 accent: Color::srgb_u8(0x89, 0xb4, 0xfa),
+                signal: Color::srgb_u8(0xf9, 0xe2, 0xaf),
+                danger: Color::srgb_u8(0xf3, 0x8b, 0xa8),
+                ground: Color::srgb_u8(0x45, 0x47, 0x5a), // surface1 — gray
+                water: Color::srgb_u8(0x74, 0xc7, 0xec),  // sapphire
                 drone: Color::srgb_u8(0xf3, 0x8b, 0xa8),
+                drone_cone: Color::srgb_u8(0x74, 0xc7, 0xec),
                 base: Color::srgb_u8(0xf9, 0xe2, 0xaf),
                 grid: Color::srgb_u8(0x6c, 0x70, 0x86),
-                danger: Color::srgb_u8(0xf3, 0x8b, 0xa8),
                 moon: Color::srgb_u8(0xf9, 0xe2, 0xaf),
             }
         } else {
             Palette {
                 bg: Color::srgb_u8(0xef, 0xf1, 0xf5),
-                ground: Color::srgb_u8(0xbc, 0xc0, 0xcc), // surface1 — gray
-                water: Color::srgb_u8(0x20, 0x9f, 0xb5),  // sapphire
+                panel: Color::srgb_u8(0xcc, 0xd0, 0xda), // surface0
+                raised: Color::srgb_u8(0xbc, 0xc0, 0xcc), // surface1
+                line: Color::srgb_u8(0x9c, 0xa0, 0xb0),  // overlay0
                 surface: Color::srgb_u8(0xac, 0xb0, 0xbe), // surface2 — popup, distinct
                 text: Color::srgb_u8(0x4c, 0x4f, 0x69),
                 subtext: Color::srgb_u8(0x6c, 0x6f, 0x85),
                 accent: Color::srgb_u8(0x1e, 0x66, 0xf5),
+                signal: Color::srgb_u8(0xdf, 0x8e, 0x1d),
+                danger: Color::srgb_u8(0xd2, 0x0f, 0x39),
+                ground: Color::srgb_u8(0xbc, 0xc0, 0xcc), // surface1 — gray
+                water: Color::srgb_u8(0x20, 0x9f, 0xb5),  // sapphire
                 drone: Color::srgb_u8(0xd2, 0x0f, 0x39),
+                drone_cone: Color::srgb_u8(0x20, 0x9f, 0xb5),
                 base: Color::srgb_u8(0xdf, 0x8e, 0x1d),
                 grid: Color::srgb_u8(0x9c, 0xa0, 0xb0),
-                danger: Color::srgb_u8(0xd2, 0x0f, 0x39),
                 moon: Color::srgb_u8(0xdf, 0x8e, 0x1d),
             }
         }
+    }
+}
+
+/// Paints a node's background from `slot`, at `alpha` of its full opacity.
+#[derive(Component, Clone, Copy)]
+pub struct UiFill(pub Slot, pub f32);
+
+/// Paints a node's border from `slot`. All four sides are colored; which of
+/// them actually draws is decided by `Node::border`, so a bottom-only rule is
+/// a one-sided `border` width, not a one-sided color.
+#[derive(Component, Clone, Copy)]
+pub struct UiStroke(pub Slot, pub f32);
+
+/// Paints text from `slot`.
+#[derive(Component, Clone, Copy)]
+pub struct UiInk(pub Slot, pub f32);
+
+impl UiFill {
+    pub fn new(slot: Slot) -> Self {
+        Self(slot, 1.0)
+    }
+}
+impl UiStroke {
+    pub fn new(slot: Slot) -> Self {
+        Self(slot, 1.0)
+    }
+}
+impl UiInk {
+    pub fn new(slot: Slot) -> Self {
+        Self(slot, 1.0)
+    }
+}
+
+/// Repaint every slot-tagged UI node on a theme change.
+///
+/// Deliberately one system over the whole tagged set rather than a query per
+/// widget: screens that spawn their own chrome (the area picker, chiefly)
+/// would otherwise have to add a parameter here for every new control, and
+/// `apply_theme` already shows where that ends up. Entities spawned *after* a
+/// switch are colored correctly at spawn by whoever spawns them, so this only
+/// has to handle the switch itself.
+pub fn apply_ui_slots(
+    theme: Res<Theme>,
+    mut fills: Query<(&UiFill, &mut BackgroundColor)>,
+    mut strokes: Query<(&UiStroke, &mut BorderColor)>,
+    mut inks: Query<(&UiInk, &mut TextColor)>,
+) {
+    if !theme.is_changed() {
+        return;
+    }
+    let p = theme.palette();
+
+    for (fill, mut bg) in &mut fills {
+        bg.0 = p.slot(fill.0).with_alpha(fill.1);
+    }
+    for (stroke, mut border) in &mut strokes {
+        border.set_all(p.slot(stroke.0).with_alpha(stroke.1));
+    }
+    for (ink, mut color) in &mut inks {
+        color.0 = p.slot(ink.0).with_alpha(ink.1);
     }
 }
 
@@ -95,47 +217,31 @@ fn glow(c: Color, k: f32) -> LinearRgba {
     LinearRgba::new(l.red * k, l.green * k, l.blue * k, 0.0)
 }
 
-/// Recolor everything whenever `Theme` changes (also runs on first frame).
-#[allow(clippy::too_many_arguments, clippy::type_complexity)] // Queries are distinct Bevy system inputs.
+/// Recolor the 3D scene and the sim-overlay chrome whenever `Theme` changes.
+///
+/// UI nodes that carry a [`Slot`] tag are *not* handled here — see
+/// [`apply_ui_slots`]. What is left is the material-driven scene plus the two
+/// overlay widgets that predate the slot system and need special handling
+/// (the popup wants a translucent fill; the moon swaps visibility, not color).
+#[allow(clippy::type_complexity)] // Queries are distinct Bevy system inputs.
 pub fn apply_theme(
     theme: Res<Theme>,
     mut clear: ResMut<ClearColor>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     roles: Query<(&MeshMaterial3d<StandardMaterial>, &ThemeRole)>,
-    mut popup_bg: Query<&mut BackgroundColor, (With<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>, Without<AreaBg>)>,
-    mut title: Query<&mut TextColor, (With<InfoPopupTitle>, Without<HeadingText>, Without<BodyText>, Without<SourceText>)>,
-    mut moon_btn: Query<&mut BackgroundColor, (With<MoonButton>, Without<InfoPopup>, Without<MoonCrescent>, Without<AreaBg>)>,
+    mut popup_bg: Query<&mut BackgroundColor, (With<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>)>,
+    mut title: Query<&mut TextColor, With<InfoPopupTitle>>,
+    mut moon_btn: Query<&mut BackgroundColor, (With<MoonButton>, Without<InfoPopup>, Without<MoonCrescent>)>,
     mut crescent: Query<&mut Visibility, (With<MoonCrescent>, Without<SunRays>)>,
     mut rays: Query<&mut Visibility, (With<SunRays>, Without<MoonCrescent>)>,
-    mut crescent_bg: Query<&mut BackgroundColor, (With<MoonCrescent>, Without<MoonButton>, Without<InfoPopup>, Without<AreaBg>)>,
-    area_ui: (
-        Query<&mut BackgroundColor, (With<AreaBg>, Without<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>)>,
-        Query<&mut TextColor, (With<HeadingText>, Without<InfoPopupTitle>, Without<BodyText>, Without<SourceText>)>,
-        Query<&mut TextColor, (With<BodyText>, Without<HeadingText>, Without<InfoPopupTitle>, Without<SourceText>)>,
-        Query<&mut TextColor, (With<SourceText>, Without<HeadingText>, Without<BodyText>, Without<InfoPopupTitle>)>,
-    ),
+    mut crescent_bg: Query<&mut BackgroundColor, (With<MoonCrescent>, Without<MoonButton>, Without<InfoPopup>)>,
 ) {
-    let (mut area_bg, mut headings, mut bodies, mut sources) = area_ui;
-
     if !theme.is_changed() {
         return;
     }
     let p = theme.palette();
 
     clear.0 = p.bg;
-
-    for mut bg in &mut area_bg {
-        bg.0 = p.bg;
-    }
-    for mut tc in &mut headings {
-        tc.0 = p.text;
-    }
-    for mut tc in &mut bodies {
-        tc.0 = p.text.with_alpha(0.8);
-    }
-    for mut tc in &mut sources {
-        tc.0 = p.text.with_alpha(0.6);
-    }
 
     for (mat_handle, role) in &roles {
         let Some(mut mat) = materials.get_mut(&mat_handle.0) else { continue };
@@ -152,11 +258,9 @@ pub fn apply_theme(
                 mat.base_color = p.drone;
                 mat.emissive = glow(p.drone, 2.0);
             }
-            // Drone and base cones share the base's yellow — the whole radio
-            // side of the picture reads as one system.
             ThemeRole::DroneCone => {
-                mat.base_color = p.base.with_alpha(0.30);
-                mat.emissive = glow(p.base, 0.6);
+                mat.base_color = p.drone_cone.with_alpha(0.30);
+                mat.emissive = glow(p.drone_cone, 0.6);
             }
             ThemeRole::BaseMarker => {
                 mat.base_color = p.base;
@@ -196,12 +300,10 @@ pub fn apply_theme(
 pub fn apply_loading_theme(
     theme: Res<Theme>,
     mut root_bg: Query<&mut BackgroundColor, (With<LoadingRoot>, Without<LoadingTrack>, Without<LoadingBarFill>)>,
-    mut panel_bg: Query<&mut BackgroundColor, (With<LoadingPanel>, Without<LoadingRoot>, Without<LoadingTrack>, Without<LoadingBarFill>)>,
     mut track_bg: Query<&mut BackgroundColor, (With<LoadingTrack>, Without<LoadingRoot>, Without<LoadingBarFill>)>,
     mut fill_bg: Query<&mut BackgroundColor, (With<LoadingBarFill>, Without<LoadingTrack>, Without<LoadingRoot>)>,
     mut heading: Query<&mut TextColor, (With<LoadingHeading>, Without<LoadingStatus>)>,
     mut status: Query<&mut TextColor, (With<LoadingStatus>, Without<LoadingHeading>)>,
-    mut eyebrow: Query<&mut TextColor, (With<LoadingEyebrow>, Without<LoadingHeading>, Without<LoadingStatus>)>,
 ) {
     if !theme.is_changed() {
         return;
@@ -209,9 +311,6 @@ pub fn apply_loading_theme(
     let p = theme.palette();
     for mut bg in &mut root_bg {
         bg.0 = p.bg;
-    }
-    for mut bg in &mut panel_bg {
-        bg.0 = p.surface;
     }
     for mut bg in &mut track_bg {
         bg.0 = p.surface;
@@ -223,9 +322,6 @@ pub fn apply_loading_theme(
         tc.0 = p.text;
     }
     for mut tc in &mut status {
-        tc.0 = p.accent;
-    }
-    for mut tc in &mut eyebrow {
         tc.0 = p.accent;
     }
 }

@@ -18,11 +18,12 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 
 use crate::{
-    antenna::Antenna,
+    antenna::{Antenna, Antennas},
     camera::OrbitCamera,
     drone::{Drone, SelectedDrone, make_antenna},
     factories::{movement::DroneKinematics, track::Track},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
+    networking::RadioBundle,
     theme::ThemeRole,
     world::DRONE_RADIUS,
 };
@@ -124,6 +125,11 @@ pub fn spawn_base(
             position: pos,
             antennas: antennas.clone(),
         },
+        // The base is a first-class radio node. This makes its direct link
+        // appear in each drone's lookup table immediately and lets its table
+        // relay newly learned peers through the mesh.
+        Antennas(antennas.clone()),
+        RadioBundle::random(),
         BaseNetworkState::default(),
         ThemeRole::BaseMarker,
         crate::SimulationEntity,
@@ -147,14 +153,14 @@ pub fn spawn_base(
         cull_mode: None,
         ..default()
     });
-    for antenna in &antennas {
+    for (antenna_index, antenna) in antennas.iter().enumerate() {
         commands.spawn((
             Mesh3d(cone_mesh_for(antenna, &mut meshes)),
             MeshMaterial3d(cone_mat.clone()),
             // Bases have no heading — 0.0 leaves azimuth effectively world-frame.
             cone_transform_for(antenna, 0.0, pos),
             Visibility::Hidden,
-            RadarCone { drone_entity: base_entity },
+            RadarCone { drone_entity: base_entity, antenna_index },
             ThemeRole::BaseCone,
             crate::SimulationEntity,
         ));

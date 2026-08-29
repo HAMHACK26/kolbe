@@ -37,9 +37,16 @@ use theme::Theme;
 /// at once — see `bevy_text::TextPlugin::build`, which does the exact same
 /// `Assets<Font>::insert(AssetId::default(), ..)` trick to install its own.
 const DEFAULT_UI_FONT: &[u8] = include_bytes!("../assets/fonts/FiraSans-Bold.ttf");
+const MONO_UI_FONT: &[u8] = include_bytes!("../assets/fonts/FiraMono-Medium.ttf");
 
-fn install_default_font(mut fonts: ResMut<Assets<Font>>) {
+#[derive(Resource, Clone, Default)]
+pub struct UiFonts {
+    pub mono: Handle<Font>,
+}
+
+fn install_default_font(mut fonts: ResMut<Assets<Font>>, mut ui_fonts: ResMut<UiFonts>) {
     let _ = fonts.insert(AssetId::<Font>::default(), Font::from_bytes(DEFAULT_UI_FONT.to_vec()));
+    ui_fonts.mono = fonts.add(Font::from_bytes(MONO_UI_FONT.to_vec()));
 }
 
 #[derive(States, Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -101,6 +108,7 @@ fn main() {
         .init_state::<AppState>()
         .init_resource::<area::ScenarioArea>()
         .init_resource::<terrain::VegetationSettings>()
+        .init_resource::<UiFonts>()
         .insert_resource(SelectedDrone(None))
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
@@ -122,12 +130,14 @@ fn main() {
                 area::point_table_and_buttons,
                 area::pan_zoom,
                 area::zoom_buttons,
+                area::track_viewport_size,
                 tiles::poll_tile_fetches,
                 area::sync_map_tiles,
                 area::recompute_area_on_change,
                 area::redraw_polygon,
                 area::redraw_table,
                 area::update_status_text,
+                area::update_map_readout,
                 area::trees_toggle_interactions,
                 area::refresh_vegetation_controls,
                 area::generate_terrain,
@@ -149,19 +159,25 @@ fn main() {
                 terrain::spawn_mesh,
                 terrain::spawn_water,
                 terrain::spawn_trees,
-                world::setup,
+                // The deployment queue starts at the actual base position.
                 base::spawn_base,
+                world::setup,
                 ui::make_camera_overlay,
                 ui::spawn_reset_button,
+                ui::spawn_speed_button,
             )
                 .chain(),
         )
         .add_systems(OnExit(AppState::Simulation), teardown_simulation)
         .add_systems(Update, ui::reset_button_interactions.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, ui::speed_button_interactions.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, camera::orbit_camera.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, radar::sync_radar_visibility.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, radar::sync_radar_transforms.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, radar::draw_mesh_links.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, world::spawn_next_drone.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, terrain::draw_network_area.run_if(in_state(AppState::Simulation)))
         // Contours and trees are alternatives: a forest covers the ground the
         // contours describe, so only one of the two is drawn.
@@ -175,6 +191,7 @@ fn main() {
         .add_systems(OnExit(AppState::Simulation), terrain::cleanup_trees)
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
+        .add_systems(Update, theme::apply_ui_slots)
         .add_systems(Update, theme::apply_loading_theme)
         // Integration runs last in the movement chain: every system that wants
         // a say in this frame's velocity — navigators first, then the
@@ -193,17 +210,16 @@ fn main() {
         .add_systems(
             Update,
             (
-                // Priority reconnection flood first, so a fresh slew-freeze is
-                // visible to the aiming systems this same frame.
+                navigation::go_to_network_area,
+                networking::expire_stale_handshakes,
+                networking::request_nearby_connections,
                 networking::process_reconnect,
-                // Antenna aiming (tracking::maintain_mesh_antennas,
-                // seeking::seek_lost_links) is disabled for now — antennas and
-                // radar cones stay at their spawn angles. Wiring live aiming
-                // back in is a future PR.
+                tracking::maintain_mesh_antennas,
+                tracking::maintain_base_antennas,
+                seeking::seek_lost_links,
                 networking::detect_links_and_send_headers,
                 networking::route_packets,
-                // Partition detection + recovery run last — they need the
-                // freshly (re)detected links and updated mesh table.
+                networking::halt_on_link_loss,
                 recovery::detect_partitions,
                 recovery::run_recovery,
                 // Last word on velocity: the proximity ring deflects whatever
