@@ -3,7 +3,7 @@ use bevy::{prelude::*, window::PrimaryWindow};
 use crate::{
     antenna::{Antenna, Antennas},
     base::Base,
-    drone::{Drone, DroneType, SelectedDrone},
+    drone::{Drone, SelectedDrone},
     networking::MeshTable,
     theme::Theme,
 };
@@ -28,6 +28,16 @@ pub fn make_camera_overlay(mut cameras: Query<&mut Camera, With<UiCamera>>) {
 #[derive(Component)]
 pub struct ResetButton;
 
+/// Current virtual-time multiplier selected by the simulation speed button.
+#[derive(Resource, Default)]
+pub struct SimulationSpeed(pub usize);
+
+#[derive(Component)]
+pub struct SpeedButton;
+
+#[derive(Component)]
+pub struct SpeedButtonLabel;
+
 pub fn spawn_reset_button(mut commands: Commands) {
     commands
         .spawn((
@@ -51,6 +61,30 @@ pub fn spawn_reset_button(mut commands: Commands) {
         ));
 }
 
+pub fn spawn_speed_button(mut commands: Commands) {
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(16.0),
+                top: Val::Px(60.0),
+                padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            SpeedButton,
+            crate::SimulationEntity,
+        ))
+        .with_child((
+            Text::new("Speed: 1×"),
+            TextFont { font_size: FontSize::Px(14.0), ..default() },
+            TextColor(Color::WHITE),
+            SpeedButtonLabel,
+        ));
+}
+
 pub fn reset_button_interactions(
     interactions: Query<&Interaction, (Changed<Interaction>, With<ResetButton>)>,
     mut next_state: ResMut<NextState<crate::AppState>>,
@@ -59,6 +93,24 @@ pub fn reset_button_interactions(
         if *interaction == Interaction::Pressed {
             next_state.set(crate::AppState::AreaSelection);
         }
+    }
+}
+
+pub fn speed_button_interactions(
+    interactions: Query<&Interaction, (Changed<Interaction>, With<SpeedButton>)>,
+    mut speed: ResMut<SimulationSpeed>,
+    mut virtual_time: ResMut<Time<Virtual>>,
+    mut labels: Query<&mut Text, With<SpeedButtonLabel>>,
+) {
+    const MULTIPLIERS: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
+    if !interactions.iter().any(|state| *state == Interaction::Pressed) {
+        return;
+    }
+    speed.0 = (speed.0 + 1) % MULTIPLIERS.len();
+    let multiplier = MULTIPLIERS[speed.0];
+    virtual_time.set_relative_speed(multiplier);
+    for mut label in &mut labels {
+        **label = format!("Speed: {}×", multiplier as u8);
     }
 }
 
@@ -253,11 +305,7 @@ pub fn update_popup_position(
 }
 
 fn drone_title(drone: &Drone, antennas: &Antennas) -> String {
-    let type_str = match drone.drone_type {
-        DroneType::Attack => "Attack",
-        DroneType::Node => "Node",
-    };
-    format!("{}  [{}]  {} ant", drone.id, type_str, antennas.0.len())
+    format!("{}  [Node]  {} ant", drone.id, antennas.0.len())
 }
 
 fn base_title(base: &Base, antennas: &Antennas) -> String {

@@ -2,18 +2,11 @@ use bevy::prelude::*;
 
 use crate::antenna::Antenna;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DroneType {
-    Node,
-    Attack,
-}
-
 /// A flying node. Its radio lives in a separate [`crate::antenna::Antennas`]
 /// component, shared with the base — see that type's docs.
 #[derive(Component)]
 pub struct Drone {
     pub id: String,
-    pub drone_type: DroneType,
 }
 
 #[derive(Resource, Default)]

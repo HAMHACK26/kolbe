@@ -113,6 +113,9 @@ pub const FLIGHT_LOOKAHEAD_SECS: f32 = 0.1;
 /// How often a header resends while a link stays up (on the sender's own clock).
 pub const HEADER_INTERVAL_SECS: f64 = 0.1;
 
+/// Desired number of simultaneous direct radio peers per drone.
+pub const TARGET_DIRECT_CONNECTIONS: usize = 3;
+
 /// Speed of light (km/s) — ranging is in km.
 pub const SPEED_OF_LIGHT_KM_S: f64 = 299_792.458;
 
@@ -173,6 +176,9 @@ impl DroneClock {
 #[derive(Component, Default)]
 pub struct LinkSet {
     pub connected: std::collections::HashMap<Entity, f64>,
+    /// The local antenna reserved for each live peer session. A peer can have
+    /// only one active antenna on this node, even if beams overlap.
+    pub antenna_for_peer: std::collections::HashMap<Entity, usize>,
 }
 
 /// Distance/direction to each peer, recovered by ranging.
@@ -462,7 +468,10 @@ pub fn detect_links_and_send_headers(
         &mut SentHeaders,
         &MeshTable,
     )>,
-    positions: Query<(Entity, &GlobalTransform), With<Antennas>>,
+    positions: Query<
+        (Entity, &GlobalTransform, &Antennas, Option<&DroneKinematics>),
+        With<Antennas>,
+    >,
     uuids: Query<&DroneUuid>,
     bases: Query<&Base>,
 ) {
@@ -480,28 +489,42 @@ pub fn detect_links_and_send_headers(
 
         // All peers currently detected (regardless of resend cadence) — this
         // is what `connections` means for our own upserted row on the peer.
-        let detected: Vec<Entity> = positions
+        let detected: Vec<(Entity, usize)> = positions
             .iter()
-            .filter(|(peer_entity, peer_gt)| {
-                *peer_entity != self_entity && {
-                    let peer_pos = peer_gt.translation();
-                    let distance_km = (peer_pos - self_pos).length();
-                    antennas.0.iter().any(|antenna| {
-                        let theta_tx = antenna.off_boresight_deg(heading_deg, self_pos, peer_pos);
-                        antenna.rssi_dbm(theta_tx, 0.0, distance_km) >= antenna.sensitivity_dbm
-                    })
+            .filter_map(|(peer_entity, peer_gt, peer_antennas, peer_kin)| {
+                if peer_entity == self_entity {
+                    return None;
                 }
+                let peer_pos = peer_gt.translation();
+                let distance_km = (peer_pos - self_pos).length();
+                let local_antenna = antennas.0.iter().enumerate().find_map(|(index, antenna)| {
+                    let theta = antenna.off_boresight_deg(heading_deg, self_pos, peer_pos);
+                    (antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm)
+                        .then_some(index)
+                });
+                let peer_heading = peer_kin.map(|kin| kin.heading_deg).unwrap_or(0.0);
+                let peer_detects_us = peer_antennas.0.iter().any(|antenna| {
+                    let theta = antenna.off_boresight_deg(peer_heading, peer_pos, self_pos);
+                    antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm
+                });
+                local_antenna
+                    .filter(|_| peer_detects_us)
+                    .map(|antenna_index| (peer_entity, antenna_index))
             })
-            .map(|(peer_entity, _)| peer_entity)
             .collect();
         let origin_connections: Vec<String> =
-            detected.iter().filter_map(|e| uuids.get(*e).ok().map(|u| u.0.clone())).collect();
+            detected
+                .iter()
+                .filter_map(|(e, _)| uuids.get(*e).ok().map(|u| u.0.clone()))
+                .collect();
         let body: Vec<MeshRow> = table.0.values().cloned().collect();
 
         let mut detected_now: std::collections::HashMap<Entity, f64> =
             std::collections::HashMap::new();
+        let mut antenna_for_peer = std::collections::HashMap::new();
 
-        for &peer_entity in &detected {
+        for &(peer_entity, antenna_index) in &detected {
+            antenna_for_peer.insert(peer_entity, antenna_index);
             // Keep this link's last-sent time unless it's due for a resend.
             let last_sent = links.connected.get(&peer_entity).copied();
             let due = match last_sent {
@@ -540,6 +563,7 @@ pub fn detect_links_and_send_headers(
 
         // Drop links no longer detected so they re-fire on reconnect.
         links.connected = detected_now;
+        links.antenna_for_peer = antenna_for_peer;
     }
 }
 
@@ -817,17 +841,27 @@ pub fn process_reconnect(
 pub fn halt_on_link_loss(
     mut drones: Query<(Entity, &RingIndex, &LinkSet, &mut DroneKinematics)>,
     ring_slots: Query<(Entity, &RingIndex), With<Drone>>,
+    bases: Query<Entity, With<Base>>,
 ) {
+    let Some(base_entity) = bases.iter().next() else {
+        return;
+    };
     let mut ring: Vec<(usize, Entity)> = ring_slots.iter().map(|(e, ri)| (ri.0, e)).collect();
     ring.sort_by_key(|(i, _)| *i);
     let n = ring.len();
-    // Below 3 drones "next" and "previous" are the same peer (or nonexistent),
-    // so there is no two-neighbor invariant to hold anyone to.
-    if n < 3 {
-        return;
-    }
-
     for (self_entity, self_ring, links, mut kin) in &mut drones {
+        // Flight is permitted only while the drone is directly connected to
+        // the ground station. A lost base link takes priority over mesh
+        // movement or recovery commands.
+        if !links.connected.contains_key(&base_entity) {
+            kin.velocity = Vec3::ZERO;
+            continue;
+        }
+        // Below 3 drones "next" and "previous" are the same peer (or
+        // nonexistent), so only the base-link rule applies.
+        if n < 3 {
+            continue;
+        }
         let next = ring[(self_ring.0 + 1) % n].1;
         let prev = ring[(self_ring.0 + n - 1) % n].1;
         let linked = |peer: Entity| peer == self_entity || links.connected.contains_key(&peer);
@@ -877,6 +911,9 @@ pub fn request_nearby_connections(
             continue;
         }
         if links.connected.is_empty() {
+            continue;
+        }
+        if links.connected.len() >= TARGET_DIRECT_CONNECTIONS {
             continue;
         }
 

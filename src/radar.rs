@@ -4,7 +4,7 @@ use crate::{
     antenna::{Antenna, Antennas, radar_direction},
     drone::SelectedDrone,
     factories::movement::DroneKinematics,
-    networking::LinkSet,
+    networking::{DroneUuid, LinkSet, MeshTable},
 };
 
 /// Fixed visual beam length (km). The drone knows only its pointing angles —
@@ -74,26 +74,26 @@ pub fn sync_radar_transforms(
 
 /// Draw a line between every pair of drones that has a *live, two-way* link.
 ///
-/// A connection counts only when each drone independently detected the other
-/// and is therefore sending it headers — mutual membership in both
-/// [`LinkSet`]s. A one-sided detection is not a connection: a drone that only
-/// hears its peer, or one still spiral-searching for a lock
-/// (`crate::seeking`), has no entry on the far side and gets no line. The
-/// picture is therefore exactly the mesh that is actually carrying data.
+/// A connection counts only when each node independently detects the other
+/// *and* each has received the other's header directly. A one-sided detection
+/// or a one-way header has no line; the picture only shows bidirectional data
+/// exchange over mutually connected antennas.
 pub fn draw_mesh_links(
     mut gizmos: Gizmos,
     theme: Res<crate::theme::Theme>,
-    nodes: Query<(Entity, &Transform, &LinkSet), With<Antennas>>,
+    nodes: Query<(Entity, &Transform, &DroneUuid, &LinkSet, &MeshTable), With<Antennas>>,
 ) {
     // One color for every hop, base or drone — the mesh is one system, and the
     // cones the links come out of are drawn in the same yellow.
     let color = theme.palette().base;
     let nodes: Vec<RadioNode> = nodes
         .iter()
-        .map(|(entity, transform, links)| RadioNode {
+        .map(|(entity, transform, uuid, links, table)| RadioNode {
             entity,
             position: transform.translation,
+            uuid: &uuid.0,
             links,
+            table,
         })
         .collect();
     for (from, to) in mutual_link_segments(&nodes) {
@@ -105,18 +105,31 @@ pub fn draw_mesh_links(
 struct RadioNode<'a> {
     entity: Entity,
     position: Vec3,
+    uuid: &'a str,
     links: &'a LinkSet,
+    table: &'a MeshTable,
 }
 
 /// The undirected segments of [`draw_mesh_links`]: one per pair that appears
-/// in *both* nodes' link sets, each pair yielded exactly once.
+/// in both link sets and whose headers were received in both directions, each
+/// pair yielded exactly once.
 fn mutual_link_segments(nodes: &[RadioNode]) -> Vec<(Vec3, Vec3)> {
     let mut segments = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
         for peer in &nodes[i + 1..] {
             let mutual = node.links.connected.contains_key(&peer.entity)
                 && peer.links.connected.contains_key(&node.entity);
-            if mutual {
+            let exchanged_headers = node
+                .table
+                .0
+                .get(peer.uuid)
+                .is_some_and(|row| row.neighbour_distance == 0)
+                && peer
+                    .table
+                    .0
+                    .get(node.uuid)
+                    .is_some_and(|row| row.neighbour_distance == 0);
+            if mutual && exchanged_headers {
                 segments.push((node.position, peer.position));
             }
         }

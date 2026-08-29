@@ -111,6 +111,7 @@ fn main() {
         .init_resource::<networking::ReconnectBus>()
         .init_resource::<networking::ReconnectRequests>()
         .init_resource::<ui::NetworkTablePanelOpen>()
+        .init_resource::<ui::SimulationSpeed>()
         .init_resource::<tiles::TileCache>()
         .add_systems(Startup, (install_default_font, ui::setup_camera, theme::setup_moon))
         .add_systems(OnEnter(AppState::AreaSelection), area::setup)
@@ -155,11 +156,13 @@ fn main() {
                 world::setup,
                 ui::make_camera_overlay,
                 ui::spawn_reset_button,
+                ui::spawn_speed_button,
             )
                 .chain(),
         )
         .add_systems(OnExit(AppState::Simulation), teardown_simulation)
         .add_systems(Update, ui::reset_button_interactions.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, ui::speed_button_interactions.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, camera::orbit_camera.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, radar::sync_radar_visibility.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, radar::sync_radar_transforms.run_if(in_state(AppState::Simulation)))

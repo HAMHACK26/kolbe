@@ -38,8 +38,10 @@
 
 use bevy::prelude::*;
 
+use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
+use crate::networking::{DroneUuid, LinkSet, MeshTable};
 use crate::world::DeploymentTarget;
 
 /// The flight envelope a drone is governed to. All limits are deliberately
@@ -267,27 +269,49 @@ pub fn go_to_network_area(
     time: Res<Time>,
     network_area: Res<crate::area::NetworkArea>,
     scenario: Res<crate::area::ScenarioArea>,
-    positions: Query<(Entity, &Transform), With<Drone>>,
-    mut drones: Query<(Entity, &Transform, &mut DeploymentTarget, &mut DroneKinematics), With<Drone>>,
+    peer_uuids: Query<&DroneUuid, With<Drone>>,
+    bases: Query<&Base>,
+    mut drones: Query<
+        (
+            &Transform,
+            &mut DeploymentTarget,
+            &mut DroneKinematics,
+            &LinkSet,
+            &MeshTable,
+        ),
+        With<Drone>,
+    >,
 ) {
     let dt = time.delta_secs();
     let limits = FlightLimits::default().in_km();
 
-    for (entity, transform, mut target, mut kin) in &mut drones {
+    let Some(base_pos) = bases.iter().next().map(|base| base.position) else {
+        return;
+    };
+
+    for (transform, mut target, mut kin, links, table) in &mut drones {
         if !target.spreading && transform.translation.distance(target.ingress) < 0.15 {
             target.spreading = true;
         }
         let waypoint = if target.spreading {
             dumb_spacing_waypoint(
-                entity,
                 transform.translation,
-                &positions,
+                table,
+                base_pos,
                 &network_area,
                 &scenario,
             )
         } else {
             target.ingress
         };
+        let waypoint = preserve_critical_links(
+            transform.translation,
+            waypoint,
+            links,
+            table,
+            &peer_uuids,
+            base_pos,
+        );
         let mut state = DroneState {
             position: transform.translation,
             velocity: kin.velocity,
@@ -300,22 +324,20 @@ pub fn go_to_network_area(
 }
 
 const SPACING_LIMIT_KM: f32 = 3.0;
+const PROTECTED_LINK_MARGIN_KM: f32 = 0.1;
 const BOUNDARY_BUFFER_KM: f32 = 0.5;
 const SPACING_STEP_KM: f32 = 0.1;
 
 fn dumb_spacing_waypoint(
-    self_entity: Entity,
     self_pos: Vec3,
-    positions: &Query<(Entity, &Transform), With<Drone>>,
+    table: &MeshTable,
+    base_pos: Vec3,
     area: &crate::area::NetworkArea,
     scenario: &crate::area::ScenarioArea,
 ) -> Vec3 {
     let mut push = Vec3::ZERO;
-    for (peer, transform) in positions.iter() {
-        if peer == self_entity {
-            continue;
-        }
-        let offset = self_pos - transform.translation;
+    for row in table.0.values() {
+        let offset = self_pos - (base_pos + row.location);
         let distance = offset.length();
         if distance > f32::EPSILON && distance < SPACING_LIMIT_KM {
             push += offset / distance * ((SPACING_LIMIT_KM - distance) / SPACING_LIMIT_KM);
@@ -352,4 +374,38 @@ fn dumb_spacing_waypoint(
     } else {
         self_pos
     }
+}
+
+/// Refuse a movement that would stretch a live, protected peer link beyond
+/// the antenna limit. A peer is protected when its newest lookup-table row
+/// says it has at most two direct connections. The row is refreshed by that
+/// peer's header every `networking::HEADER_INTERVAL_SECS` while the link is up.
+fn preserve_critical_links(
+    self_pos: Vec3,
+    waypoint: Vec3,
+    links: &LinkSet,
+    table: &MeshTable,
+    peer_uuids: &Query<&DroneUuid, With<Drone>>,
+    base_pos: Vec3,
+) -> Vec3 {
+    let planned_displacement = waypoint - self_pos;
+    for &peer_entity in links.connected.keys() {
+        let Ok(peer_uuid) = peer_uuids.get(peer_entity) else {
+            continue; // The base is not a drone-peer protection edge.
+        };
+        let Some(peer_row) = table.0.get(&peer_uuid.0) else {
+            continue;
+        };
+        if peer_row.connections.len() > 2 {
+            continue;
+        }
+
+        let from_peer = self_pos - (base_pos + peer_row.location);
+        if from_peer.length() >= SPACING_LIMIT_KM - PROTECTED_LINK_MARGIN_KM
+            && planned_displacement.dot(from_peer) > 0.0
+        {
+            return self_pos;
+        }
+    }
+    waypoint
 }

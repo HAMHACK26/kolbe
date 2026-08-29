@@ -4,7 +4,7 @@ use crate::{
     antenna::{Antenna, Antennas, angles_toward},
     base::{Base, CommandQueue},
     camera::OrbitCamera,
-    drone::{Drone, DroneType, SelectedDrone, drone_id, make_antenna},
+    drone::{Drone, SelectedDrone, drone_id, make_antenna},
     factories::{DroneAi, movement::DroneKinematics},
     networking::NetworkingBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
@@ -320,14 +320,13 @@ fn spawn_deployment_drone(
     target_slots: &[Vec3],
     index: usize,
 ) {
-    let drone_type = if index % 3 == 0 { DroneType::Attack } else { DroneType::Node };
     let antennas = formation_antennas(target_slots, index, base_pos);
     let drone_entity = commands
         .spawn((
             Mesh3d(drone_mesh.clone()),
             MeshMaterial3d(drone_mat.clone()),
             Transform::from_translation(base_pos),
-            Drone { id: drone_id(index), drone_type },
+            Drone { id: drone_id(index) },
             Antennas(antennas.clone()),
             DeploymentTarget { ingress, spreading: false },
             DroneKinematics::default(),
