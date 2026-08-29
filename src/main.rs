@@ -89,6 +89,7 @@ fn main() {
                 area::place_base_on_click,
                 area::point_table_and_buttons,
                 area::pan_zoom,
+                area::zoom_buttons,
                 area::apply_pan_zoom,
                 area::recompute_area_on_change,
                 area::redraw_polygon,

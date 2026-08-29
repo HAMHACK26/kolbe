@@ -167,10 +167,20 @@ fn recompute_network_area(points: &[(f64, f64)]) -> NetworkArea {
 }
 
 /// Current pan/zoom of the map content, relative to its base 1:1 layout.
-#[derive(Resource, Default)]
+/// `zoom` must never be 0 — `apply_pan_zoom` applies it directly as the
+/// content node's scale, and `#[derive(Default)]` would give `0.0` here,
+/// collapsing the whole map (image, cities, points) to nothing on the very
+/// first frame after `MapView::default()` is inserted.
+#[derive(Resource)]
 pub(crate) struct MapView {
     pub zoom: f32,
     pub pan: Vec2,
+}
+
+impl Default for MapView {
+    fn default() -> Self {
+        Self { zoom: ZOOM_MIN, pan: Vec2::ZERO }
+    }
 }
 
 impl MapView {
@@ -242,6 +252,41 @@ pub(crate) struct SetBaseButton;
 #[derive(Component)]
 pub(crate) struct SetBaseLabel;
 
+#[derive(Component)]
+pub(crate) struct ZoomInButton;
+
+#[derive(Component)]
+pub(crate) struct ZoomOutButton;
+
+fn spawn_zoom_button(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    marker: impl Component,
+    bg: Color,
+    fg: Color,
+) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                width: Val::Px(28.0),
+                height: Val::Px(28.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                ..default()
+            },
+            BackgroundColor(bg),
+            marker,
+        ))
+        .with_child((
+            Text::new(label),
+            TextFont { font_size: FontSize::Px(18.0), ..default() },
+            TextColor(fg),
+            Pickable::IGNORE,
+        ));
+}
+
 pub fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -265,7 +310,7 @@ pub fn setup(
         TextureDimension::D2,
         sweden_geo::rasterize(theme.dark),
         TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
+        RenderAssetUsages::default(),
     ));
     commands.insert_resource(SwedenMapHandle(map_handle.clone()));
 
@@ -305,7 +350,6 @@ pub fn setup(
                         Node {
                             width: Val::Px(sweden_geo::IMG_W as f32),
                             height: Val::Px(sweden_geo::IMG_H as f32),
-                            position_type: PositionType::Absolute,
                             ..default()
                         },
                         UiTransform::IDENTITY,
@@ -352,6 +396,28 @@ pub fn setup(
                                 Pickable::IGNORE,
                             ));
                         }
+                    });
+
+                // Zoom controls — scroll-wheel zoom is unreliable on macOS
+                // trackpads, so these buttons (Google Maps-style) are the
+                // primary way to zoom. Siblings of `MapContent`, not
+                // children, so they stay fixed in the corner instead of
+                // scaling/panning with the map.
+                viewport
+                    .spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            right: Val::Px(10.0),
+                            bottom: Val::Px(10.0),
+                            flex_direction: FlexDirection::Column,
+                            ..default()
+                        },
+                        Pickable::IGNORE,
+                    ))
+                    .with_children(|controls| {
+                        spawn_zoom_button(controls, "+", ZoomInButton, p.surface, p.text);
+                        controls.spawn(Node { height: Val::Px(2.0), ..default() });
+                        spawn_zoom_button(controls, "\u{2212}", ZoomOutButton, p.surface, p.text);
                     });
             });
 
@@ -612,8 +678,9 @@ pub fn point_table_and_buttons(
     }
 }
 
-/// Pan (drag) and zoom (scroll) the map content — only while reviewing, and
-/// only while the cursor is over the viewport.
+/// Zoom (scroll) works in any mode; pan (drag) only while reviewing, so it
+/// doesn't fight click-to-place-a-point. Both only act while the cursor is
+/// over the viewport.
 pub fn pan_zoom(
     mode: Res<PickMode>,
     viewport_q: Query<&RelativeCursorPosition, With<MapViewport>>,
@@ -622,9 +689,6 @@ pub fn pan_zoom(
     scroll: Res<AccumulatedMouseScroll>,
     mut view: ResMut<MapView>,
 ) {
-    if *mode != PickMode::Reviewing {
-        return;
-    }
     let Ok(cursor) = viewport_q.single() else {
         return;
     };
@@ -635,8 +699,29 @@ pub fn pan_zoom(
     if scroll.delta.y != 0.0 {
         view.zoom = (view.zoom + scroll.delta.y * 0.15).clamp(ZOOM_MIN, ZOOM_MAX);
     }
-    if mouse_button.pressed(MouseButton::Left) && motion.delta != Vec2::ZERO {
+    if *mode == PickMode::Reviewing
+        && mouse_button.pressed(MouseButton::Left)
+        && motion.delta != Vec2::ZERO
+    {
         view.pan += motion.delta;
+    }
+}
+
+const ZOOM_STEP: f32 = 0.5;
+
+/// Google Maps-style +/- buttons — the reliable zoom path, since scroll-wheel
+/// zoom is flaky on macOS trackpads (two-finger scroll doesn't consistently
+/// reach `AccumulatedMouseScroll`).
+pub fn zoom_buttons(
+    zoom_in: Query<&Interaction, (Changed<Interaction>, With<ZoomInButton>)>,
+    zoom_out: Query<&Interaction, (Changed<Interaction>, With<ZoomOutButton>)>,
+    mut view: ResMut<MapView>,
+) {
+    if zoom_in.iter().any(|i| *i == Interaction::Pressed) {
+        view.zoom = (view.zoom + ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+    }
+    if zoom_out.iter().any(|i| *i == Interaction::Pressed) {
+        view.zoom = (view.zoom - ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
     }
 }
 
@@ -645,7 +730,7 @@ pub fn apply_pan_zoom(view: Res<MapView>, mut content_q: Query<&mut UiTransform,
         return;
     }
     if let Ok(mut transform) = content_q.single_mut() {
-        transform.scale = Vec2::splat(view.zoom);
+        transform.scale = Vec2::splat(view.zoom.max(0.01));
         transform.translation = Val2::px(view.pan.x, view.pan.y);
     }
 }
