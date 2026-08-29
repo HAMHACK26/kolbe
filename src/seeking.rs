@@ -68,6 +68,7 @@ use bevy::prelude::*;
 use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
+use crate::factories::movement::DroneKinematics;
 use crate::navigation::FlightLimits;
 use crate::networking::{DroneClock, DroneUuid, LinkSet, MeshTable, Pairing, RingIndex};
 
@@ -214,6 +215,7 @@ pub fn seek_lost_links(
         &DroneClock,
         &mut SeekState,
         &Pairing,
+        &DroneKinematics,
     )>,
     positions: Query<(Entity, &Transform, &RingIndex, &DroneUuid), With<Drone>>,
     bases: Query<&Base>,
@@ -232,8 +234,18 @@ pub fn seek_lost_links(
     ring.sort_by_key(|(i, ..)| *i);
     let n = ring.len();
 
-    for (self_transform, mut drone, self_ring, self_uuid, links, table, clock, mut seek, pairing) in
-        &mut drones
+    for (
+        self_transform,
+        mut drone,
+        self_ring,
+        self_uuid,
+        links,
+        table,
+        clock,
+        mut seek,
+        pairing,
+        kin,
+    ) in &mut drones
     {
         if n == 0 {
             continue;
@@ -268,6 +280,7 @@ pub fn seek_lost_links(
             max_speed_mps,
             omega_rad_s: omega,
             dt,
+            heading_deg: kin.heading_deg,
             elapsed: &mut seek.next_elapsed_secs,
         });
         seek_one_slot(SeekSlotArgs {
@@ -283,6 +296,7 @@ pub fn seek_lost_links(
             max_speed_mps,
             omega_rad_s: omega,
             dt,
+            heading_deg: kin.heading_deg,
             elapsed: &mut seek.prev_elapsed_secs,
         });
     }
@@ -301,6 +315,9 @@ struct SeekSlotArgs<'a> {
     max_speed_mps: f32,
     omega_rad_s: f32,
     dt: f32,
+    /// The owning drone's heading, used to convert the world-frame aim below
+    /// into the drone-relative frame `Antenna::azimuth_deg` is expressed in.
+    heading_deg: f32,
     elapsed: &'a mut f32,
 }
 
@@ -318,6 +335,7 @@ fn seek_one_slot(args: SeekSlotArgs) {
         max_speed_mps,
         omega_rad_s,
         dt,
+        heading_deg,
         elapsed,
     } = args;
 
@@ -353,12 +371,12 @@ fn seek_one_slot(args: SeekSlotArgs) {
     let (delta_az, delta_el) =
         spiral_offset_deg(*elapsed, omega_rad_s, half_cone_deg, SPIRAL_TURNS_PER_SWEEP);
 
-    // TODO(future PR, re-enabling live aiming): `angles_toward` is a world-frame
-    // bearing, but `Antenna::azimuth_deg` is now drone-relative (heading-relative).
-    // Subtract the drone's own heading, e.g. `center_az - kin.heading_deg`.
+    // `angles_toward` is a world-frame bearing but `Antenna::azimuth_deg` is
+    // drone-relative, so the drone's own heading comes back out. Elevation is
+    // world-frame already and needs no correction.
     let (center_az, center_el) = angles_toward(self_pos, target_pos);
     if let Some(antenna) = drone.antennas.get_mut(antenna_idx) {
-        antenna.azimuth_deg = (center_az + delta_az).rem_euclid(360.0);
+        antenna.azimuth_deg = (center_az - heading_deg + delta_az).rem_euclid(360.0);
         antenna.elevation_deg = (center_el + delta_el).clamp(-90.0, 90.0);
     }
 }

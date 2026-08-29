@@ -48,9 +48,8 @@ pub struct TerrainHeightMap {
 
 impl TerrainHeightMap {
     /// Side length (km) of the fetched terrain — the actual requested
-    /// network-area size, which can differ a lot from the fixed
-    /// `world::WORLD_SIZE` (20km) the hand-placed drone ring and grid
-    /// overlay are scaled from.
+    /// network-area size. The drone formation and the grid overlay are both
+    /// sized from this rather than any fixed world extent.
     pub fn size_km(&self) -> f32 {
         self.size_km
     }

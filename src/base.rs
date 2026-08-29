@@ -32,7 +32,7 @@ use crate::{
 /// Edge length of the cube the ground station is drawn as, km. Doubles as its
 /// physical footprint — [`crate::avoidance`] derives the base's bounding
 /// radius from it so drones keep clear of the structure.
-pub const BASE_BOX_SIZE_KM: f32 = 0.3;
+pub const BASE_BOX_SIZE_KM: f32 = 0.075;
 
 /// Marks the ground control station entity.
 #[derive(Component)]
@@ -40,8 +40,6 @@ pub struct Base {
     pub id: String,
     /// Fixed world-space position (km). Y = elevation.
     pub position: Vec3,
-    /// Antennas this base uses to communicate with drones.
-    pub antennas: Vec<Antenna>,
 }
 
 /// Tracks which drones the base can currently communicate with.
@@ -147,14 +145,14 @@ pub fn spawn_base(
         cull_mode: None,
         ..default()
     });
-    for antenna in &antennas {
+    for (antenna_index, antenna) in antennas.iter().enumerate() {
         commands.spawn((
             Mesh3d(cone_mesh_for(antenna, &mut meshes)),
             MeshMaterial3d(cone_mat.clone()),
             // Bases have no heading — 0.0 leaves azimuth effectively world-frame.
             cone_transform_for(antenna, 0.0, pos),
             Visibility::Hidden,
-            RadarCone { drone_entity: base_entity },
+            RadarCone { drone_entity: base_entity, antenna_index },
             ThemeRole::BaseCone,
             crate::SimulationEntity,
         ));

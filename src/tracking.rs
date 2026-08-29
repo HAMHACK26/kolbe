@@ -20,6 +20,7 @@ use bevy::prelude::*;
 use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
+use crate::factories::movement::DroneKinematics;
 use crate::networking::{DroneUuid, MeshTable, Pairing, RingIndex};
 
 /// Where this drone currently believes a tracked peer *will be*, based
@@ -61,9 +62,16 @@ pub struct TrackedPeers(pub HashMap<Entity, Vec3>);
 ///
 /// This overrides the fixed 120°-apart layout `world::setup` used to compute
 /// the initial angles; those were only ever a starting point.
-#[allow(dead_code)] // Implemented and tested, but live aiming is not yet enabled in main.
 pub fn maintain_mesh_antennas(
-    mut drones: Query<(&Transform, &mut Drone, &RingIndex, &TrackedPeers, &MeshTable, &Pairing)>,
+    mut drones: Query<(
+        &Transform,
+        &mut Drone,
+        &DroneKinematics,
+        &RingIndex,
+        &TrackedPeers,
+        &MeshTable,
+        &Pairing,
+    )>,
     positions: Query<(Entity, &RingIndex, &DroneUuid), With<Drone>>,
     bases: Query<&Base>,
 ) {
@@ -77,7 +85,7 @@ pub fn maintain_mesh_antennas(
     ring.sort_by_key(|(i, ..)| *i);
     let n = ring.len();
 
-    for (self_transform, mut drone, self_ring, tracked, table, pairing) in &mut drones {
+    for (self_transform, mut drone, kin, self_ring, tracked, table, pairing) in &mut drones {
         if n == 0 {
             continue;
         }
@@ -114,23 +122,25 @@ pub fn maintain_mesh_antennas(
         // feedback using `Antenna::rssi_dbm`/`off_boresight_deg` sampled at
         // a few points around the current boresight each tick.
 
-        // TODO(future PR, re-enabling live aiming): `angles_toward` returns a
-        // world-frame bearing, but `Antenna::azimuth_deg` is now drone-relative
-        // (heading-relative). Subtract the drone's own heading before assigning,
-        // e.g. `az - kin.heading_deg` — elevation needs no such adjustment.
+        // `angles_toward` returns a world-frame bearing while
+        // `Antenna::azimuth_deg` is drone-relative — the antennas turn with the
+        // airframe — so the drone's own heading comes back out of every
+        // azimuth. Elevation is already world-frame (everything shares one
+        // "up") and needs no such correction.
+        let relative_az = |az: f32| (az - kin.heading_deg).rem_euclid(360.0);
         if let (Some(next_pos), Some(first)) = (next_pos, drone.antennas.get_mut(0)) {
             let (az, el) = angles_toward(self_pos, next_pos);
-            first.azimuth_deg = az;
+            first.azimuth_deg = relative_az(az);
             first.elevation_deg = el;
         }
         if let (Some(base_pos), Some(second)) = (base_pos, drone.antennas.get_mut(1)) {
             let (az, el) = angles_toward(self_pos, base_pos);
-            second.azimuth_deg = az;
+            second.azimuth_deg = relative_az(az);
             second.elevation_deg = el;
         }
         if let (Some(prev_pos), Some(third)) = (prev_pos, drone.antennas.get_mut(2)) {
             let (az, el) = angles_toward(self_pos, prev_pos);
-            third.azimuth_deg = az;
+            third.azimuth_deg = relative_az(az);
             third.elevation_deg = el;
         }
     }
@@ -154,22 +164,23 @@ mod tests {
         world
             .spawn((
                 Transform::from_translation(pos),
-                Drone {
-                    id: format!("d{ring}"),
-                    drone_type: DroneType::Node,
-                    antennas: vec![
-                        make_antenna(0.0, 0.0, 0),
-                        make_antenna(0.0, 0.0, 1),
-                        make_antenna(0.0, 0.0, 2),
-                    ],
-                },
+                Drone { id: format!("d{ring}"), drone_type: DroneType::Node },
+                Antennas(vec![
+                    make_antenna(0.0, 0.0, 0),
+                    make_antenna(0.0, 0.0, 1),
+                    make_antenna(0.0, 0.0, 2),
+                ]),
                 NetworkingBundle::random(ring),
+                // Heading 0 — the aiming math converts world bearings into
+                // this drone's frame, so the tests' expected angles are the
+                // world-frame ones.
+                DroneKinematics::default(),
             ))
             .id()
     }
 
     fn spawn_base(world: &mut World, pos: Vec3) {
-        world.spawn(Base { id: "base".into(), position: pos, antennas: vec![] });
+        world.spawn(Base { id: "base".into(), position: pos });
     }
 
     fn antenna0_az(world: &World, drone: Entity) -> f32 {

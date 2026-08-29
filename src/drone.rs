@@ -8,11 +8,12 @@ pub enum DroneType {
     Attack,
 }
 
+/// A flying node. Its radio lives in a separate [`crate::antenna::Antennas`]
+/// component, shared with the base — see that type's docs.
 #[derive(Component)]
 pub struct Drone {
     pub id: String,
     pub drone_type: DroneType,
-    pub antennas: Vec<Antenna>,
 }
 
 #[derive(Resource, Default)]

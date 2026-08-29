@@ -1,5 +1,17 @@
 use bevy::prelude::*;
 
+/// Every antenna carried by one radio node — a drone or the base.
+///
+/// Antennas live in their own component, not on [`crate::drone::Drone`] or
+/// [`crate::base::Base`], because the radio behaves the same either way: link
+/// detection, ranging, the mesh table and the link rendering all run over
+/// "things with antennas", so a base takes part in the mesh on exactly the
+/// same code path a drone does. What differs is only *aiming policy* — a drone
+/// tracks its two ring neighbors, a base covers the whole formation — and the
+/// color the links are drawn in.
+#[derive(Component, Clone, Default)]
+pub struct Antennas(pub Vec<Antenna>);
+
 /// Physical parameters for a single directional antenna.
 ///
 /// `gain_db`, `path_loss_db`, and `rssi_dbm` are intentionally separate so

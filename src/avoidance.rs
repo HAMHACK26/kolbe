@@ -900,7 +900,7 @@ mod tests {
         use std::time::Duration;
 
         fn drone(id: &str) -> Drone {
-            Drone { id: id.into(), drone_type: DroneType::Node, antennas: Vec::new() }
+            Drone { id: id.into(), drone_type: DroneType::Node }
         }
 
         let mut app = App::new();

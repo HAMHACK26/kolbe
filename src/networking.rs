@@ -746,6 +746,46 @@ pub fn process_reconnect(
     bus.0 = outgoing;
 }
 
+/// Stop any drone that is missing a direct link to one of its two ring
+/// neighbors.
+///
+/// A directional 1°-beam link is lost by *drifting off boresight*, so the
+/// worst thing a drone can do when a neighbor goes quiet is keep flying: it
+/// widens the geometry the seeking spiral has to search and drags its own
+/// remaining links toward their range limit. Holding station freezes the
+/// problem in place while `crate::seeking` sweeps the lost slot and
+/// `crate::tracking` holds the slots that are still up.
+///
+/// This zeroes `DroneKinematics::velocity` only — `apply_velocity` still does
+/// the integration, and any navigator that runs afterwards (notably
+/// `crate::recovery::run_recovery`, which flies back to the last-contact
+/// waypoint when a link loss actually partitions the mesh) is free to
+/// override the halt.
+///
+/// Runs after `detect_links_and_send_headers`, so `LinkSet` is this frame's.
+pub fn halt_on_link_loss(
+    mut drones: Query<(Entity, &RingIndex, &LinkSet, &mut DroneKinematics)>,
+    ring_slots: Query<(Entity, &RingIndex), With<Drone>>,
+) {
+    let mut ring: Vec<(usize, Entity)> = ring_slots.iter().map(|(e, ri)| (ri.0, e)).collect();
+    ring.sort_by_key(|(i, _)| *i);
+    let n = ring.len();
+    // Below 3 drones "next" and "previous" are the same peer (or nonexistent),
+    // so there is no two-neighbor invariant to hold anyone to.
+    if n < 3 {
+        return;
+    }
+
+    for (self_entity, self_ring, links, mut kin) in &mut drones {
+        let next = ring[(self_ring.0 + 1) % n].1;
+        let prev = ring[(self_ring.0 + n - 1) % n].1;
+        let linked = |peer: Entity| peer == self_entity || links.connected.contains_key(&peer);
+        if !linked(next) || !linked(prev) {
+            kin.velocity = Vec3::ZERO;
+        }
+    }
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 /// A fresh random request id (v4-format UUID string) for a reconnection flood.
@@ -803,15 +843,12 @@ mod tests {
             .spawn((
                 Transform::from_translation(pos),
                 GlobalTransform::from(Transform::from_translation(pos)),
-                Drone {
-                    id: format!("d{ring}"),
-                    drone_type: DroneType::Node,
-                    antennas: vec![
-                        make_antenna(0.0, 0.0, 0),
-                        make_antenna(0.0, 0.0, 1),
-                        make_antenna(0.0, 0.0, 2),
-                    ],
-                },
+                Drone { id: format!("d{ring}"), drone_type: DroneType::Node },
+                Antennas(vec![
+                    make_antenna(0.0, 0.0, 0),
+                    make_antenna(0.0, 0.0, 1),
+                    make_antenna(0.0, 0.0, 2),
+                ]),
                 DroneKinematics::default(),
                 NetworkingBundle::random(ring),
             ))
@@ -851,12 +888,51 @@ mod tests {
         world.run_system_once(detect_links_and_send_headers).unwrap();
     }
 
+    /// A drone whose ring neighbors are all linked keeps flying; a drone
+    /// missing one stops dead. This is the whole "lose a connection → stop"
+    /// rule, so both halves are asserted against one shared setup.
+    #[test]
+    fn link_loss_halts_only_the_drone_that_lost_it() {
+        let mut world = World::new();
+        // Three drones is the smallest ring where "next" and "previous" are
+        // different peers, i.e. where the two-neighbor invariant exists.
+        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
+        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
+        let c = spawn_drone(&mut world, Vec3::new(0.0, 0.0, 1.0), 2);
+
+        let cruising = Vec3::new(0.01, 0.0, 0.0);
+        for drone in [a, b, c] {
+            world.get_mut::<DroneKinematics>(drone).unwrap().velocity = cruising;
+        }
+        // Fully linked ring, except A never hears C.
+        let link = |world: &mut World, owner: Entity, peers: &[Entity]| {
+            let mut links = world.get_mut::<LinkSet>(owner).unwrap();
+            for &peer in peers {
+                links.connected.insert(peer, 0.0);
+            }
+        };
+        link(&mut world, a, &[b]);
+        link(&mut world, b, &[a, c]);
+        link(&mut world, c, &[a, b]);
+
+        world.run_system_once(halt_on_link_loss).unwrap();
+
+        let velocity = |world: &World, drone: Entity| {
+            world.get::<DroneKinematics>(drone).unwrap().velocity
+        };
+        assert_eq!(velocity(&world, a), Vec3::ZERO, "A lost C and must stop");
+        assert_eq!(velocity(&world, b), cruising, "B has both neighbors and keeps flying");
+        // C still *thinks* it has both — links are per-drone and A's loss is
+        // A's alone until C's own detection notices.
+        assert_eq!(velocity(&world, c), cruising, "C still has both neighbors");
+    }
+
     #[test]
     fn link_forms_between_facing_in_range_drones() {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base { id: "base".into(), position: base_pos });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(1.0, 0.0, 0.0);
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -882,7 +958,7 @@ mod tests {
     fn out_of_range_drones_do_not_link() {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
-        world.spawn(Base { id: "base".into(), position: Vec3::new(0.0, 0.0, -5.0), antennas: vec![] });
+        world.spawn(Base { id: "base".into(), position: Vec3::new(0.0, 0.0, -5.0) });
         let a = spawn_drone(&mut world, Vec3::ZERO, 0);
         // 100 km apart — far past the ~3.5 km link budget.
         let b = spawn_drone(&mut world, Vec3::new(100.0, 0.0, 0.0), 1);
@@ -898,7 +974,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base { id: "base".into(), position: base_pos });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(1.0, 0.0, 0.0);
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -920,7 +996,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base { id: "base".into(), position: base_pos });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(2.0, 0.0, 0.0); // 2 km apart
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -957,7 +1033,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -8.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base { id: "base".into(), position: base_pos });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(2.5, 0.0, 0.0);
         let c_pos = Vec3::new(5.0, 0.0, 0.0);
@@ -998,7 +1074,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base { id: "base".into(), position: base_pos });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(1.0, 0.0, 0.0);
         let a = spawn_drone(&mut world, a_pos, 0);
@@ -1031,7 +1107,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Mailbox::default());
         let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos, antennas: vec![] });
+        world.spawn(Base { id: "base".into(), position: base_pos });
         let a_pos = Vec3::ZERO;
         let b_pos = Vec3::new(1.0, 0.0, 0.0);
         let a = spawn_drone(&mut world, a_pos, 0);
