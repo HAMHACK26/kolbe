@@ -2,6 +2,7 @@ mod antenna;
 mod area;
 mod base;
 mod camera;
+mod controller;
 mod drone;
 mod factories;
 mod navigation;
@@ -97,7 +98,15 @@ fn main() {
         .add_systems(OnExit(AppState::Simulation), terrain::cleanup_trees)
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
-        .add_systems(Update, factories::movement::apply_velocity.run_if(in_state(AppState::Simulation)))
+        .add_systems(
+            Update,
+            (
+                controller::control_selected_drone,
+                factories::movement::apply_velocity,
+            )
+                .chain()
+                .run_if(in_state(AppState::Simulation)),
+        )
         .add_systems(
             Update,
             networking::advance_clocks.run_if(in_state(AppState::Simulation)),
