@@ -407,14 +407,18 @@ mod demo {
         let snapshot: Vec<(Vec3, f32)> =
             bodies.iter().map(|b| (b.state.position, b.radius_km)).collect();
 
-        for index in 0..bodies.len() {
-            let Some(waypoint) = bodies[index].waypoint else {
+        // Iterating mutably is safe alongside `snapshot` because that is an
+        // independent copy taken before the loop — every body reacts to where
+        // the others were at the top of the tick, not to partially-updated
+        // positions.
+        for (index, body) in bodies.iter_mut().enumerate() {
+            let Some(waypoint) = body.waypoint else {
                 continue;
             };
-            let position = bodies[index].state.position;
-            let flown = bodies[index].state.velocity;
+            let position = body.state.position;
+            let flown = body.state.velocity;
 
-            navigate(&mut bodies[index].state, waypoint, limits, dt);
+            navigate(&mut body.state, waypoint, limits, dt);
 
             let detections: Vec<Detection> = snapshot
                 .iter()
@@ -426,16 +430,16 @@ mod demo {
                 })
                 .collect();
 
-            bodies[index].state.velocity = avoidance_velocity(
+            body.state.velocity = avoidance_velocity(
                 flown,
-                bodies[index].state.velocity,
-                bodies[index].radius_km,
+                body.state.velocity,
+                body.radius_km,
                 &detections,
                 SENSOR_RANGE_KM,
                 limits,
                 dt,
             );
-            bodies[index].state.position = position + bodies[index].state.velocity * dt;
+            body.state.position = position + body.state.velocity * dt;
         }
     }
 
@@ -452,16 +456,15 @@ mod demo {
     /// Rows are sampled coarsely on the long approach and every tick once the
     /// ring is within reach, so the interesting part is at full resolution
     /// without thousands of lines of cruise.
-    fn run(title: &str, detail: &str, bodies: &mut Vec<Body>, limits: &FlightLimits) {
+    fn run(title: &str, detail: &str, bodies: &mut [Body], limits: &FlightLimits) {
         let dt = 0.02;
         let ring_m = SENSOR_RANGE_M;
 
         println!("\n=== {title} ===");
         println!("{detail}");
-        println!(
-            "{:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {}",
-            "t(s)", "gap(m)", "A(m/s)", "B(m/s)", "A z(m)", "ring"
-        );
+        // Column widths match the row format below: {:>7} then four {:>9},
+        // separated by two spaces.
+        println!("   t(s)     gap(m)     A(m/s)     B(m/s)     A z(m)  ring");
 
         let mut last_printed = f32::NEG_INFINITY;
         let mut min_gap = f32::MAX;

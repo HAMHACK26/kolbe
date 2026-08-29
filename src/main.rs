@@ -3,6 +3,7 @@ mod area;
 mod avoidance;
 mod base;
 mod camera;
+mod demo;
 mod drone;
 mod factories;
 mod navigation;
@@ -32,6 +33,18 @@ enum AppState {
 }
 
 fn main() {
+    // Opt-in only: `KOLBE_DEMO=1 cargo run` launches the collision-avoidance
+    // demo (see src/demo.rs) instead of the simulator. A plain `cargo run`
+    // always takes the normal path below.
+    //
+    // Checked for a truthy *value*, not mere presence — `std::env::var(..)
+    // .is_ok()` would also fire on an empty `KOLBE_DEMO=`, which is how a
+    // stray line in a .env or CI config silently hijacks the real app.
+    if demo::requested() {
+        demo::run();
+        return;
+    }
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
