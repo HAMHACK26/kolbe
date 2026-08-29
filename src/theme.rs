@@ -33,6 +33,8 @@ pub struct MoonCrescent;
 /// Container for the sun rays (shown in light mode only).
 #[derive(Component)]
 pub struct SunRays;
+#[derive(Component)]
+pub struct ThemeEmoji;
 
 #[derive(Resource, Default)]
 pub struct Theme {
@@ -330,10 +332,14 @@ pub fn apply_loading_theme(
 pub fn moon_toggle(
     interactions: Query<&Interaction, (Changed<Interaction>, With<MoonButton>)>,
     mut theme: ResMut<Theme>,
+    mut labels: Query<&mut Text, With<ThemeEmoji>>,
 ) {
     for interaction in &interactions {
         if *interaction == Interaction::Pressed {
             theme.dark = !theme.dark;
+            for mut label in &mut labels {
+                **label = if theme.dark { "🌙" } else { "☀️" }.into();
+            }
         }
     }
 }
@@ -343,95 +349,31 @@ pub fn setup_moon(mut commands: Commands, theme: Res<Theme>) {
     spawn_moon(&mut commands, &theme);
 }
 
-/// Spawn the round day/night toggle (top-right): a small disc that reads as a
-/// crescent moon in dark mode and a rayed sun in light mode.
+/// Spawn the day/night toggle using explicit moon/sun emoji states.
 pub fn spawn_moon(commands: &mut Commands, theme: &Theme) {
     let p = theme.palette();
-
-    // Compact geometry. The disc is the sun/moon body; a slightly offset disc of
-    // the background color carves the crescent; thin rays ring it for the sun.
-    const EDGE: f32 = 14.0; // margin from the top-right corner
-    const DISC: f32 = 18.0; // sun/moon body diameter
-    const CRESCENT: f32 = 15.0; // carving disc (dark mode)
-    const RAY_LEN: f32 = 4.0; // sun ray length
-    const RAY_W: f32 = 2.0; // sun ray thickness
-    const RAY_GAP: f32 = 2.5; // gap between disc edge and ray
-
-    // Rays live in a box centered on the disc; sized to fit disc + rays + gap.
-    let box_size = DISC + 2.0 * (RAY_GAP + RAY_LEN);
-    let disc_center_from_edge = EDGE + DISC / 2.0;
-    let box_offset = disc_center_from_edge - box_size / 2.0;
-
     commands
         .spawn((
             Button,
             Node {
                 position_type: PositionType::Absolute,
-                right: Val::Px(EDGE),
-                top: Val::Px(EDGE),
-                width: Val::Px(DISC),
-                height: Val::Px(DISC),
-                border_radius: BorderRadius::all(Val::Percent(50.0)),
-                overflow: Overflow::clip(),
+                right: Val::Px(14.0),
+                top: Val::Px(12.0),
+                width: Val::Px(32.0),
+                height: Val::Px(32.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BackgroundColor(p.moon),
             MoonButton,
         ))
-        .with_children(|b| {
-            // Offset disc carves the crescent (bg color in dark, hidden in light).
-            b.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    right: Val::Px(-4.0),
-                    top: Val::Px(-2.5),
-                    width: Val::Px(CRESCENT),
-                    height: Val::Px(CRESCENT),
-                    border_radius: BorderRadius::all(Val::Percent(50.0)),
-                    ..default()
-                },
-                BackgroundColor(if theme.dark { p.bg } else { p.moon }),
-                Pickable::IGNORE,
-                MoonCrescent,
-            ));
-        });
-
-    // Sun rays — short capsules around the disc, as a sibling so they aren't
-    // clipped by the disc's `overflow: clip`.
-    let center = box_size / 2.0;
-    let radius = DISC / 2.0 + RAY_GAP + RAY_LEN / 2.0;
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                right: Val::Px(box_offset),
-                top: Val::Px(box_offset),
-                width: Val::Px(box_size),
-                height: Val::Px(box_size),
-                ..default()
-            },
+        .with_child((
+            Text::new(if theme.dark { "🌙" } else { "☀️" }),
+            TextFont { font_size: FontSize::Px(18.0), ..default() },
+            TextColor(Color::WHITE),
+            ThemeEmoji,
             Pickable::IGNORE,
-            Visibility::Visible,
-            SunRays,
-        ))
-        .with_children(|r| {
-            for k in 0..8 {
-                let a = k as f32 * std::f32::consts::TAU / 8.0;
-                let cx = center + radius * a.cos();
-                let cy = center + radius * a.sin();
-                r.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: Val::Px(cx - RAY_W / 2.0),
-                        top: Val::Px(cy - RAY_LEN / 2.0),
-                        width: Val::Px(RAY_W),
-                        height: Val::Px(RAY_LEN),
-                        border_radius: BorderRadius::all(Val::Percent(50.0)),
-                        ..default()
-                    },
-                    BackgroundColor(p.moon),
-                    Pickable::IGNORE,
-                ));
-            }
-        });
+        ));
 }

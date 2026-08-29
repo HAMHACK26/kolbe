@@ -38,10 +38,8 @@
 
 use bevy::prelude::*;
 
-use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
-use crate::networking::{DroneUuid, LinkSet, MeshTable};
 use crate::world::DeploymentTarget;
 
 /// The flight envelope a drone is governed to. All limits are deliberately
@@ -262,58 +260,23 @@ pub fn navigate(state: &mut DroneState, target: Vec3, limits: &FlightLimits, dt:
     }
 }
 
-/// Fly drones to the target-area center, then let each use a deliberately
-/// simple local spacing rule: move away from nearby peers and the boundary,
-/// without letting a mesh neighbour grow beyond the 3 km antenna limit.
+/// Fly drones to the selected area's center, then to their fixed 3 km survey
+/// slots. This mission mode deliberately ignores all communication state;
+/// collision avoidance remains the layer that can deflect the course.
 pub fn go_to_network_area(
     time: Res<Time>,
-    network_area: Res<crate::area::NetworkArea>,
-    scenario: Res<crate::area::ScenarioArea>,
-    peer_uuids: Query<&DroneUuid, With<Drone>>,
-    bases: Query<(&Base, &DroneUuid)>,
-    mut drones: Query<
-        (
-            &Transform,
-            &mut DeploymentTarget,
-            &mut DroneKinematics,
-            &LinkSet,
-            &MeshTable,
-        ),
-        With<Drone>,
-    >,
+    mut drones: Query<(&Transform, &mut DeploymentTarget, &mut DroneKinematics), With<Drone>>,
 ) {
     let dt = time.delta_secs();
     let limits = FlightLimits::default().in_km();
 
-    let Some((base, base_uuid)) = bases.iter().next() else {
-        return;
-    };
-    let base_pos = base.position;
-
-    for (transform, mut target, mut kin, links, table) in &mut drones {
-        if !target.spreading && inside_target_area(transform.translation, &network_area, &scenario) {
+    for (transform, mut target, mut kin) in &mut drones {
+        if !target.spreading
+            && transform.translation.xz().distance(target.ingress.xz()) <= INGRESS_ARRIVE_KM
+        {
             target.spreading = true;
         }
-        let waypoint = if target.spreading {
-            dumb_spacing_waypoint(
-                transform.translation,
-                table,
-                base_pos,
-                &network_area,
-                &scenario,
-            )
-        } else {
-            target.ingress
-        };
-        let waypoint = preserve_critical_links(
-            transform.translation,
-            waypoint,
-            links,
-            table,
-            &peer_uuids,
-            base_pos,
-            &base_uuid.0,
-        );
+        let waypoint = if target.spreading { target.slot } else { target.ingress };
         let mut state = DroneState {
             position: transform.translation,
             velocity: kin.velocity,
@@ -325,125 +288,4 @@ pub fn go_to_network_area(
     }
 }
 
-const SPACING_LIMIT_KM: f32 = 3.0;
-const PROTECTED_LINK_MARGIN_KM: f32 = 0.25;
-const BOUNDARY_BUFFER_KM: f32 = 0.5;
-const SPACING_STEP_KM: f32 = 0.1;
-
-fn inside_target_area(
-    position: Vec3,
-    area: &crate::area::NetworkArea,
-    scenario: &crate::area::ScenarioArea,
-) -> bool {
-    let (lon, lat) = area.center;
-    let center_x = ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
-    let center_z = ((lat - scenario.latitude) * 110.574) as f32;
-    let (sin, cos) = area.rotation_deg.to_radians().sin_cos();
-    let (sin, cos) = (sin as f32, cos as f32);
-    let dx = position.x - center_x;
-    let dz = position.z - center_z;
-    let rx = dx * cos + dz * sin;
-    let rz = -dx * sin + dz * cos;
-    let half = area.side_km as f32 * 0.5;
-    rx.abs() <= half && rz.abs() <= half
-}
-
-fn dumb_spacing_waypoint(
-    self_pos: Vec3,
-    table: &MeshTable,
-    base_pos: Vec3,
-    area: &crate::area::NetworkArea,
-    scenario: &crate::area::ScenarioArea,
-) -> Vec3 {
-    let mut push = Vec3::ZERO;
-    for row in table.0.values() {
-        let offset = self_pos - (base_pos + row.location);
-        let distance = offset.length();
-        if distance > f32::EPSILON && distance < SPACING_LIMIT_KM {
-            push += offset / distance * ((SPACING_LIMIT_KM - distance) / SPACING_LIMIT_KM);
-        }
-    }
-
-    // The target-area square may be rotated.  Work in its axes, then rotate
-    // the boundary push back to world X/Z.
-    let (lon, lat) = area.center;
-    let center_x = ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
-    let center_z = ((lat - scenario.latitude) * 110.574) as f32;
-    let (sin, cos) = area.rotation_deg.to_radians().sin_cos();
-    let (sin, cos) = (sin as f32, cos as f32);
-    let dx = self_pos.x - center_x;
-    let dz = self_pos.z - center_z;
-    let rx = dx * cos + dz * sin;
-    let rz = -dx * sin + dz * cos;
-    let half = area.side_km as f32 * 0.5;
-    let mut local_push = Vec2::ZERO;
-    if half - rx.abs() < BOUNDARY_BUFFER_KM {
-        local_push.x = -rx.signum();
-    }
-    if half - rz.abs() < BOUNDARY_BUFFER_KM {
-        local_push.y = -rz.signum();
-    }
-    push += Vec3::new(
-        local_push.x * cos - local_push.y * sin,
-        0.0,
-        local_push.x * sin + local_push.y * cos,
-    );
-
-    if push.length_squared() > f32::EPSILON {
-        self_pos + push.normalize() * SPACING_STEP_KM
-    } else {
-        self_pos
-    }
-}
-
-/// Refuse a movement that would stretch a live, protected peer link beyond
-/// the antenna limit. A peer is protected when its newest lookup-table row
-/// says it has at most two direct connections. The row is refreshed by that
-/// peer's header every `networking::HEADER_INTERVAL_SECS` while the link is up.
-fn preserve_critical_links(
-    self_pos: Vec3,
-    waypoint: Vec3,
-    links: &LinkSet,
-    table: &MeshTable,
-    peer_uuids: &Query<&DroneUuid, With<Drone>>,
-    base_pos: Vec3,
-    base_uuid: &str,
-) -> Vec3 {
-    let planned_displacement = waypoint - self_pos;
-    let has_direct_base_link = links.connected.keys().any(|&peer| {
-        peer_uuids
-            .get(peer)
-            .is_err() // The only non-drone radio node is the base.
-    });
-    let base_link_is_protected = has_direct_base_link
-        && table
-            .0
-            .get(base_uuid)
-            .is_none_or(|row| row.connections.len() <= 3);
-    let from_base = self_pos - base_pos;
-    if base_link_is_protected
-        && from_base.length() >= SPACING_LIMIT_KM - PROTECTED_LINK_MARGIN_KM
-        && planned_displacement.dot(from_base) > 0.0
-    {
-        return self_pos;
-    }
-    for &peer_entity in links.connected.keys() {
-        let Ok(peer_uuid) = peer_uuids.get(peer_entity) else {
-            continue; // The base is not a drone-peer protection edge.
-        };
-        let Some(peer_row) = table.0.get(&peer_uuid.0) else {
-            continue;
-        };
-        if peer_row.connections.len() > 3 {
-            continue;
-        }
-
-        let from_peer = self_pos - (base_pos + peer_row.location);
-        if from_peer.length() >= SPACING_LIMIT_KM - PROTECTED_LINK_MARGIN_KM
-            && planned_displacement.dot(from_peer) > 0.0
-        {
-            return self_pos;
-        }
-    }
-    waypoint
-}
+const INGRESS_ARRIVE_KM: f32 = 0.05;

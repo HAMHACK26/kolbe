@@ -22,12 +22,16 @@ pub const DRONE_COUNT: usize = 5;
 pub const DRONE_RADIUS: f32 = 0.0225;
 /// Clearance from the terrain to the underside of each drone, in km (50 m).
 pub const DRONE_GROUND_CLEARANCE_KM: f32 = 0.05;
-const DEPLOYMENT_INTERVAL_SECS: f32 = 10.0;
+const DEPLOYMENT_INTERVAL_SECS: f32 = 5.0;
 
 /// The individual destination assigned to a drone during deployment.
 #[derive(Component)]
 pub struct DeploymentTarget {
     pub ingress: Vec3,
+    /// Stable, per-drone destination once ingress is complete. Keeping this
+    /// stateful prevents the reactive spacing rule from flipping direction on
+    /// consecutive mesh-table updates.
+    pub slot: Vec3,
     pub spreading: bool,
 }
 
@@ -43,15 +47,12 @@ pub(crate) struct DeploymentQueue {
     cone_mat: Handle<StandardMaterial>,
 }
 
-/// Hard cap on the distance between two ring neighbors, km.
-///
-/// The link budget in `make_antenna` closes at ~3.5 km on boresight
-/// (`Antenna::max_range_km`), so holding neighbors at 3 km keeps every mesh
-/// hop inside range with margin for terrain relief and drift.
-pub const MAX_NEIGHBOR_SPACING_KM: f32 = 3.0;
+/// Radius of the initial survey ring around the selected area's center.
+pub const FORMATION_RADIUS_KM: f32 = 3.0;
 
-/// Evenly distribute the swarm inside the selected target area.  The radius
-/// stays inside the area's inscribed circle and within the mesh link budget.
+/// Evenly distribute the swarm on a 3 km ring around the selected area's
+/// center. Communication range is intentionally not part of this deployment
+/// mode; each drone has a fixed survey slot.
 pub fn target_area_formation(
     area: &crate::area::NetworkArea,
     scenario: &crate::area::ScenarioArea,
@@ -60,9 +61,7 @@ pub fn target_area_formation(
     let (lon, lat) = area.center;
     let center_x = ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
     let center_z = ((lat - scenario.latitude) * 110.574) as f32;
-    let max_mesh_radius = MAX_NEIGHBOR_SPACING_KM
-        / (2.0 * (std::f32::consts::PI / DRONE_COUNT as f32).sin());
-    let radius = ((area.side_km as f32) * 0.25).min(max_mesh_radius).max(0.05);
+    let radius = FORMATION_RADIUS_KM;
     (0..DRONE_COUNT)
         .map(|i| {
             let angle = i as f32 / DRONE_COUNT as f32 * std::f32::consts::TAU;
@@ -282,7 +281,7 @@ pub fn setup(
         });
 }
 
-/// Launch the next node from the base every ten seconds until the initial
+/// Launch the next node from the base every five seconds until the initial
 /// deployment queue is exhausted.
 pub fn spawn_next_drone(
     time: Res<Time>,
@@ -330,7 +329,11 @@ fn spawn_deployment_drone(
             Transform::from_translation(base_pos),
             Drone { id: drone_id(index) },
             Antennas(antennas.clone()),
-            DeploymentTarget { ingress, spreading: false },
+            DeploymentTarget {
+                ingress,
+                slot: target_slots[index],
+                spreading: false,
+            },
             DroneKinematics::default(),
             DroneAi::default(),
             CommandQueue::default(),

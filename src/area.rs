@@ -115,8 +115,8 @@ pub enum PickMode {
 #[derive(Resource, Default, Clone, Copy)]
 pub struct BasePosition(pub Option<(f64, f64)>);
 
-/// The (possibly rotated) minimum-area square enclosing the picked points —
-/// the "network area". Recomputed live as points are added/removed; the
+/// The north/east-aligned square enclosing the picked points — the "network
+/// area". Recomputed live as points are added/removed; the
 /// version present when "Generate terrain" is pressed is what gets fetched
 /// and, later, marked on the 3D terrain.
 #[derive(Resource, Clone, Debug, Default)]
@@ -126,8 +126,7 @@ pub struct NetworkArea {
     pub center: (f64, f64),
     pub side_km: f64,
     pub rotation_deg: f64,
-    /// Axis-aligned size guaranteed to cover the (possibly rotated) square —
-    /// what actually gets requested from the height server.
+    /// Size of the north/east-aligned square requested from the height server.
     pub fetch_size_km: f32,
     /// Corners of that axis-aligned fetch square — "the area it's going to
     /// pull." The base must land inside this box.
@@ -149,7 +148,7 @@ pub struct NetworkArea {
 }
 
 impl NetworkArea {
-    /// Distance in km from a lat/lon point to the (possibly rotated)
+    /// Distance in km from a lat/lon point to the north/east-aligned
     /// network-area square — 0.0 if the point is inside it.
     pub fn distance_to_square_km(&self, lat: f64, lon: f64) -> f64 {
         if !self.valid {
@@ -188,7 +187,10 @@ fn recompute_network_area(points: &[(f64, f64)]) -> NetworkArea {
         .map(|&(lat, lon)| polygon::project(ref_lon, ref_lat, lon, lat))
         .collect();
 
-    let Some(square) = polygon::min_bounding_square(&locals) else {
+    // The operational rectangle is deliberately locked to east/north axes:
+    // it is the area the mission uses and the orange square the operator
+    // sees, so it must not rotate as points are added.
+    let Some(square) = polygon::axis_aligned_bounding_square(&locals) else {
         return NetworkArea { points: points.to_vec(), ..default() };
     };
 
@@ -2136,10 +2138,9 @@ mod tests {
     }
 
     #[test]
-    fn rotated_selection_cannot_download_more_than_the_limit() {
-        // A diamond whose minimum rotated square is approximately 20 km per
-        // side. Its axis-aligned terrain request is about 28 km, and must be
-        // rejected even though the rotated selection itself is within 20 km.
+    fn operational_rectangle_is_north_aligned_and_obeys_the_limit() {
+        // A diamond's operational rectangle stays north/east-aligned, so the
+        // selection is rejected based on that visible rectangle's own size.
         let net = recompute_network_area(&[
             (59.115, 18.000),
             (59.000, 18.222),
@@ -2147,8 +2148,9 @@ mod tests {
             (59.000, 17.778),
         ]);
         assert!(net.valid);
-        assert!(net.side_km <= MAX_SIDE_KM, "side={} fetch={}", net.side_km, net.fetch_size_km);
-        assert!(net.fetch_size_km as f64 > MAX_SIDE_KM, "side={} fetch={}", net.side_km, net.fetch_size_km);
+        assert_eq!(net.rotation_deg, 0.0);
+        assert!((net.fetch_size_km as f64 - net.side_km).abs() < 0.001);
+        assert!(net.side_km > MAX_SIDE_KM, "side={} fetch={}", net.side_km, net.fetch_size_km);
         assert!(net.over_limit);
     }
 

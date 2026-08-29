@@ -165,12 +165,14 @@ fn main() {
                 ui::make_camera_overlay,
                 ui::spawn_reset_button,
                 ui::spawn_speed_button,
+                ui::spawn_zoom_buttons,
             )
                 .chain(),
         )
         .add_systems(OnExit(AppState::Simulation), teardown_simulation)
         .add_systems(Update, ui::reset_button_interactions.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::speed_button_interactions.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, ui::zoom_button_interactions.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, camera::orbit_camera.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, radar::sync_radar_visibility.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, radar::sync_radar_transforms.run_if(in_state(AppState::Simulation)))
@@ -211,7 +213,6 @@ fn main() {
             Update,
             (
                 navigation::go_to_network_area,
-                networking::expire_stale_handshakes,
                 networking::request_nearby_connections,
                 networking::process_reconnect,
                 tracking::maintain_mesh_antennas,
@@ -219,9 +220,6 @@ fn main() {
                 seeking::seek_lost_links,
                 networking::detect_links_and_send_headers,
                 networking::route_packets,
-                networking::halt_on_link_loss,
-                recovery::detect_partitions,
-                recovery::run_recovery,
                 // Last word on velocity: the proximity ring deflects whatever
                 // the navigators above just committed to, before
                 // `apply_velocity` integrates it.

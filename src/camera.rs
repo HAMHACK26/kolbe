@@ -9,6 +9,7 @@ use bevy::{
 const MIN_RADIUS_KM: f32 = 0.001;
 /// Farthest the camera may orbit from its target.
 const MAX_RADIUS_KM: f32 = 60.0;
+const ZOOM_STEP: f32 = 0.12;
 
 #[derive(Resource)]
 pub struct OrbitCamera {
@@ -27,6 +28,12 @@ impl Default for OrbitCamera {
     fn default() -> Self {
         Self { yaw: PI / 4.0, pitch: PI / 4.0, radius: 25.0, drag_total: 0.0, target: Vec3::ZERO }
     }
+}
+
+/// Apply the same multiplicative zoom step used by mouse-wheel input.
+pub fn zoom_by(orbit: &mut OrbitCamera, steps: f32) {
+    let factor = (1.0 - steps * ZOOM_STEP).max(0.1);
+    orbit.radius = (orbit.radius * factor).clamp(MIN_RADIUS_KM, MAX_RADIUS_KM);
 }
 
 pub fn orbit_camera(
@@ -66,8 +73,7 @@ pub fn orbit_camera(
         // Multiplicative zoom: a fixed km-per-notch step would be useless at
         // either end of a 1 m .. 60 km range, so each notch instead covers a
         // fixed fraction of the *current* distance.
-        let factor = (1.0 - scroll.delta.y * 0.12).max(0.1);
-        orbit.radius = (orbit.radius * factor).clamp(MIN_RADIUS_KM, MAX_RADIUS_KM);
+        zoom_by(&mut orbit, scroll.delta.y);
     }
 
     let x = orbit.radius * orbit.pitch.cos() * orbit.yaw.sin();

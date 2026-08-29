@@ -92,6 +92,30 @@ impl BoundingSquare {
     }
 }
 
+/// Smallest north/east-aligned square enclosing all points. Unlike
+/// [`min_bounding_square`], this does not rotate to follow the polygon.
+pub fn axis_aligned_bounding_square(points: &[LocalPoint]) -> Option<BoundingSquare> {
+    let mut iter = points.iter().copied();
+    let first = iter.next()?;
+    let (mut min_x, mut max_x) = (first.x_km, first.x_km);
+    let (mut min_z, mut max_z) = (first.z_km, first.z_km);
+    for point in iter {
+        min_x = min_x.min(point.x_km);
+        max_x = max_x.max(point.x_km);
+        min_z = min_z.min(point.z_km);
+        max_z = max_z.max(point.z_km);
+    }
+    let side = (max_x - min_x).max(max_z - min_z);
+    Some(BoundingSquare {
+        center: LocalPoint {
+            x_km: (min_x + max_x) * 0.5,
+            z_km: (min_z + max_z) * 0.5,
+        },
+        half_side_km: side * 0.5,
+        rotation: 0.0,
+    })
+}
+
 /// Minimum-area enclosing square found by a numeric sweep over rotation
 /// angle: for each candidate angle, the required square side is
 /// `max(width, height)` of the point set's axis-aligned bbox in that
@@ -190,6 +214,13 @@ mod tests {
     fn single_point_has_a_zero_size_square() {
         let square = min_bounding_square(&[pt(1.0, 1.0)]).unwrap();
         assert!(square.side_km() < 1e-6);
+    }
+
+    #[test]
+    fn axis_aligned_square_never_rotates() {
+        let square = axis_aligned_bounding_square(&[pt(-2.0, -5.0), pt(5.0, 1.0)]).unwrap();
+        assert_eq!(square.rotation, 0.0);
+        assert!((square.side_km() - 7.0).abs() < 1e-9);
     }
 
     #[test]

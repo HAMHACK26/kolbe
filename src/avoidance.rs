@@ -290,6 +290,7 @@ pub fn avoid_collisions(
     mut drones: Query<(Entity, &Transform, &mut DroneKinematics), With<Drone>>,
     bases: Query<&Transform, With<Base>>,
     props: Query<(&Transform, &Obstacle), Without<Drone>>,
+    canopies: Option<Res<crate::terrain::RadioCanopies>>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
@@ -317,6 +318,21 @@ pub fn avoid_collisions(
                 radius_km: *radius_km,
             })
             .collect();
+        let mut detections = detections;
+        if let Some(canopies) = &canopies {
+            // Include the drone hull and canopy radius in the broad-phase
+            // lookup so trees are visible before their surfaces meet.
+            let search_radius = DRONE_RADIUS + SENSOR_RANGE_KM;
+            detections.extend(
+                canopies
+                    .nearby_canopies(self_pos, search_radius)
+                    .into_iter()
+                    .map(|canopy| Detection {
+                        offset: canopy.position - self_pos,
+                        radius_km: canopy.radius_km,
+                    }),
+            );
+        }
 
         kinematics.velocity = avoidance_velocity(
             kinematics.flown_velocity,

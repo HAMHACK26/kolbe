@@ -95,6 +95,26 @@ impl RadioCanopies {
         }
         false
     }
+
+    /// Canopies near a drone's short-range collision sensor. The forest is
+    /// rendered in merged chunks, so this index is the authoritative cheap
+    /// source of individual tree positions for avoidance.
+    pub fn nearby_canopies(&self, position: Vec3, range_km: f32) -> Vec<RadioCanopy> {
+        let (cx, cz) = Self::cell(position);
+        let cell_radius = (range_km / RADIO_CELL_KM).ceil() as i32 + 1;
+        let mut nearby = Vec::new();
+        for x in cx - cell_radius..=cx + cell_radius {
+            for z in cz - cell_radius..=cz + cell_radius {
+                let Some(canopies) = self.0.get(&(x, z)) else { continue };
+                nearby.extend(canopies.iter().copied().filter(|canopy| {
+                    Vec2::new(canopy.position.x - position.x, canopy.position.z - position.z)
+                        .length()
+                        <= range_km + canopy.radius_km
+                }));
+            }
+        }
+        nearby
+    }
 }
 
 /// Density multipliers the area-selection slider offers, relative to

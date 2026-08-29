@@ -104,7 +104,9 @@ use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
 use crate::spherical::SphericalVec;
-use crate::world::MAX_NEIGHBOR_SPACING_KM;
+/// Maximum candidate distance for the dormant reconnection protocol. The
+/// active deployment path does not use this communication limit.
+const MAX_NEIGHBOR_SPACING_KM: f32 = 3.0;
 use crate::tracking::TrackedPeers;
 use crate::terrain::{RadioCanopies, TerrainHeightMap, terrain_blocks_radio_path};
 
@@ -712,6 +714,9 @@ pub fn process_reconnect(
             request_id: request_id.clone(),
             target: target_uuid.clone(),
         };
+        // A reconnection attempt is an explicit, short-lived hold.  It is
+        // released by `expire_stale_handshakes` if no reply arrives.
+        pairing.frozen = true;
         pairing.state_since = clock.now;
         // Flood the Request out every live link.
         for &peer in links.connected.keys() {
@@ -829,15 +834,13 @@ pub fn process_reconnect(
     bus.0 = outgoing;
 }
 
-/// Stop any drone that is missing a direct link to one of its two ring
-/// neighbors.
+/// Hold a drone only while its reconnection handshake is actively waiting.
 ///
-/// A directional 1°-beam link is lost by *drifting off boresight*, so the
-/// worst thing a drone can do when a neighbor goes quiet is keep flying: it
-/// widens the geometry the seeking spiral has to search and drags its own
-/// remaining links toward their range limit. Holding station freezes the
-/// problem in place while `crate::seeking` sweeps the lost slot and
-/// `crate::tracking` holds the slots that are still up.
+/// A directional 1°-beam link can drift off boresight, so a drone pauses only
+/// for the bounded period in which a reconnection exchange is awaiting its
+/// next message.  A missing link by itself is not a hold condition: newly
+/// deployed drones have not acquired their ring links yet, and an unanswered
+/// handshake must resume mission flight after its timeout.
 ///
 /// This zeroes `DroneKinematics::velocity` only — `apply_velocity` still does
 /// the integration, and any navigator that runs afterwards (notably
@@ -847,38 +850,20 @@ pub fn process_reconnect(
 ///
 /// Runs after `detect_links_and_send_headers`, so `LinkSet` is this frame's.
 pub fn halt_on_link_loss(
-    mut drones: Query<(Entity, &RingIndex, &LinkSet, &MeshTable, &mut DroneKinematics)>,
-    ring_slots: Query<(Entity, &RingIndex), With<Drone>>,
-    bases: Query<(Entity, &DroneUuid), With<Base>>,
+    mut drones: Query<(&Pairing, &mut DroneKinematics), With<Drone>>,
 ) {
-    let Some((base_entity, base_uuid)) = bases.iter().next() else {
-        return;
-    };
-    let mut ring: Vec<(usize, Entity)> = ring_slots.iter().map(|(e, ri)| (ri.0, e)).collect();
-    ring.sort_by_key(|(i, _)| *i);
-    let n = ring.len();
-    for (self_entity, self_ring, links, table, mut kin) in &mut drones {
-        // A live direct base link is ideal, but a current lookup-table row
-        // for the base proves that a relay path still carries the base
-        // session. Either permits flight.
-        let has_base_session = links.connected.contains_key(&base_entity)
-            || table.0.contains_key(&base_uuid.0);
-        if !has_base_session {
-            kin.velocity = Vec3::ZERO;
-            continue;
-        }
-        // Below 3 drones "next" and "previous" are the same peer (or
-        // nonexistent), so only the base-link rule applies.
-        if n < 3 {
-            continue;
-        }
-        let next = ring[(self_ring.0 + 1) % n].1;
-        let prev = ring[(self_ring.0 + n - 1) % n].1;
-        let linked = |peer: Entity| peer == self_entity || links.connected.contains_key(&peer);
-        if !linked(next) || !linked(prev) {
+    for (pairing, mut kin) in &mut drones {
+        if reconnect_waiting(&pairing.state) {
             kin.velocity = Vec3::ZERO;
         }
     }
+}
+
+fn reconnect_waiting(state: &PairingState) -> bool {
+    matches!(
+        state,
+        PairingState::AwaitingAccept { .. } | PairingState::AcceptedAwaitingPosition { .. }
+    )
 }
 
 /// Ask a nearby drone for a connection.
@@ -1023,4 +1008,26 @@ fn format_uuid_v4(hi: u64, lo: u64) -> String {
         b(lo, 56), b(lo, 48),
         b(lo, 40), b(lo, 32), b(lo, 24), b(lo, 16), b(lo, 8), b(lo, 0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_unfinished_reconnects_hold_flight() {
+        assert!(!reconnect_waiting(&PairingState::Idle));
+        assert!(reconnect_waiting(&PairingState::AwaitingAccept {
+            request_id: "request".into(),
+            target: "target".into(),
+        }));
+        assert!(reconnect_waiting(&PairingState::AcceptedAwaitingPosition {
+            request_id: "request".into(),
+            requester: "requester".into(),
+        }));
+        assert!(!reconnect_waiting(&PairingState::Paired {
+            request_id: "request".into(),
+            peer: "peer".into(),
+        }));
+    }
 }

@@ -363,8 +363,8 @@ pub fn spawn_water(
     ));
 }
 
-/// Marks the picked polygon, its (possibly rotated) minimum bounding square
-/// — the network area — and the larger axis-aligned box actually fetched.
+/// Marks the picked polygon, its north/east-aligned operational square — the
+/// network area — and the terrain box actually fetched.
 /// Lines are subdivided and dropped onto the height field so they follow
 /// the terrain instead of floating as flat chords over sloped ground.
 pub fn draw_network_area(
@@ -388,8 +388,11 @@ pub fn draw_network_area(
     let square_color = Color::srgb(1.0, 0.85, 0.2);
     let polygon_color = Color::srgb(0.3, 0.9, 1.0);
 
-    draw_ring(&mut gizmos, &terrain, net.fetch_corners.map(|(lat, lon)| to_local(lat, lon)), fetch_color);
-    draw_ring(&mut gizmos, &terrain, net.corners.map(|(lat, lon)| to_local(lat, lon)), square_color);
+    // `NetworkArea` stores generated corners as `(lon, lat)`; user clicks in
+    // `net.points` remain `(lat, lon)`.  Keep those conventions explicit so
+    // the overlay is drawn at the same world position navigation targets.
+    draw_ring(&mut gizmos, &terrain, net.fetch_corners.map(|(lon, lat)| to_local(lat, lon)), fetch_color);
+    draw_ring(&mut gizmos, &terrain, net.corners.map(|(lon, lat)| to_local(lat, lon)), square_color);
     let points: Vec<(f32, f32)> = net.points.iter().map(|&(lat, lon)| to_local(lat, lon)).collect();
     draw_ring(&mut gizmos, &terrain, points, polygon_color);
 }

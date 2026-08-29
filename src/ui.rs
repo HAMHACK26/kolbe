@@ -6,6 +6,7 @@ use crate::{
     drone::{Drone, SelectedDrone},
     networking::MeshTable,
     theme::Theme,
+    camera::{self, OrbitCamera},
 };
 
 #[derive(Component)]
@@ -35,6 +36,14 @@ pub struct SpeedButton;
 #[derive(Component)]
 pub struct SpeedButtonLabel;
 
+/// Zoom the simulation camera in one wheel-equivalent step.
+#[derive(Component)]
+pub struct ZoomInButton;
+
+/// Zoom the simulation camera out one wheel-equivalent step.
+#[derive(Component)]
+pub struct ZoomOutButton;
+
 pub fn spawn_reset_button(mut commands: Commands) {
     commands
         .spawn((
@@ -52,7 +61,7 @@ pub fn spawn_reset_button(mut commands: Commands) {
             crate::SimulationEntity,
         ))
         .with_child((
-            Text::new("Back to area selection"),
+            Text::new("Back to map"),
             TextFont { font_size: FontSize::Px(14.0), ..default() },
             TextColor(Color::WHITE),
         ));
@@ -64,7 +73,9 @@ pub fn spawn_speed_button(mut commands: Commands) {
             Button,
             Node {
                 position_type: PositionType::Absolute,
-                right: Val::Px(16.0),
+                // Sits directly beside the map-return control, leaving the
+                // theme switch alone in the top-right corner.
+                left: Val::Px(150.0),
                 top: Val::Px(16.0),
                 padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
@@ -80,6 +91,45 @@ pub fn spawn_speed_button(mut commands: Commands) {
             TextColor(Color::WHITE),
             SpeedButtonLabel,
         ));
+}
+
+/// Adds explicit zoom controls for the 3D simulation alongside the existing
+/// map-return and speed controls. Mouse-wheel zoom remains available too.
+pub fn spawn_zoom_buttons(mut commands: Commands) {
+    let button = |commands: &mut Commands, left: f32, label: &str, marker: ZoomControl| {
+        let mut entity = commands.spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(left),
+                top: Val::Px(16.0),
+                width: Val::Px(34.0),
+                height: Val::Px(34.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            crate::SimulationEntity,
+        ));
+        match marker {
+            ZoomControl::In => entity.insert(ZoomInButton),
+            ZoomControl::Out => entity.insert(ZoomOutButton),
+        };
+        entity.with_child((
+            Text::new(label),
+            TextFont { font_size: FontSize::Px(20.0), ..default() },
+            TextColor(Color::WHITE),
+        ));
+    };
+    button(&mut commands, 255.0, "−", ZoomControl::Out);
+    button(&mut commands, 297.0, "+", ZoomControl::In);
+}
+
+enum ZoomControl {
+    In,
+    Out,
 }
 
 pub fn reset_button_interactions(
@@ -111,6 +161,19 @@ pub fn speed_button_interactions(
     virtual_time.set_relative_speed(next_speed);
     for mut label in &mut labels {
         **label = format!("Speed ×{next_speed:.0}");
+    }
+}
+
+pub fn zoom_button_interactions(
+    zoom_in: Query<&Interaction, (Changed<Interaction>, With<ZoomInButton>)>,
+    zoom_out: Query<&Interaction, (Changed<Interaction>, With<ZoomOutButton>)>,
+    mut orbit: ResMut<OrbitCamera>,
+) {
+    if zoom_in.iter().any(|interaction| *interaction == Interaction::Pressed) {
+        camera::zoom_by(&mut orbit, 1.0);
+    }
+    if zoom_out.iter().any(|interaction| *interaction == Interaction::Pressed) {
+        camera::zoom_by(&mut orbit, -1.0);
     }
 }
 
