@@ -330,6 +330,286 @@ pub fn avoid_collisions(
     }
 }
 
+/// Runnable scenarios that print a flight trace, for watching the ring work.
+///
+/// The simulation's visuals can't show this: the orbit camera bottoms out at
+/// a 5 km radius and drones are drawn as 180 m spheres, so a 3 m standoff is
+/// a fraction of a pixel. The numbers are the only honest instrument at this
+/// scale, so these print them.
+///
+/// They are `#[ignore]`d because their value is the output, not an assertion
+/// (the real coverage is in `tests` below). Run them explicitly:
+///
+/// ```text
+/// cargo test avoidance::demo -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod demo {
+    use super::*;
+    use crate::navigation::{navigate, DroneState};
+
+    /// One thing in a scenario: a drone flying toward `waypoint`, or — with
+    /// `waypoint: None` — a fixed obstacle that just sits there.
+    struct Body {
+        state: DroneState,
+        waypoint: Option<Vec3>,
+        radius_km: f32,
+    }
+
+    impl Body {
+        fn drone(x_km: f32, z_km: f32, waypoint: Vec3) -> Self {
+            Self {
+                state: DroneState {
+                    position: Vec3::new(x_km, 0.0, z_km),
+                    ..Default::default()
+                },
+                waypoint: Some(waypoint),
+                radius_km: DRONE_RADIUS,
+            }
+        }
+
+        fn obstacle(x_km: f32, z_km: f32) -> Self {
+            Self {
+                state: DroneState {
+                    position: Vec3::new(x_km, 0.0, z_km),
+                    ..Default::default()
+                },
+                waypoint: None,
+                radius_km: DRONE_RADIUS,
+            }
+        }
+
+        fn speed_mps(&self) -> f32 {
+            self.state.velocity.length() * 1000.0
+        }
+    }
+
+    /// Two drones facing each other with `runway_km` of *clear air* between
+    /// their hulls, each aimed at a waypoint far beyond the other.
+    ///
+    /// The runway is hull-to-hull, not center-to-center — bodies are 180 m in
+    /// radius here, so placing them by center coordinate is an easy way to
+    /// start a scenario already overlapping. It also has to be long enough for
+    /// `navigate` to wind up to the speed cap under test, or the trace only
+    /// ever shows a crawl.
+    fn head_on_pair(runway_km: f32) -> Vec<Body> {
+        let x = DRONE_RADIUS + runway_km / 2.0;
+        vec![
+            Body::drone(-x, 0.0, Vec3::new(1000.0, 0.0, 0.0)),
+            Body::drone(x, 0.0, Vec3::new(-1000.0, 0.0, 0.0)),
+        ]
+    }
+
+    /// Advance every mobile body one tick through the real pipeline: navigate,
+    /// then let the ring veto, then integrate the vetoed velocity — the same
+    /// order `run_recovery` → `avoid_collisions` → `apply_velocity` runs in.
+    fn step(bodies: &mut [Body], limits: &FlightLimits, dt: f32) {
+        let snapshot: Vec<(Vec3, f32)> =
+            bodies.iter().map(|b| (b.state.position, b.radius_km)).collect();
+
+        for index in 0..bodies.len() {
+            let Some(waypoint) = bodies[index].waypoint else {
+                continue;
+            };
+            let position = bodies[index].state.position;
+            let flown = bodies[index].state.velocity;
+
+            navigate(&mut bodies[index].state, waypoint, limits, dt);
+
+            let detections: Vec<Detection> = snapshot
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, (pos, radius_km))| Detection {
+                    offset: *pos - position,
+                    radius_km: *radius_km,
+                })
+                .collect();
+
+            bodies[index].state.velocity = avoidance_velocity(
+                flown,
+                bodies[index].state.velocity,
+                bodies[index].radius_km,
+                &detections,
+                SENSOR_RANGE_KM,
+                limits,
+                dt,
+            );
+            bodies[index].state.position = position + bodies[index].state.velocity * dt;
+        }
+    }
+
+    /// Surface-to-surface gap between the first two bodies, meters.
+    fn gap_m(bodies: &[Body]) -> f32 {
+        ((bodies[1].state.position - bodies[0].state.position).length()
+            - bodies[0].radius_km
+            - bodies[1].radius_km)
+            * 1000.0
+    }
+
+    /// Run a scenario to a standstill (or to contact) and print the trace.
+    ///
+    /// Rows are sampled coarsely on the long approach and every tick once the
+    /// ring is within reach, so the interesting part is at full resolution
+    /// without thousands of lines of cruise.
+    fn run(title: &str, detail: &str, bodies: &mut Vec<Body>, limits: &FlightLimits) {
+        let dt = 0.02;
+        let ring_m = SENSOR_RANGE_M;
+
+        println!("\n=== {title} ===");
+        println!("{detail}");
+        println!(
+            "{:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {}",
+            "t(s)", "gap(m)", "A(m/s)", "B(m/s)", "A z(m)", "ring"
+        );
+
+        let mut last_printed = f32::NEG_INFINITY;
+        let mut min_gap = f32::MAX;
+        let mut contact = false;
+        let mut was_engaged = false;
+        let mut rows = 0usize;
+
+        for tick in 0..8000 {
+            let t = tick as f32 * dt;
+            let gap = gap_m(bodies);
+            min_gap = min_gap.min(gap);
+            was_engaged |= gap <= ring_m;
+
+            // Fine resolution only while the ring is actually acting, a
+            // sample every half second on the run-in. Keying this on "engaged"
+            // rather than on proximity matters: a slow lateral pass spends
+            // many seconds just *near* the obstacle, and printing all of it
+            // buries the part where something happens. Past a row budget,
+            // back off to coarse everywhere — a long engagement is usually
+            // chatter, and its shape is clear from the first few seconds.
+            let fine = gap <= ring_m && rows < 60;
+            let sample_every = if fine { 0.1 } else { 0.5 };
+            if t - last_printed >= sample_every {
+                last_printed = t;
+                rows += 1;
+                println!(
+                    "{:>7.2}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {}",
+                    t,
+                    gap,
+                    bodies[0].speed_mps(),
+                    bodies[1].speed_mps(),
+                    bodies[0].state.position.z * 1000.0,
+                    if gap <= ring_m { "ENGAGED" } else { "-" }
+                );
+            }
+
+            if gap <= 0.0 {
+                contact = true;
+                println!("  >> CONTACT at t={t:.2}s");
+                break;
+            }
+
+            // Settled into a standoff: everything mobile has effectively
+            // stopped with the ring still holding it off.
+            let moving = bodies.iter().any(|b| b.waypoint.is_some() && b.speed_mps() > 0.01);
+            if !moving && gap <= ring_m {
+                println!("  >> settled at t={t:.2}s");
+                break;
+            }
+            // Or flew past and left it behind — a deflection, not a standoff.
+            // Without this a glancing pass would cruise on to the horizon.
+            if was_engaged && gap > ring_m * 2.0 {
+                println!("  >> cleared at t={t:.2}s, opening up");
+                break;
+            }
+
+            step(bodies, limits, dt);
+        }
+
+        println!(
+            "  result: min gap {:.3} m, final gap {:.3} m — {}",
+            min_gap,
+            gap_m(bodies),
+            if contact { "CONTACT" } else { "no contact" }
+        );
+    }
+
+    /// Closing at exactly what one airframe can brake from — the rated case.
+    #[test]
+    #[ignore]
+    fn head_on_at_rated_speed() {
+        let accel = FlightLimits::default().max_accel_mps2;
+        let stoppable = safe_closing_speed_mps(SENSOR_RANGE_M, accel);
+        let mut limits = FlightLimits::default().in_km();
+        limits.set_max_speed(stoppable / 2.0 / 1000.0);
+
+        // 10 m of runway: reaching 2.45 m/s at 4 m/s² takes under a meter.
+        let mut bodies = head_on_pair(0.01);
+        run(
+            "Head-on at the rated closing speed",
+            &format!(
+                "Two drones flying through each other at {stoppable:.2} m/s closing \
+                 (sqrt(2*a*range), what a single airframe can brake from).",
+            ),
+            &mut bodies,
+            &limits,
+        );
+    }
+
+    /// Past the single-airframe limit: both drones brake, so the pair still
+    /// holds — this is the sqrt(4*a*range) regime.
+    #[test]
+    #[ignore]
+    fn head_on_past_the_single_airframe_limit() {
+        let mut limits = FlightLimits::default().in_km();
+        limits.set_max_speed(6.8 / 2.0 / 1000.0);
+
+        // 20 m of runway: reaching 3.4 m/s at 4 m/s² takes ~1.4 m.
+        let mut bodies = head_on_pair(0.02);
+        run(
+            "Head-on at 6.8 m/s closing — past one airframe's limit",
+            "Both drones brake, so the closing rate sheds at twice one \
+             airframe's authority. Rated single-braker limit is 4.90 m/s.",
+            &mut bodies,
+            &limits,
+        );
+    }
+
+    /// The documented failure: 3 m of warning cannot arrest a 30 m/s closing
+    /// rate, and the drones touch.
+    #[test]
+    #[ignore]
+    fn head_on_at_cruise_speed() {
+        let limits = FlightLimits::default().in_km();
+        let mut bodies = head_on_pair(0.4);
+        run(
+            "Head-on at full cruise — the ring loses",
+            "30 m/s closing needs ~28 m of braking distance. The ring gives 3 m. \
+             This is expected to make contact.",
+            &mut bodies,
+            &limits,
+        );
+    }
+
+    /// The other half of the behavior: an obstacle off to one side produces a
+    /// sideways step, not a stop. Watch the `A z(m)` column.
+    #[test]
+    #[ignore]
+    fn glancing_pass_deflects_sideways() {
+        let mut limits = FlightLimits::default().in_km();
+        limits.set_max_speed(4.0 / 1000.0);
+
+        // A dead drone parked 2 m inside our flight path — without a deflection
+        // we clip it.
+        let mut bodies = vec![
+            Body::drone(-0.08, 0.0, Vec3::new(1000.0, 0.0, 0.0)),
+            Body::obstacle(0.0, DRONE_RADIUS * 2.0 - 0.002),
+        ];
+        run(
+            "Glancing pass around a parked drone",
+            "Flying +X at 4 m/s past a static obstacle sitting 2 m inside our \
+             path. The ring should step us sideways (A z) rather than stop us.",
+            &mut bodies,
+            &limits,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
