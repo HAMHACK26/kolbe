@@ -6,7 +6,6 @@ use crate::{
     camera::OrbitCamera,
     drone::{Drone, DroneType, SelectedDrone, drone_id, make_antenna},
     factories::{DroneAi, movement::DroneKinematics},
-    navigation::Orbit,
     networking::NetworkingBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     recovery::{ContactMemory, RecoveryState},
@@ -19,7 +18,27 @@ use crate::{
 };
 
 pub const DRONE_COUNT: usize = 5;
-pub const DRONE_RADIUS: f32 = 0.01125;
+pub const DRONE_RADIUS: f32 = 0.0225;
+const DEPLOYMENT_INTERVAL_SECS: f32 = 10.0;
+
+/// The individual destination assigned to a drone during deployment.
+#[derive(Component)]
+pub struct DeploymentTarget {
+    pub ingress: Vec3,
+    pub spreading: bool,
+}
+
+#[derive(Resource)]
+pub(crate) struct DeploymentQueue {
+    target_slots: Vec<Vec3>,
+    next_index: usize,
+    timer: Timer,
+    base_pos: Vec3,
+    ingress: Vec3,
+    drone_mesh: Handle<Mesh>,
+    drone_mat: Handle<StandardMaterial>,
+    cone_mat: Handle<StandardMaterial>,
+}
 
 /// Hard cap on the distance between two ring neighbors, km.
 ///
@@ -28,80 +47,40 @@ pub const DRONE_RADIUS: f32 = 0.01125;
 /// hop inside range with margin for terrain relief and drift.
 pub const MAX_NEIGHBOR_SPACING_KM: f32 = 3.0;
 
-/// Keep the formation ring this far inside the terrain edge, km, so no drone
-/// spawns off the fetched height map.
-const RING_TERRAIN_MARGIN_KM: f32 = 0.5;
-
-/// The startup formation: `DRONE_COUNT` drones on a ring around the base,
-/// spread as wide as the radio allows.
-///
-/// The ring sits at the largest radius whose neighbor spacing still respects
-/// [`MAX_NEIGHBOR_SPACING_KM`]. A ring of N at radius R has a neighbor chord
-/// of 2·R·sin(π/N), so the cap inverts to R = spacing / (2·sin(π/N)); that is
-/// then clamped so the ring fits inside the fetched terrain, whose side length
-/// is whatever area was picked on the map and can be far smaller than the ring
-/// the link budget alone would allow.
-///
-/// It is centered on the base because the base is a radio node in the same
-/// mesh: putting the ring around it holds every drone one radius from the
-/// ground station, inside the same link budget that governs the drone-to-drone
-/// hops. A base close to the terrain edge would push the ring off the map, so
-/// the *center* slides inward to whatever keeps the full-width ring inside the
-/// fetched area — the base then sits off-center in its own ring rather than
-/// the formation collapsing.
-///
-/// `height_at` is the terrain sampler (`TerrainHeightMap::height_at`), taken as
-/// a closure so the geometry can be exercised against synthetic terrain.
-pub fn ring_formation(
-    terrain_size_km: f32,
-    base_pos: Vec3,
-    height_at: impl Fn(f32, f32) -> f32,
+/// Evenly distribute the swarm inside the selected target area.  The radius
+/// stays inside the area's inscribed circle and within the mesh link budget.
+pub fn target_area_formation(
+    area: &crate::area::NetworkArea,
+    scenario: &crate::area::ScenarioArea,
+    terrain: &crate::terrain::TerrainHeightMap,
 ) -> Vec<Vec3> {
-    let n = DRONE_COUNT as f32;
-    let chord_per_radius = 2.0 * (std::f32::consts::PI / n).sin();
-    let terrain_limit = (terrain_size_km * 0.5 - RING_TERRAIN_MARGIN_KM).max(0.1);
-    let mut radius = (MAX_NEIGHBOR_SPACING_KM / chord_per_radius).min(terrain_limit);
+    let (lon, lat) = area.center;
+    let center_x = ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
+    let center_z = ((lat - scenario.latitude) * 110.574) as f32;
+    let max_mesh_radius = MAX_NEIGHBOR_SPACING_KM
+        / (2.0 * (std::f32::consts::PI / DRONE_COUNT as f32).sin());
+    let radius = ((area.side_km as f32) * 0.25).min(max_mesh_radius).max(0.05);
+    (0..DRONE_COUNT)
+        .map(|i| {
+            let angle = i as f32 / DRONE_COUNT as f32 * std::f32::consts::TAU;
+            let x = center_x + radius * angle.sin();
+            let z = center_z + radius * angle.cos();
+            Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z)
+        })
+        .collect()
+}
 
-    let center_limit = (terrain_limit - radius).max(0.0);
-    let center = Vec2::new(
-        base_pos.x.clamp(-center_limit, center_limit),
-        base_pos.z.clamp(-center_limit, center_limit),
-    );
-
-    let point_at = |radius: f32, angle: f32| {
-        let (x, z) = (center.x + radius * angle.sin(), center.y + radius * angle.cos());
-        Vec3::new(x, height_at(x, z) + DRONE_RADIUS, z)
-    };
-    let slot_angle = |i: usize| i as f32 / n * std::f32::consts::TAU;
-
-    // The chord above is a *flat* distance, but the drones sit on the terrain,
-    // so relief stretches the real 3-D neighbor distance past the cap. Shrink
-    // until the true spacing is inside it — iteratively, because moving the
-    // ring inward also changes which terrain it lands on.
-    //
-    // Checked at *every* rotation of the formation, not just the spawn
-    // angles: the drones orbit the base (`navigation::orbit_base`), so a pair
-    // of hills anywhere on the circle would otherwise break the link the
-    // moment the ring turned onto them.
-    const SAMPLES_PER_SLOT: usize = 12;
-    let worst_over_the_orbit = |radius: f32| {
-        let samples = DRONE_COUNT * SAMPLES_PER_SLOT;
-        (0..samples)
-            .map(|k| {
-                let angle = k as f32 / samples as f32 * std::f32::consts::TAU;
-                point_at(radius, angle).distance(point_at(radius, angle + slot_angle(1)))
-            })
-            .fold(0.0f32, f32::max)
-    };
-    for _ in 0..32 {
-        let worst = worst_over_the_orbit(radius);
-        if worst <= MAX_NEIGHBOR_SPACING_KM {
-            break;
-        }
-        radius *= (MAX_NEIGHBOR_SPACING_KM / worst) * 0.999;
-    }
-
-    (0..DRONE_COUNT).map(|i| point_at(radius, slot_angle(i))).collect()
+/// Center of the selected target area in the simulation's local kilometer
+/// coordinate frame.
+pub fn target_area_center(
+    area: &crate::area::NetworkArea,
+    scenario: &crate::area::ScenarioArea,
+    terrain: &crate::terrain::TerrainHeightMap,
+) -> Vec3 {
+    let (lon, lat) = area.center;
+    let x = ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
+    let z = ((lat - scenario.latitude) * 110.574) as f32;
+    Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z)
 }
 
 /// The three antennas drone `i` spawns with, already aimed at its mesh
@@ -136,6 +115,8 @@ pub fn setup(
     terrain: Res<crate::terrain::TerrainHeightMap>,
     theme: Res<Theme>,
     bases: Query<&Base>,
+    network_area: Res<crate::area::NetworkArea>,
+    scenario: Res<crate::area::ScenarioArea>,
 ) {
     let pal = theme.palette();
     // `AmbientLight` is a per-camera override of `GlobalAmbientLight` and so
@@ -174,64 +155,32 @@ pub fn setup(
     });
 
     // The base spawns before this system (see `main`), so this is the real
-    // base position — both the ring's center and what every drone's antenna #2
-    // points at from frame one.
+    // launch position. Every drone starts here, then receives a distinct
+    // destination inside the target area.
     let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
-    let ring = ring_formation(terrain.size_km(), base_pos, |x, z| terrain.height_at(x, z));
-
-    for i in 0..DRONE_COUNT {
-        let drone_pos = ring[i];
-        let drone_type = if i % 3 == 0 { DroneType::Attack } else { DroneType::Node };
-        let antennas = formation_antennas(&ring, i, base_pos);
-
-        let drone_entity = commands
-            .spawn((
-                Mesh3d(drone_mesh.clone()),
-                MeshMaterial3d(drone_mat.clone()),
-                Transform::from_translation(drone_pos),
-                Drone { id: drone_id(i), drone_type },
-                Antennas(antennas.clone()),
-                DroneKinematics::default(),
-                // Every drone orbits the base on the same circle it spawned
-                // on, so the formation's angular spacing — and its links —
-                // stay put all the way around.
-                Orbit { radius_km: (drone_pos.xz() - base_pos.xz()).length() },
-                DroneAi::default(),
-                CommandQueue::default(),
-                NetworkingBundle::random(i),
-                SeekState::default(),
-                RecoveryState::default(),
-                ContactMemory::default(),
-                ThemeRole::Drone,
-                crate::SimulationEntity,
-            ))
-            .observe(
-                |mut t: On<Pointer<Click>>,
-                 orbit: Res<OrbitCamera>,
-                 mut sel: ResMut<SelectedDrone>| {
-                    t.propagate(false);
-                    if orbit.drag_total < 5.0 {
-                        sel.0 = Some(t.original_event_target());
-                    }
-                },
-            )
-            .id();
-
-        for (antenna_index, antenna) in antennas.iter().enumerate() {
-            commands.spawn((
-                Mesh3d(cone_mesh_for(antenna, &mut meshes)),
-                MeshMaterial3d(cone_mat.clone()),
-                // heading 0.0 matches the DroneKinematics::default() this
-                // drone spawns with; `radar::sync_radar_transforms` re-derives
-                // this every frame as the drone moves and re-aims.
-                cone_transform_for(antenna, 0.0, drone_pos),
-                Visibility::Hidden,
-                RadarCone { drone_entity, antenna_index },
-                ThemeRole::DroneCone,
-                crate::SimulationEntity,
-            ));
-        }
-    }
+    let target_slots = target_area_formation(&network_area, &scenario, &terrain);
+    let ingress = target_area_center(&network_area, &scenario, &terrain);
+    spawn_deployment_drone(
+        &mut commands,
+        &mut meshes,
+        &drone_mesh,
+        &drone_mat,
+        &cone_mat,
+        base_pos,
+        ingress,
+        &target_slots,
+        0,
+    );
+    commands.insert_resource(DeploymentQueue {
+        target_slots,
+        next_index: 1,
+        timer: Timer::from_seconds(DEPLOYMENT_INTERVAL_SECS, TimerMode::Repeating),
+        base_pos,
+        ingress,
+        drone_mesh,
+        drone_mat,
+        cone_mat,
+    });
 
     // Info popup
     commands
@@ -330,6 +279,90 @@ pub fn setup(
                 NetworkTablePanelText,
             ));
         });
+}
+
+/// Launch the next drone from the base after the configured deployment delay.
+pub fn spawn_next_drone(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut deployment: ResMut<DeploymentQueue>,
+) {
+    if deployment.next_index >= deployment.target_slots.len()
+        || !deployment.timer.tick(time.delta()).just_finished()
+    {
+        return;
+    }
+
+    let index = deployment.next_index;
+    deployment.next_index += 1;
+    spawn_deployment_drone(
+        &mut commands,
+        &mut meshes,
+        &deployment.drone_mesh.clone(),
+        &deployment.drone_mat.clone(),
+        &deployment.cone_mat.clone(),
+        deployment.base_pos,
+        deployment.ingress,
+        &deployment.target_slots,
+        index,
+    );
+}
+
+fn spawn_deployment_drone(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    drone_mesh: &Handle<Mesh>,
+    drone_mat: &Handle<StandardMaterial>,
+    cone_mat: &Handle<StandardMaterial>,
+    base_pos: Vec3,
+    ingress: Vec3,
+    target_slots: &[Vec3],
+    index: usize,
+) {
+    let drone_type = if index % 3 == 0 { DroneType::Attack } else { DroneType::Node };
+    let antennas = formation_antennas(target_slots, index, base_pos);
+    let drone_entity = commands
+        .spawn((
+            Mesh3d(drone_mesh.clone()),
+            MeshMaterial3d(drone_mat.clone()),
+            Transform::from_translation(base_pos),
+            Drone { id: drone_id(index), drone_type },
+            Antennas(antennas.clone()),
+            DeploymentTarget { ingress, spreading: false },
+            DroneKinematics::default(),
+            DroneAi::default(),
+            CommandQueue::default(),
+            NetworkingBundle::random(index),
+            SeekState::default(),
+            RecoveryState::default(),
+            ContactMemory::default(),
+            ThemeRole::Drone,
+            crate::SimulationEntity,
+        ))
+        .observe(
+            |mut t: On<Pointer<Click>>,
+             orbit: Res<OrbitCamera>,
+             mut sel: ResMut<SelectedDrone>| {
+                t.propagate(false);
+                if orbit.drag_total < 5.0 {
+                    sel.0 = Some(t.original_event_target());
+                }
+            },
+        )
+        .id();
+
+    for (antenna_index, antenna) in antennas.iter().enumerate() {
+        commands.spawn((
+            Mesh3d(cone_mesh_for(antenna, meshes)),
+            MeshMaterial3d(cone_mat.clone()),
+            cone_transform_for(antenna, 0.0, base_pos),
+            Visibility::Hidden,
+            RadarCone { drone_entity, antenna_index },
+            ThemeRole::DroneCone,
+            crate::SimulationEntity,
+        ));
+    }
 }
 
 pub fn draw_grid(

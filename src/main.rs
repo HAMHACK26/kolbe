@@ -166,6 +166,7 @@ fn main() {
         .add_systems(Update, radar::draw_mesh_links.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, world::spawn_next_drone.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, terrain::draw_network_area.run_if(in_state(AppState::Simulation)))
         // Contours and trees are alternatives: a forest covers the ground the
         // contours describe, so only one of the two is drawn.
@@ -201,7 +202,7 @@ fn main() {
                 // everything below — the link-loss halt, recovery, the
                 // proximity ring — gets to override it before
                 // `apply_velocity` integrates.
-                navigation::orbit_base,
+                navigation::go_to_network_area,
                 // Handshake bookkeeping, then origination, then the flood
                 // itself — so a request that timed out this frame frees the
                 // drone to ask again in the same frame it becomes idle.

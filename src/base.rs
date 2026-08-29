@@ -33,7 +33,7 @@ use crate::{
 /// Edge length of the cube the ground station is drawn as, km. Doubles as its
 /// physical footprint — [`crate::avoidance`] derives the base's bounding
 /// radius from it so drones keep clear of the structure.
-pub const BASE_BOX_SIZE_KM: f32 = 0.01875;
+pub const BASE_BOX_SIZE_KM: f32 = 0.0375;
 
 /// Marks the ground control station entity.
 #[derive(Component)]
@@ -87,6 +87,7 @@ pub fn spawn_base(
     theme: Res<crate::theme::Theme>,
     base_position: Res<crate::area::BasePosition>,
     area: Res<crate::area::ScenarioArea>,
+    network_area: Res<crate::area::NetworkArea>,
 ) {
     // Initial colors from the palette; `apply_theme` re-syncs on toggle
     // (these entities carry ThemeRole markers).
@@ -109,9 +110,7 @@ pub fn spawn_base(
     // on where the ring is being flown, the same plan `world::setup` spawns
     // the drones onto, so its links are up on frame 0 alongside theirs.
     // `crate::tracking::maintain_base_antennas` keeps them aimed from there.
-    let ring = crate::world::ring_formation(terrain.size_km(), pos, |x, z| {
-        terrain.height_at(x, z)
-    });
+    let ring = crate::world::target_area_formation(&network_area, &area, &terrain);
     let antennas: Vec<Antenna> = ring
         .iter()
         .enumerate()

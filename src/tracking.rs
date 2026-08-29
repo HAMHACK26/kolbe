@@ -173,8 +173,8 @@ pub fn maintain_base_antennas(
             continue;
         }
         let base_pos = base.position;
-        for (slot, (_, drone_entity, drone_uuid)) in ring.iter().enumerate() {
-            let Some(antenna) = antennas.0.get_mut(slot) else {
+        for (slot, drone_entity, drone_uuid) in &ring {
+            let Some(antenna) = antennas.0.get_mut(*slot) else {
                 break; // fewer antennas than drones — the rest go uncovered.
             };
             let target = tracked
