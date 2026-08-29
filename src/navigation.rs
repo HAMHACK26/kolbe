@@ -261,7 +261,7 @@ pub fn navigate(state: &mut DroneState, target: Vec3, limits: &FlightLimits, dt:
 }
 
 /// Fly drones toward the selected area, then send each to its fixed 3 km
-/// survey slot as soon as it crosses the operational rectangle. This mission
+/// survey slot as soon as it crosses the blue target polygon. This mission
 /// mode deliberately ignores all communication state; collision avoidance
 /// remains the layer that can deflect the course.
 pub fn go_to_network_area(
@@ -278,7 +278,12 @@ pub fn go_to_network_area(
             target.spreading = true;
         }
         let waypoint = if target.spreading {
-            clamp_to_target_area(target.slot, &network_area, &scenario)
+            repel_from_target_boundary(
+                transform.translation,
+                clamp_to_target_area(target.slot, &network_area, &scenario),
+                &network_area,
+                &scenario,
+            )
         } else {
             target.ingress
         };
@@ -291,6 +296,47 @@ pub fn go_to_network_area(
         kin.velocity = state.velocity;
         kin.heading_deg = state.heading_deg;
     }
+}
+
+/// The blue boundary behaves like a virtual survey neighbor at this distance.
+/// It keeps the formation off edges and combines two edge forces at corners.
+const TARGET_BOUNDARY_SPACING_KM: f32 = crate::world::FORMATION_RADIUS_KM;
+
+fn repel_from_target_boundary(
+    position: Vec3,
+    slot: Vec3,
+    area: &crate::area::NetworkArea,
+    scenario: &crate::area::ScenarioArea,
+) -> Vec3 {
+    let hull = target_hull_local(area, scenario);
+    if hull.len() < 3 {
+        return slot;
+    }
+
+    // The stored hull is counter-clockwise, so its left-hand normals point
+    // inward. Using every nearby edge makes a corner produce a diagonal push.
+    let point = position.xz();
+    let mut push = Vec2::ZERO;
+    let mut urgency = 0.0_f32;
+    for (start, end) in hull.iter().zip(hull.iter().cycle().skip(1)).take(hull.len()) {
+        let edge = *end - *start;
+        let length = edge.length();
+        if length <= f32::EPSILON {
+            continue;
+        }
+        let inward = Vec2::new(-edge.y, edge.x) / length;
+        let distance = ((point - *start).dot(inward)).max(0.0);
+        if distance < TARGET_BOUNDARY_SPACING_KM {
+            let weight = (1.0 - distance / TARGET_BOUNDARY_SPACING_KM).clamp(0.0, 1.0);
+            push += inward * weight;
+            urgency = urgency.max(weight);
+        }
+    }
+    if push.length_squared() <= f32::EPSILON {
+        return slot;
+    }
+    let escape = position + Vec3::new(push.x, 0.0, push.y).normalize() * TARGET_BOUNDARY_SPACING_KM;
+    slot.lerp(clamp_to_target_area(escape, area, scenario), urgency)
 }
 
 fn target_hull_local(

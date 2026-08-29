@@ -94,7 +94,7 @@ pub fn target_area_drone_count(area: &crate::area::NetworkArea) -> usize {
     let safe_cell_area = 2.0 * FORMATION_RADIUS_KM.powi(2);
     ((blue_target_area_km2(area) / safe_cell_area) * COVERAGE_RESERVE)
         .ceil()
-        .max(1.0) as usize
+        .max(5.0) as usize
 }
 
 fn launch_position(base_pos: Vec3, index: usize, count: usize) -> Vec3 {
@@ -519,8 +519,8 @@ mod tests {
             ..default()
         };
         let (columns, rows) = coverage_grid_dimensions(&area);
-        // 36 km² / 18 km² per gap-free cell × 1.75 reserve = 4 drones.
-        assert_eq!(target_area_drone_count(&area), 4);
-        assert_eq!((columns, rows), (2, 2));
+        // The computed four is raised to the five-drone fleet minimum.
+        assert_eq!(target_area_drone_count(&area), 5);
+        assert_eq!((columns, rows), (3, 2));
     }
 }
