@@ -65,7 +65,7 @@ use std::collections::HashSet;
 
 use bevy::prelude::*;
 
-use crate::antenna::angles_toward;
+use crate::antenna::{Antenna, angles_toward};
 use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
@@ -74,6 +74,7 @@ use crate::networking::{
     DroneClock, DroneUuid, LinkSet, MeshRow, MeshTable, Pairing, PairingState, ReconnectRequests,
     RingIndex,
 };
+use crate::tracking::BaseAntennaTargets;
 
 /// Mechanical/electronic scan speed floor, rad/s (~4.8 rpm).
 pub const OMEGA_MIN_RAD_S: f32 = 0.5;
@@ -256,7 +257,7 @@ pub fn seek_lost_links(
         table,
         clock,
         kin,
-        mut seek,
+        seek,
         pairing,
     ) in &mut drones
     {
@@ -272,6 +273,10 @@ pub fn seek_lost_links(
         if pairing.frozen && !accepted_connection_request {
             continue;
         }
+        // One `DerefMut` up front: the two slot blocks below each borrow a
+        // different pair of fields, which the `Mut<SeekState>` wrapper cannot
+        // split on its own.
+        let seek = seek.into_inner();
         let self_pos = self_transform.translation;
         // Scan speed keys off the drone's real UUID identity, not its
         // formation ring slot.
@@ -287,7 +292,7 @@ pub fn seek_lost_links(
         {
             let (elapsed, was_linked) = (&mut seek.next_elapsed_secs, &mut seek.next_was_linked);
             seek_one_slot(SeekSlotArgs {
-                drone: &mut drone,
+                antennas: &mut drone.antennas,
                 antenna_idx: 0,
                 neighbor_entity: next_entity,
                 neighbor_uuid: &next_uuid,
@@ -308,7 +313,7 @@ pub fn seek_lost_links(
         {
             let (elapsed, was_linked) = (&mut seek.prev_elapsed_secs, &mut seek.prev_was_linked);
             seek_one_slot(SeekSlotArgs {
-                drone: &mut drone,
+                antennas: &mut drone.antennas,
                 antenna_idx: 2,
                 neighbor_entity: prev_entity,
                 neighbor_uuid: &prev_uuid,
@@ -329,8 +334,96 @@ pub fn seek_lost_links(
     }
 }
 
+/// Per-antenna spiral state for the ground station, one entry per antenna.
+///
+/// Same rule as a drone's [`SeekState`]: a slot may only search after it has
+/// actually held a mutual link, and the spiral restarts from the centre on
+/// each fresh loss.
+#[derive(Component, Default)]
+pub struct BaseSeekState {
+    pub elapsed_secs: Vec<f32>,
+    pub was_linked: Vec<bool>,
+}
+
+/// The ground-station twin of [`seek_lost_links`]: when a drone an antenna was
+/// tracking goes quiet, spiral-search around its last-known mesh-table
+/// position instead of staring at an increasingly stale point.
+///
+/// Must run after [`crate::tracking::maintain_base_antennas`] — it overrides
+/// only the slots that system left tracking a peer whose link is down, and it
+/// reads that system's per-antenna assignment from [`BaseAntennaTargets`].
+/// Slots resting on an empty sector are left where they are.
+#[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
+pub fn seek_lost_base_links(
+    time: Res<Time>,
+    mut bases: Query<(
+        &mut Base,
+        &LinkSet,
+        &MeshTable,
+        &DroneClock,
+        &DroneUuid,
+        &BaseAntennaTargets,
+        &mut BaseSeekState,
+    )>,
+    drones: Query<&DroneUuid, With<Drone>>,
+) {
+    let dt = time.delta_secs();
+    // Same caveat as `seek_lost_links`: flight limits are not a live resource
+    // yet, so this reads the default.
+    let max_speed_mps = FlightLimits::default().max_speed_mps;
+
+    for (mut base, links, table, clock, self_uuid, targets, mut seek) in &mut bases {
+        let base_pos = base.position;
+        let antenna_count = base.antennas.len();
+        if seek.elapsed_secs.len() != antenna_count {
+            seek.elapsed_secs = vec![0.0; antenna_count];
+            seek.was_linked = vec![false; antenna_count];
+        }
+        // The station is fixed, so its scan speed keys off its own UUID alone.
+        let omega = scan_angular_speed_rad_s(
+            uuid_to_u64(&self_uuid.0),
+            OMEGA_MIN_RAD_S,
+            OMEGA_MAX_RAD_S,
+        );
+
+        let seek = seek.into_inner();
+        for antenna_idx in 0..antenna_count {
+            let Some(peer_entity) = targets.0.get(antenna_idx).copied().flatten() else {
+                // Resting on its sector — nobody assigned, nothing to find.
+                seek.elapsed_secs[antenna_idx] = 0.0;
+                continue;
+            };
+            let Ok(peer_uuid) = drones.get(peer_entity) else {
+                continue;
+            };
+            seek_one_slot(SeekSlotArgs {
+                antennas: &mut base.antennas,
+                antenna_idx,
+                neighbor_entity: peer_entity,
+                neighbor_uuid: &peer_uuid.0,
+                links,
+                table,
+                self_pos: base_pos,
+                base_pos,
+                // A station has no airframe to yaw: its antenna azimuths are
+                // already world-frame.
+                self_heading_deg: 0.0,
+                self_clock_now: clock.now,
+                max_speed_mps,
+                omega_rad_s: omega,
+                dt,
+                elapsed: &mut seek.elapsed_secs[antenna_idx],
+                was_linked: &mut seek.was_linked[antenna_idx],
+                accepted_connection_request: false,
+            });
+        }
+    }
+}
+
 struct SeekSlotArgs<'a> {
-    drone: &'a mut Drone,
+    /// The owning node's antenna array — a drone's three, or the ground
+    /// station's five. Both seek the same way.
+    antennas: &'a mut [Antenna],
     antenna_idx: usize,
     neighbor_entity: Entity,
     neighbor_uuid: &'a str,
@@ -352,7 +445,7 @@ struct SeekSlotArgs<'a> {
 
 fn seek_one_slot(args: SeekSlotArgs) {
     let SeekSlotArgs {
-        drone,
+        antennas,
         antenna_idx,
         neighbor_entity,
         neighbor_uuid,
@@ -413,7 +506,7 @@ fn seek_one_slot(args: SeekSlotArgs) {
     // drone-relative, so the drone's own yaw comes back out of it. Elevation
     // needs no such correction — the airframe stays level.
     let (center_az, center_el) = angles_toward(self_pos, target_pos);
-    if let Some(antenna) = drone.antennas.get_mut(antenna_idx) {
+    if let Some(antenna) = antennas.get_mut(antenna_idx) {
         antenna.azimuth_deg = (center_az - self_heading_deg + delta_az).rem_euclid(360.0);
         antenna.elevation_deg = (center_el + delta_el).clamp(-90.0, 90.0);
     }

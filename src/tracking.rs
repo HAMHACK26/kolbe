@@ -21,7 +21,10 @@ use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
-use crate::networking::{DroneUuid, MeshTable, Pairing, RingIndex};
+use crate::networking::{
+    BASE_SECTOR_DEG, BASE_SECTOR_ELEVATION_DEG, DroneUuid, MeshTable, Pairing, RingIndex,
+    shortest_angle_deg,
+};
 
 /// Where this drone currently believes a tracked peer *will be*, based
 /// purely on the last header that peer sent — never on omniscient ECS
@@ -37,6 +40,93 @@ use crate::networking::{DroneUuid, MeshTable, Pairing, RingIndex};
 /// [`maintain_mesh_antennas`] for aiming.
 #[derive(Component, Default)]
 pub struct TrackedPeers(pub HashMap<Entity, Vec3>);
+
+/// Which peer each of the ground station's antennas is currently tracking,
+/// one slot per antenna. Written by [`maintain_base_antennas`] and read by
+/// [`crate::seeking::seek_lost_base_links`], which needs to know whose link
+/// went quiet before it may start sweeping that slot.
+#[derive(Component, Default)]
+pub struct BaseAntennaTargets(pub Vec<Option<Entity>>);
+
+/// Keep the ground station's five sector antennas locked onto the drones it
+/// knows about — the station tracks exactly the way an airframe does.
+///
+/// It used to aim straight at each drone's live `Transform`, which is
+/// omniscience the radio cannot supply: the station knows only what arrived
+/// over the air. So the aim point per peer is, in order, that peer's
+/// **predicted** position from [`TrackedPeers`] (its own last self-reported
+/// flight direction, led forward), then its last-known
+/// [`MeshTable`] row (`base_pos + row.location`), then nothing — a peer the
+/// station has never heard from is not aimed at.
+///
+/// Assignment is unchanged: peers claim antennas nearest-first, each taking
+/// the free antenna whose sector its bearing falls closest to, so beams stay
+/// spread while there is spread to be had but no known drone is left untracked
+/// while an antenna idles. Genuinely spare antennas rest on their sector.
+pub fn maintain_base_antennas(
+    mut bases: Query<(&mut Base, &TrackedPeers, &MeshTable, &mut BaseAntennaTargets)>,
+    drones: Query<(Entity, &DroneUuid), With<Drone>>,
+) {
+    for (mut base, tracked, table, mut targets) in &mut bases {
+        let base_pos = base.position;
+
+        // Identity comes from the ECS, position never does.
+        let mut peers: Vec<(Entity, Vec3)> = drones
+            .iter()
+            .filter_map(|(entity, uuid)| {
+                let estimate = tracked
+                    .0
+                    .get(&entity)
+                    .copied()
+                    .or_else(|| table.0.get(&uuid.0).map(|row| base_pos + row.location))?;
+                Some((entity, estimate))
+            })
+            .collect();
+        peers.sort_by(|a, b| (a.1 - base_pos).length().total_cmp(&(b.1 - base_pos).length()));
+
+        let mut assigned: Vec<Option<(Entity, Vec3)>> = vec![None; base.antennas.len()];
+        for (entity, peer_pos) in &peers {
+            // At zero range there is no bearing to aim at. Those launch links
+            // are held open by the zero-distance rule in the detector instead.
+            if (*peer_pos - base_pos).length() <= f32::EPSILON {
+                continue;
+            }
+            let (azimuth_deg, _) = angles_toward(base_pos, *peer_pos);
+            let free = assigned
+                .iter()
+                .enumerate()
+                .filter(|(_, taken)| taken.is_none())
+                .min_by(|(a, _), (b, _)| {
+                    let offset = |index: usize| {
+                        shortest_angle_deg(azimuth_deg, index as f32 * BASE_SECTOR_DEG).abs()
+                    };
+                    offset(*a).total_cmp(&offset(*b))
+                })
+                .map(|(index, _)| index);
+            match free {
+                Some(index) => assigned[index] = Some((*entity, *peer_pos)),
+                // Every antenna is already tracking someone.
+                None => break,
+            }
+        }
+
+        for (index, antenna) in base.antennas.iter_mut().enumerate() {
+            match assigned[index] {
+                Some((_, peer_pos)) => {
+                    let (azimuth_deg, elevation_deg) = angles_toward(base_pos, peer_pos);
+                    antenna.azimuth_deg = azimuth_deg;
+                    antenna.elevation_deg = elevation_deg;
+                }
+                None => {
+                    antenna.azimuth_deg = index as f32 * BASE_SECTOR_DEG;
+                    antenna.elevation_deg = BASE_SECTOR_ELEVATION_DEG;
+                }
+            }
+        }
+
+        targets.0 = assigned.iter().map(|slot| slot.map(|(entity, _)| entity)).collect();
+    }
+}
 
 /// Keep every drone locked onto its ring neighbors: antenna #1 → next
 /// neighbor, antenna #2 → base, antenna #3 → previous neighbor. Non-adjacent
@@ -187,6 +277,38 @@ mod tests {
         world.spawn(Base { id: "base".into(), position: pos, antennas: vec![] });
     }
 
+    /// A station that can actually aim: five sector antennas plus the same
+    /// networking state a real one carries, so it matches
+    /// `maintain_base_antennas`'s query in full.
+    fn spawn_tracking_base(world: &mut World, pos: Vec3) -> Entity {
+        let antennas = (0..5)
+            .map(|k| make_antenna(k as f32 * BASE_SECTOR_DEG, BASE_SECTOR_ELEVATION_DEG, 200 + k))
+            .collect();
+        world
+            .spawn((
+                Transform::from_translation(pos),
+                Base { id: "base".into(), position: pos, antennas },
+                NetworkingBundle::random(usize::MAX),
+                BaseAntennaTargets::default(),
+            ))
+            .id()
+    }
+
+    /// The bearing of whichever base antenna ended up aimed off its resting
+    /// sector, if any.
+    fn base_tracking_azimuth(world: &World, base: Entity) -> Option<f32> {
+        let base_component = world.get::<Base>(base).unwrap();
+        base_component
+            .antennas
+            .iter()
+            .enumerate()
+            .find(|(index, antenna)| {
+                antenna.azimuth_deg != *index as f32 * BASE_SECTOR_DEG
+                    || antenna.elevation_deg != BASE_SECTOR_ELEVATION_DEG
+            })
+            .map(|(_, antenna)| antenna.azimuth_deg)
+    }
+
     fn antenna0_az(world: &World, drone: Entity) -> f32 {
         world.get::<Drone>(drone).unwrap().antennas[0].azimuth_deg
     }
@@ -286,5 +408,61 @@ mod tests {
         let az = antenna0_az(&world, a);
         assert!((az - 0.0).abs() < 0.5, "expected ~0° (mesh-table row), got {az}");
         assert!((az - 90.0).abs() > 10.0, "must not aim at B's true position (90°)");
+    }
+
+    /// The station aims from what the radio told it — a relayed mesh-table
+    /// row — not from the drone's true `Transform`.
+    #[test]
+    fn base_aims_at_mesh_table_row_not_true_position() {
+        let mut world = World::new();
+        let base = spawn_tracking_base(&mut world, Vec3::ZERO);
+        // True bearing from the station is +X → 90°.
+        let drone = spawn_drone(&mut world, Vec3::new(4.0, 0.0, 0.0), 0);
+        // The station was told it sits due north instead (bearing 0°).
+        set_mesh_row(&mut world, base, drone, Vec3::new(0.0, 0.0, 4.0));
+
+        world.run_system_once(maintain_base_antennas).unwrap();
+
+        let az = base_tracking_azimuth(&world, base).expect("an antenna should be tracking");
+        assert!((az - 0.0).abs() < 0.5, "expected ~0° (mesh-table row), got {az}");
+        assert!((az - 90.0).abs() > 10.0, "must not aim at the true position (90°)");
+        assert_eq!(
+            world.get::<BaseAntennaTargets>(base).unwrap().0[0],
+            Some(drone),
+            "the tracking slot should record whose link it owns"
+        );
+    }
+
+    /// A direct prediction from the peer's own header beats the relayed row,
+    /// same precedence a drone uses.
+    #[test]
+    fn base_prefers_prediction_over_mesh_table() {
+        let mut world = World::new();
+        let base = spawn_tracking_base(&mut world, Vec3::ZERO);
+        let drone = spawn_drone(&mut world, Vec3::new(4.0, 0.0, 0.0), 0);
+        set_mesh_row(&mut world, base, drone, Vec3::new(0.0, 0.0, 4.0));
+        // Predicted point bears 45°, between the row (0°) and the truth (90°).
+        set_tracked(&mut world, base, drone, Vec3::new(4.0, 0.0, 4.0));
+
+        world.run_system_once(maintain_base_antennas).unwrap();
+
+        let az = base_tracking_azimuth(&world, base).expect("an antenna should be tracking");
+        assert!((az - 45.0).abs() < 0.5, "expected ~45° (prediction), got {az}");
+    }
+
+    /// A drone the station has never heard of is not aimed at, and the spare
+    /// antennas stay resting on their sectors.
+    #[test]
+    fn base_leaves_unknown_drones_untracked() {
+        let mut world = World::new();
+        let base = spawn_tracking_base(&mut world, Vec3::ZERO);
+        spawn_drone(&mut world, Vec3::new(4.0, 0.0, 0.0), 0);
+
+        world.run_system_once(maintain_base_antennas).unwrap();
+
+        assert!(
+            base_tracking_azimuth(&world, base).is_none(),
+            "no comms knowledge means no aim"
+        );
     }
 }

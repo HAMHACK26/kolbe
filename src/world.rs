@@ -31,7 +31,7 @@ pub const MIN_MESH_DRONES: usize = 5;
 pub const DRONE_RADIUS: f32 = 0.045;
 /// Rendered marker radius, km. Kept separate from the safety envelope so the
 /// map reads as aircraft rather than oversized balls.
-pub const DRONE_RENDER_RADIUS: f32 = DRONE_RADIUS / 2.0;
+pub const DRONE_RENDER_RADIUS: f32 = DRONE_RADIUS / 4.0;
 
 /// A pre-briefed, base-relative mission slot. Drones launch from the base and
 /// fly to this target before beginning random in-area patrol.
@@ -305,7 +305,7 @@ pub fn setup(
                 // drone spawns with; apply_velocity updates heading as it
                 // moves, but nothing currently re-syncs the cone transform.
                 cone_transform_for(antenna, 0.0, launch_pos),
-                Visibility::Hidden,
+                Visibility::Visible,
                 RadarCone { drone_entity, antenna_index },
                 ThemeRole::DroneCone,
                 crate::SimulationEntity,

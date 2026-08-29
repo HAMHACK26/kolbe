@@ -2,7 +2,8 @@ use bevy::{mesh::primitives::ConeAnchor, prelude::*};
 
 use crate::{
     antenna::{Antenna, radar_direction},
-    drone::{Drone, SelectedDrone},
+    base::Base,
+    drone::Drone,
     factories::movement::DroneKinematics,
 };
 
@@ -43,26 +44,38 @@ pub fn cone_transform_for(antenna: &Antenna, heading_deg: f32, drone_pos: Vec3) 
     }
 }
 
+/// Keep every antenna beam drawn, on every node, all the time.
+///
+/// The beams *are* the mesh topology — a live link is two of them meeting — so
+/// hiding them until their owner is selected hid the one thing worth watching.
+/// Selection now only moves the camera and the info popup.
 pub fn sync_radar_visibility(
-    selected: Res<SelectedDrone>,
     // Radar cones are separate entities, so this filter proves they cannot
     // overlap the mutable cone-transform query below.
     drones: Query<(&Transform, &Drone, &DroneKinematics), Without<RadarCone>>,
+    // The base owns cones too, and its five antennas are re-aimed every frame
+    // by `detect_base_links_and_send_headers`. Without this query the cones it
+    // owns never matched the query above (a base has no `Drone`), so they sat
+    // frozen at their spawn-time sector bearings instead of showing where the
+    // antennas are actually pointing.
+    bases: Query<(&Transform, &Base), Without<RadarCone>>,
     mut cones: Query<(&RadarCone, &mut Transform, &mut Visibility)>,
 ) {
     for (cone, mut transform, mut vis) in &mut cones {
-        *vis = if selected.0 == Some(cone.drone_entity) {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
+        *vis = Visibility::Visible;
 
         // The cone is a separate render entity, so it must be refreshed from
         // its owner every frame rather than remaining at the launch point.
-        if let Ok((drone_transform, drone, kin)) = drones.get(cone.drone_entity)
-            && let Some(antenna) = drone.antennas.get(cone.antenna_index)
+        if let Ok((drone_transform, drone, kin)) = drones.get(cone.drone_entity) {
+            if let Some(antenna) = drone.antennas.get(cone.antenna_index) {
+                *transform =
+                    cone_transform_for(antenna, kin.heading_deg, drone_transform.translation);
+            }
+        } else if let Ok((base_transform, base)) = bases.get(cone.drone_entity)
+            && let Some(antenna) = base.antennas.get(cone.antenna_index)
         {
-            *transform = cone_transform_for(antenna, kin.heading_deg, drone_transform.translation);
+            // A base has no heading — its antenna azimuths are world-frame.
+            *transform = cone_transform_for(antenna, 0.0, base_transform.translation);
         }
     }
 }

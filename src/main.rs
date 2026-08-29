@@ -260,6 +260,11 @@ fn main() {
                 // seeking only overrides slots tracking left without a lock.
                 tracking::maintain_mesh_antennas,
                 seeking::seek_lost_links,
+                // The ground station follows the same two-step: track its
+                // assigned drones from comms-derived positions, then sweep
+                // whichever sector antennas have lost their peer.
+                tracking::maintain_base_antennas,
+                seeking::seek_lost_base_links,
                 networking::detect_links_and_send_headers,
                 networking::detect_base_links_and_send_headers,
                 networking::retain_mutual_links,

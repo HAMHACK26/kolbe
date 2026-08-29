@@ -176,6 +176,10 @@ pub fn spawn_base(
             antennas: antennas.clone(),
         },
         BaseNetworkState::default(),
+        // The station tracks and seeks like an airframe: per-antenna peer
+        // assignment plus per-antenna spiral state.
+        crate::tracking::BaseAntennaTargets::default(),
+        crate::seeking::BaseSeekState::default(),
         // The station is a static mesh node: same header/table protocol as a
         // drone, but five antenna slots and no flight systems.
         networking,
@@ -194,7 +198,7 @@ pub fn spawn_base(
     )
     .id();
 
-    // Radar cones — hidden until the base is selected (keyed by base entity).
+    // Radar cones — always drawn, keyed by base entity.
     let cone_mat = materials.add(StandardMaterial {
         base_color: pal.base.with_alpha(0.20),
         emissive: LinearRgba::new(0.6, 0.5, 0.0, 0.0),
@@ -209,7 +213,7 @@ pub fn spawn_base(
             MeshMaterial3d(cone_mat.clone()),
             // Bases have no heading — 0.0 leaves azimuth effectively world-frame.
             cone_transform_for(antenna, 0.0, pos),
-            Visibility::Hidden,
+            Visibility::Visible,
             RadarCone { drone_entity: base_entity, antenna_index },
             ThemeRole::BaseCone,
             crate::SimulationEntity,

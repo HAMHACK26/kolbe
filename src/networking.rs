@@ -120,7 +120,7 @@ pub const BASE_SECTOR_DEG: f32 = 72.0;
 pub const BASE_SECTOR_ELEVATION_DEG: f32 = 5.0;
 
 /// Signed difference `a - b`, folded into `[-180, 180)`.
-fn shortest_angle_deg(a: f32, b: f32) -> f32 {
+pub fn shortest_angle_deg(a: f32, b: f32) -> f32 {
     (a - b + 540.0).rem_euclid(360.0) - 180.0
 }
 
@@ -557,75 +557,26 @@ pub fn detect_links_and_send_headers(
 /// The fixed base runs the same link/header protocol as a drone, with five
 /// independently aimed sectors. It is intentionally separate from the drone
 /// detector because it has no `Drone` component and must never enter flight.
+///
+/// Detection only. Where those five antennas *point* is decided upstream by
+/// [`crate::tracking::maintain_base_antennas`] and
+/// [`crate::seeking::seek_lost_base_links`], exactly as a drone's aim is —
+/// this system reads the resulting boresight and evaluates link budget
+/// against it.
 pub fn detect_base_links_and_send_headers(
     mut mailbox: ResMut<Mailbox>,
     mut bases: Query<(
-        Entity, &mut Base, &DroneClock, &DroneUuid, &mut LinkSet, &mut SentHeaders, &MeshTable,
+        Entity, &Base, &DroneClock, &DroneUuid, &mut LinkSet, &mut SentHeaders, &MeshTable,
         &TargetAreaVectors,
     )>,
     drones: Query<(Entity, &GlobalTransform, &DroneUuid), With<Drone>>,
 ) {
-    for (base_entity, mut base, clock, uuid, mut links, mut sent, table, target_area) in &mut bases {
+    for (base_entity, base, clock, uuid, mut links, mut sent, table, target_area) in &mut bases {
         let base_pos = base.position;
-        let mut peers: Vec<(Entity, Vec3, String)> = drones
+        let peers: Vec<(Entity, Vec3, String)> = drones
             .iter()
             .map(|(entity, transform, peer_uuid)| (entity, transform.translation(), peer_uuid.0.clone()))
             .collect();
-        peers.sort_by(|a, b| (a.1 - base_pos).length().total_cmp(&(b.1 - base_pos).length()));
-
-        // Point one antenna at each connected drone.
-        //
-        // Two earlier versions of this got it wrong in opposite directions.
-        // Zipping antennas against the five nearest peers aimed every one of
-        // them at the same cluster. Pinning each antenna to its own 72 degree
-        // sector fixed that but broke the more important case: with four
-        // drones on one bearing, one antenna tracked them and the other four
-        // sat at their sector centres pointing at empty sky.
-        //
-        // So: peers claim antennas nearest-first, each taking the free antenna
-        // whose sector it falls closest to. Sector geometry still decides *who
-        // gets whom*, which keeps beams spread while there is spread to be
-        // had, but it never leaves a connected drone untracked while an
-        // antenna is idle. Only genuinely spare antennas rest on their sector.
-        let mut assigned: Vec<Option<Vec3>> = vec![None; base.antennas.len()];
-        for (_, peer_pos, _) in &peers {
-            // At zero range there is no bearing to aim at. Those launch links
-            // are held open by the zero-distance rule below instead.
-            if (*peer_pos - base_pos).length() <= f32::EPSILON {
-                continue;
-            }
-            let (azimuth_deg, _) = crate::antenna::angles_toward(base_pos, *peer_pos);
-            let free = assigned
-                .iter()
-                .enumerate()
-                .filter(|(_, taken)| taken.is_none())
-                .min_by(|(a, _), (b, _)| {
-                    let offset = |index: usize| {
-                        shortest_angle_deg(azimuth_deg, index as f32 * BASE_SECTOR_DEG).abs()
-                    };
-                    offset(*a).total_cmp(&offset(*b))
-                })
-                .map(|(index, _)| index);
-            match free {
-                Some(index) => assigned[index] = Some(*peer_pos),
-                // Every antenna is already tracking someone.
-                None => break,
-            }
-        }
-        for (index, antenna) in base.antennas.iter_mut().enumerate() {
-            match assigned[index] {
-                Some(peer_pos) => {
-                    let (azimuth_deg, elevation_deg) =
-                        crate::antenna::angles_toward(base_pos, peer_pos);
-                    antenna.azimuth_deg = azimuth_deg;
-                    antenna.elevation_deg = elevation_deg;
-                }
-                None => {
-                    antenna.azimuth_deg = index as f32 * BASE_SECTOR_DEG;
-                    antenna.elevation_deg = BASE_SECTOR_ELEVATION_DEG;
-                }
-            }
-        }
 
         let mut detected_now = HashMap::new();
         for (peer_entity, peer_pos, _peer_uuid) in &peers {
