@@ -326,7 +326,7 @@ pub fn go_to_network_area(
 }
 
 const SPACING_LIMIT_KM: f32 = 3.0;
-const PROTECTED_LINK_MARGIN_KM: f32 = 0.1;
+const PROTECTED_LINK_MARGIN_KM: f32 = 0.25;
 const BOUNDARY_BUFFER_KM: f32 = 0.5;
 const SPACING_STEP_KM: f32 = 0.1;
 
@@ -419,7 +419,7 @@ fn preserve_critical_links(
         && table
             .0
             .get(base_uuid)
-            .is_some_and(|row| row.connections.len() <= 2);
+            .is_none_or(|row| row.connections.len() <= 3);
     let from_base = self_pos - base_pos;
     if base_link_is_protected
         && from_base.length() >= SPACING_LIMIT_KM - PROTECTED_LINK_MARGIN_KM
@@ -434,7 +434,7 @@ fn preserve_critical_links(
         let Some(peer_row) = table.0.get(&peer_uuid.0) else {
             continue;
         };
-        if peer_row.connections.len() > 2 {
+        if peer_row.connections.len() > 3 {
             continue;
         }
 

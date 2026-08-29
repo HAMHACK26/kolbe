@@ -158,9 +158,9 @@ fn main() {
             (
                 terrain::spawn_mesh,
                 terrain::spawn_water,
-                terrain::spawn_trees,
                 // The deployment queue starts at the actual base position.
                 base::spawn_base,
+                terrain::spawn_trees,
                 world::setup,
                 ui::make_camera_overlay,
                 ui::spawn_reset_button,

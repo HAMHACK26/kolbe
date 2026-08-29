@@ -270,6 +270,7 @@ pub fn spawn_trees(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     settings: Res<VegetationSettings>,
+    bases: Query<&crate::base::Base>,
 ) {
     if !settings.enabled {
         return;
@@ -289,6 +290,15 @@ pub fn spawn_trees(
     let mut planted = 0usize;
     let mut radio_canopies = RadioCanopies::default();
     for tree in candidates {
+        // The ground station keeps a small clear pad around itself. Remove
+        // trees from both the render mesh and the radio index so a canopy
+        // cannot block the base's first mesh hop.
+        if bases.iter().any(|base| {
+            Vec2::new(tree.x_km - base.position.x, tree.z_km - base.position.z).length()
+                < crate::base::BASE_FOLIAGE_CLEARANCE_KM
+        }) {
+            continue;
+        }
         if !is_land(&height_map, tree.x_km, tree.z_km) {
             continue;
         }
