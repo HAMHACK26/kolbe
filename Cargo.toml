@@ -12,6 +12,10 @@ flate2 = "1.1.10"
 tiff = "0.10"
 proj4rs = "0.1.10"
 dotenvy = "0.15.7"
+# Decodes OSM tile PNGs fetched over HTTP (see src/tiles.rs). Already in the
+# dependency tree transitively via Bevy's own PNG asset loading — pinned to
+# the version already resolved in Cargo.lock so this doesn't pull a second copy.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [features]
 # Enable to implement drone logic in Python:

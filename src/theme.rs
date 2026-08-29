@@ -7,6 +7,8 @@
 use bevy::prelude::*;
 
 use crate::{
+    area::{AreaBg, BodyText, HeadingText, SourceText},
+    terrain::{LoadingBarFill, LoadingHeading, LoadingRoot, LoadingStatus, LoadingTrack},
     ui::{InfoPopup, InfoPopupTitle},
 };
 
@@ -14,6 +16,7 @@ use crate::{
 #[derive(Component, Clone, Copy)]
 pub enum ThemeRole {
     Ground,
+    Water,
     Drone,
     DroneCone,
     BaseMarker,
@@ -38,6 +41,7 @@ pub struct Theme {
 pub struct Palette {
     pub bg: Color,       // window clear color (base)
     pub ground: Color,   // green
+    pub water: Color,    // sea-level reference plane
     pub surface: Color,  // popup background (surface0)
     pub text: Color,     // text
     pub subtext: Color,  // dimmed body text (subtext0)
@@ -56,6 +60,7 @@ impl Theme {
             Palette {
                 bg: Color::srgb_u8(0x1e, 0x1e, 0x2e),
                 ground: Color::srgb_u8(0x45, 0x47, 0x5a), // surface1 — gray
+                water: Color::srgb_u8(0x74, 0xc7, 0xec),  // sapphire
                 surface: Color::srgb_u8(0x58, 0x5b, 0x70), // surface2 — popup, distinct
                 text: Color::srgb_u8(0xcd, 0xd6, 0xf4),
                 subtext: Color::srgb_u8(0xa6, 0xad, 0xc8),
@@ -71,6 +76,7 @@ impl Theme {
             Palette {
                 bg: Color::srgb_u8(0xef, 0xf1, 0xf5),
                 ground: Color::srgb_u8(0xbc, 0xc0, 0xcc), // surface1 — gray
+                water: Color::srgb_u8(0x20, 0x9f, 0xb5),  // sapphire
                 surface: Color::srgb_u8(0xac, 0xb0, 0xbe), // surface2 — popup, distinct
                 text: Color::srgb_u8(0x4c, 0x4f, 0x69),
                 subtext: Color::srgb_u8(0x6c, 0x6f, 0x85),
@@ -99,13 +105,21 @@ pub fn apply_theme(
     mut clear: ResMut<ClearColor>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     roles: Query<(&MeshMaterial3d<StandardMaterial>, &ThemeRole)>,
-    mut popup_bg: Query<&mut BackgroundColor, (With<InfoPopup>, Without<MoonButton>)>,
-    mut title: Query<&mut TextColor, With<InfoPopupTitle>>,
-    mut moon_btn: Query<&mut BackgroundColor, (With<MoonButton>, Without<InfoPopup>)>,
+    mut popup_bg: Query<&mut BackgroundColor, (With<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>, Without<AreaBg>)>,
+    mut title: Query<&mut TextColor, (With<InfoPopupTitle>, Without<HeadingText>, Without<BodyText>, Without<SourceText>)>,
+    mut moon_btn: Query<&mut BackgroundColor, (With<MoonButton>, Without<InfoPopup>, Without<MoonCrescent>, Without<AreaBg>)>,
     mut crescent: Query<&mut Visibility, (With<MoonCrescent>, Without<SunRays>)>,
     mut rays: Query<&mut Visibility, (With<SunRays>, Without<MoonCrescent>)>,
-    mut crescent_bg: Query<&mut BackgroundColor, (With<MoonCrescent>, Without<MoonButton>, Without<InfoPopup>)>,
+    mut crescent_bg: Query<&mut BackgroundColor, (With<MoonCrescent>, Without<MoonButton>, Without<InfoPopup>, Without<AreaBg>)>,
+    area_ui: (
+        Query<&mut BackgroundColor, (With<AreaBg>, Without<InfoPopup>, Without<MoonButton>, Without<MoonCrescent>)>,
+        Query<&mut TextColor, (With<HeadingText>, Without<InfoPopupTitle>, Without<BodyText>, Without<SourceText>)>,
+        Query<&mut TextColor, (With<BodyText>, Without<HeadingText>, Without<InfoPopupTitle>, Without<SourceText>)>,
+        Query<&mut TextColor, (With<SourceText>, Without<HeadingText>, Without<BodyText>, Without<InfoPopupTitle>)>,
+    ),
 ) {
+    let (mut area_bg, mut headings, mut bodies, mut sources) = area_ui;
+
     if !theme.is_changed() {
         return;
     }
@@ -113,12 +127,29 @@ pub fn apply_theme(
 
     clear.0 = p.bg;
 
+    for mut bg in &mut area_bg {
+        bg.0 = p.bg;
+    }
+    for mut tc in &mut headings {
+        tc.0 = p.text;
+    }
+    for mut tc in &mut bodies {
+        tc.0 = p.text.with_alpha(0.8);
+    }
+    for mut tc in &mut sources {
+        tc.0 = p.text.with_alpha(0.6);
+    }
+
     for (mat_handle, role) in &roles {
         let Some(mut mat) = materials.get_mut(&mat_handle.0) else { continue };
         match role {
             ThemeRole::Ground => {
                 mat.base_color = p.ground;
                 mat.emissive = LinearRgba::BLACK;
+            }
+            ThemeRole::Water => {
+                mat.base_color = p.water.with_alpha(0.55);
+                mat.emissive = glow(p.water, 0.15);
             }
             ThemeRole::Drone => {
                 mat.base_color = p.drone;
@@ -157,6 +188,38 @@ pub fn apply_theme(
     }
     if let Ok(mut vis) = rays.single_mut() {
         *vis = if theme.dark { Visibility::Hidden } else { Visibility::Visible };
+    }
+}
+
+/// Recolors the loading screen. Kept separate from `apply_theme` so its
+/// queries never have to prove disjointness against that system's — the
+/// two screens' entities never coexist anyway.
+pub fn apply_loading_theme(
+    theme: Res<Theme>,
+    mut root_bg: Query<&mut BackgroundColor, (With<LoadingRoot>, Without<LoadingTrack>, Without<LoadingBarFill>)>,
+    mut track_bg: Query<&mut BackgroundColor, (With<LoadingTrack>, Without<LoadingRoot>, Without<LoadingBarFill>)>,
+    mut fill_bg: Query<&mut BackgroundColor, (With<LoadingBarFill>, Without<LoadingTrack>, Without<LoadingRoot>)>,
+    mut heading: Query<&mut TextColor, (With<LoadingHeading>, Without<LoadingStatus>)>,
+    mut status: Query<&mut TextColor, (With<LoadingStatus>, Without<LoadingHeading>)>,
+) {
+    if !theme.is_changed() {
+        return;
+    }
+    let p = theme.palette();
+    for mut bg in &mut root_bg {
+        bg.0 = p.bg;
+    }
+    for mut bg in &mut track_bg {
+        bg.0 = p.surface;
+    }
+    for mut bg in &mut fill_bg {
+        bg.0 = p.accent;
+    }
+    for mut tc in &mut heading {
+        tc.0 = p.text;
+    }
+    for mut tc in &mut status {
+        tc.0 = p.accent;
     }
 }
 

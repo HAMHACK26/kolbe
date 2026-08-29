@@ -1,14 +1,11 @@
 use bevy::{picking::prelude::*, prelude::*};
 
 use crate::{
-    base::{CommandQueue, base_position},
+    base::CommandQueue,
     camera::OrbitCamera,
     drone::{Drone, DroneType, SelectedDrone, drone_id, make_antenna},
     factories::{DroneAi, movement::DroneKinematics},
-    navigation::{
-        BOUNDARY_MARGIN_KM, DriftVector, MAX_LINK_SPACING_KM, MIN_SEPARATION_KM, PatrolVolume,
-    },
-    networking::{MeshRow, MeshTable, NetworkingBundle},
+    networking::NetworkingBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     recovery::{ContactMemory, RecoveryState},
     seeking::SeekState,
@@ -20,83 +17,8 @@ use crate::{
 };
 
 pub const WORLD_SIZE: f32 = 20.0;
-/// How many drones it takes to cover the patrol area.
-///
-/// Not a free choice — it falls out of the radio. The area is 14 x 14 km and
-/// no two neighbours may sit further apart than
-/// [`MAX_LINK_SPACING_KM`] (3.0 km) or they cannot link at all, so the grid
-/// needs `ceil(14 / 3) = 6` drones per side. Fewer drones would leave the mesh
-/// permanently partitioned no matter how well the antennas were aimed; this is
-/// the count that gives the area continuous coverage.
-pub const DRONE_COUNT: usize = 36;
-/// Drawn radius of a drone, km. Still far larger than a real airframe — a
-/// true-scale quad is sub-pixel on a 20 km map — but 4x smaller than the
-/// original marker, so the 3 km separation ring reads as real distance between
-/// drones rather than a couple of body widths.
-pub const DRONE_RADIUS: f32 = 0.045;
-
-/// Fixed seed for the spawn scatter and each drone's drift stream, so a run is
-/// reproducible: same layout, same sequence of direction changes.
-pub const SPAWN_SEED: u64 = 0x5EED_D40E_5EED_D40E;
-
-/// Lay out `count` ground positions inside `volume`, keeping every adjacent
-/// pair both far enough apart to be legal and close enough to talk.
-///
-/// A jittered grid rather than rejection sampling, because the guarantee is
-/// structural instead of probabilistic. Points sit at the centers of a lattice
-/// and are then pushed around inside their own cell. The jitter is bounded
-/// from *both* sides, which is the whole trick:
-///
-///   - it can't exceed `(pitch − MIN_SEPARATION) / 2`, or two neighbours could
-///     close past the separation floor;
-///   - it can't exceed `(MAX_LINK_SPACING − pitch) / 2`, or two neighbours
-///     could drift past the radio's reach and the mesh would come up with a
-///     permanent hole in it.
-///
-/// So the layout is random but every neighbour pair lands inside
-/// `[MIN_SEPARATION_KM, MAX_LINK_SPACING_KM]` by construction, with no retry
-/// loop that might not terminate.
-///
-/// Returns horizontal positions only — altitude is measured from the terrain,
-/// which this function has no view of (see [`setup`]).
-pub fn scatter_spawn_points(count: usize, volume: &PatrolVolume, seed: u64) -> Vec<Vec2> {
-    if count == 0 {
-        return Vec::new();
-    }
-    let columns = (count as f32).sqrt().ceil() as usize;
-    let rows = count.div_ceil(columns);
-    let span = volume.span_km();
-
-    // Cell pitch. Points sit at cell centers, so N cells across a span of S
-    // have pitch S/N and the outermost centers sit half a pitch off the wall.
-    let pitch = Vec2::new(span.x / columns as f32, span.y / rows as f32);
-    // Bounded from both sides — see the doc comment. A negative bound (a grid
-    // too coarse or too fine for the limits) clamps to zero: a plain lattice.
-    let bounded_jitter = |pitch: f32| {
-        ((pitch - MIN_SEPARATION_KM) / 2.0)
-            .min((MAX_LINK_SPACING_KM - pitch) / 2.0)
-            .max(0.0)
-    };
-    let jitter = Vec2::new(bounded_jitter(pitch.x), bounded_jitter(pitch.y));
-
-    let mut rng = seed;
-    let next = |state: &mut u64| {
-        *state = state
-            .wrapping_add(0x9e37_79b9_7f4a_7c15)
-            .wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        ((*state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0 // [-1, 1)
-    };
-
-    (0..count)
-        .map(|i| {
-            let (column, row) = (i % columns, i / columns);
-            Vec2::new(
-                volume.min.x + (column as f32 + 0.5) * pitch.x + next(&mut rng) * jitter.x,
-                volume.min.z + (row as f32 + 0.5) * pitch.y + next(&mut rng) * jitter.y,
-            )
-        })
-        .collect()
-}
+pub const DRONE_COUNT: usize = 12;
+pub const DRONE_RADIUS: f32 = 0.18;
 
 pub fn setup(
     mut commands: Commands,
@@ -113,17 +35,20 @@ pub fn setup(
         Camera3d::default(),
         Transform::default(),
         AmbientLight { brightness: 300.0, ..default() },
+        crate::SimulationEntity,
     ));
 
     commands.spawn((
         DirectionalLight { illuminance: 8000.0, shadow_maps_enabled: false, ..default() },
         Transform::from_xyz(8.0, 16.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        crate::SimulationEntity,
     ));
 
-    // The target area: the world inset by BOUNDARY_MARGIN_KM on every side, so
-    // there is always empty world between the formation and the map edge.
-    let volume = PatrolVolume::inset(WORLD_SIZE, BOUNDARY_MARGIN_KM);
-    let positions = scatter_spawn_points(DRONE_COUNT, &volume, SPAWN_SEED);
+    let positions: [(f32, f32); 12] = [
+        (2.3, 4.1), (7.8, 1.5), (14.2, 6.3), (18.0, 2.0),
+        (5.5, 11.0), (11.3, 9.7), (16.8, 13.2), (3.0, 16.5),
+        (9.1, 17.8), (13.5, 14.0), (19.0, 18.5), (6.7, 7.3),
+    ];
 
     let drone_mesh = meshes.add(Sphere::new(DRONE_RADIUS));
     // Initial colors come from the palette; `apply_theme` keeps them in sync on
@@ -142,56 +67,19 @@ pub fn setup(
         ..default()
     });
 
-    // ── Pass 1: settle identities and final positions ────────────────────────
-    //
-    // Both are needed to write the mission briefing below, and a drone's UUID
-    // only exists once its `NetworkingBundle` has been built — so build them
-    // all first, then spawn.
-    let placed: Vec<(Vec3, NetworkingBundle)> = positions
-        .iter()
-        .enumerate()
-        .map(|(i, &ground_xz)| {
-            // Altitude is measured from the terrain, so each drone launches
-            // mid-band over whatever is actually beneath it.
-            let ground = terrain.height_at(ground_xz.x, ground_xz.y);
-            let (floor, ceiling) = PatrolVolume::altitude_band(ground);
-            let pos = Vec3::new(ground_xz.x, (floor + ceiling) / 2.0, ground_xz.y);
-            (pos, NetworkingBundle::random(i))
-        })
-        .collect();
-
-    // ── The mission briefing ─────────────────────────────────────────────────
-    //
-    // Every drone launches already knowing the formation: who else is up, where
-    // they were placed, and who each of them is meant to be linked to. Without
-    // this the mesh cannot cold-start — `maintain_mesh_antennas` has nothing to
-    // aim at until a header arrives, but no header can arrive until an antenna
-    // is aimed. Real formations brief the same way; the tests in `networking`
-    // and `tracking` already seed rows for exactly this reason.
-    //
-    // Locations are base-relative, matching how every other mesh row is stored.
-    let base_pos = base_position(&terrain);
-    let count = placed.len();
-    let briefing: Vec<MeshRow> = placed
-        .iter()
-        .enumerate()
-        .map(|(i, (pos, networking))| MeshRow {
-            id: networking.uuid.0.clone(),
-            // Briefed, not observed — timestamp 0 makes it maximally stale, so
-            // the first real header from that peer always supersedes it.
-            timestamp: 0.0,
-            location: *pos - base_pos,
-            neighbour_distance: 1,
-            // The ring each drone is expected to hold: previous and next slot.
-            connections: vec![
-                placed[(i + count - 1) % count].1.uuid.0.clone(),
-                placed[(i + 1) % count].1.uuid.0.clone(),
-            ],
-        })
-        .collect();
-
-    for (i, (drone_pos, networking)) in placed.into_iter().enumerate() {
-        let drone_pos = drone_pos;
+    // `positions` are hand-placed for a `WORLD_SIZE` (20km) world — scale
+    // proportionally so the ring spans the *actual* fetched terrain, which
+    // can be smaller or much larger (a network area can run up to
+    // `area::MAX_SIDE_KM` per side) depending on what was picked on the
+    // map. Without this, drones stayed clustered in a fixed center 20km
+    // regardless of the real terrain extent.
+    let half = terrain.size_km() * 0.5;
+    let scale = terrain.size_km() / WORLD_SIZE;
+    for i in 0..DRONE_COUNT {
+        let (km_x, km_z) = positions[i];
+        let x = km_x * scale - half;
+        let z = km_z * scale - half;
+        let drone_pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
         let drone_type = if i % 3 == 0 { DroneType::Attack } else { DroneType::Node };
 
         let az0 = (i as f32 * 137.5) % 360.0;
@@ -206,21 +94,6 @@ pub fn setup(
             make_antenna((az0 + 240.0) % 360.0, el0, i + 200),
         ];
 
-        // The drift deadline is anchored to this drone's own clock. That clock
-        // starts at a random offset (up to a day out), so anchoring to 0.0
-        // would put the first deadline immediately in the past.
-        let drift = DriftVector::seeded(SPAWN_SEED ^ i as u64, networking.clock.now);
-
-        // This drone's copy of the briefing — everyone but itself.
-        let mut networking = networking;
-        networking.mesh_table = MeshTable(
-            briefing
-                .iter()
-                .filter(|row| row.id != networking.uuid.0)
-                .map(|row| (row.id.clone(), row.clone()))
-                .collect(),
-        );
-
         let drone_entity = commands
             .spawn((
                 Mesh3d(drone_mesh.clone()),
@@ -230,12 +103,12 @@ pub fn setup(
                 DroneKinematics::default(),
                 DroneAi::default(),
                 CommandQueue::default(),
-                networking,
-                drift,
+                NetworkingBundle::random(i),
                 SeekState::default(),
                 RecoveryState::default(),
                 ContactMemory::default(),
                 ThemeRole::Drone,
+                crate::SimulationEntity,
             ))
             .observe(
                 |mut t: On<Pointer<Click>>,
@@ -260,6 +133,7 @@ pub fn setup(
                 Visibility::Hidden,
                 RadarCone { drone_entity },
                 ThemeRole::DroneCone,
+                crate::SimulationEntity,
             ));
         }
     }
@@ -280,6 +154,7 @@ pub fn setup(
             BackgroundColor(pal.surface.with_alpha(0.88)),
             Visibility::Hidden,
             InfoPopup,
+            crate::SimulationEntity,
         ))
         .with_children(|p| {
             p.spawn((
@@ -345,6 +220,7 @@ pub fn setup(
             BackgroundColor(pal.surface.with_alpha(0.88)),
             Visibility::Hidden,
             NetworkTablePopup,
+            crate::SimulationEntity,
         ))
         .with_children(|p| {
             p.spawn((
@@ -361,53 +237,23 @@ pub fn setup(
         });
 }
 
-/// Draw the patrol volume — the box the drones are actually allowed to fly in.
-///
-/// Without this the target area is invisible and the flight behavior reads as
-/// arbitrary: drones stop at nothing, turn at nothing. Drawn as a wireframe
-/// box in the accent color, with the floor ring emphasised (it's the edge that
-/// reads against the terrain) and the vertical corner posts tying the two
-/// altitude bounds together.
-pub fn draw_patrol_volume(mut gizmos: Gizmos, theme: Res<Theme>, volume: Res<PatrolVolume>) {
-    let (min, max) = (volume.min, volume.max);
-    let color = theme.palette().accent;
-    let floor = color.with_alpha(0.55);
-    let ceiling = color.with_alpha(0.22);
-    let post = color.with_alpha(0.30);
-
-    // The four corners, in order, so consecutive pairs are box edges.
-    let corners = |y: f32| {
-        [
-            Vec3::new(min.x, y, min.z),
-            Vec3::new(max.x, y, min.z),
-            Vec3::new(max.x, y, max.z),
-            Vec3::new(min.x, y, max.z),
-        ]
-    };
-    let low = corners(min.y);
-    let high = corners(max.y);
-
-    for i in 0..4 {
-        let next = (i + 1) % 4;
-        gizmos.line(low[i], low[next], floor);
-        gizmos.line(high[i], high[next], ceiling);
-        gizmos.line(low[i], high[i], post);
-    }
-}
-
 pub fn draw_grid(
     mut gizmos: Gizmos,
     theme: Res<Theme>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
 ) {
-    let half = WORLD_SIZE / 2.0;
+    // Scaled to the *actual* fetched terrain, not the fixed `WORLD_SIZE` the
+    // hand-placed drone ring is designed for — a hardcoded 5km step only
+    // covered a 20km world; anything bigger left the outer terrain grid-less.
+    let half = terrain.size_km() * 0.5;
+    let step = terrain.size_km() / 4.0; // 5 lines (0..=4) spanning the full terrain
     let color = theme.palette().grid.with_alpha(0.25);
     const SEGMENTS: usize = 64;
     for i in 0..=4 {
-        let offset = -half + i as f32 * 5.0;
+        let offset = -half + i as f32 * step;
         for segment in 0..SEGMENTS {
-            let a = -half + WORLD_SIZE * segment as f32 / SEGMENTS as f32;
-            let b = -half + WORLD_SIZE * (segment + 1) as f32 / SEGMENTS as f32;
+            let a = -half + terrain.size_km() * segment as f32 / SEGMENTS as f32;
+            let b = -half + terrain.size_km() * (segment + 1) as f32 / SEGMENTS as f32;
             gizmos.line(
                 Vec3::new(a, terrain.height_at(a, offset) + 0.01, offset),
                 Vec3::new(b, terrain.height_at(b, offset) + 0.01, offset),
