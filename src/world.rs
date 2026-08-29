@@ -5,7 +5,10 @@ use crate::{
     base::{Base, CommandQueue},
     camera::OrbitCamera,
     drone::{Drone, SelectedDrone, drone_id, make_antenna},
-    factories::{DroneAi, movement::DroneKinematics},
+    factories::{
+        DroneAi,
+        movement::{DroneKinematics, HoverWind},
+    },
     networking::NetworkingBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     recovery::{ContactMemory, RecoveryState},
@@ -19,6 +22,11 @@ use crate::{
 
 pub const WORLD_SIZE: f32 = 20.0;
 pub const DRONE_RADIUS: f32 = 0.0225;
+/// Radius of the visible drone sphere. Kept separate from collision geometry
+/// so the marker can be tuned without changing flight behavior.
+pub const DRONE_VISUAL_RADIUS: f32 = DRONE_RADIUS;
+/// Global wind strength. 0.0 disables wind, 1.0 is baseline, 2.0 doubles it.
+pub const WIND_INTENSITY: f32 = 3.0;
 /// Clearance from the terrain to the underside of each drone, in km (50 m).
 pub const DRONE_GROUND_CLEARANCE_KM: f32 = 0.05;
 const DEPLOYMENT_INTERVAL_SECS: f32 = 10.0;
@@ -212,7 +220,7 @@ pub fn setup(
         crate::SimulationEntity,
     ));
 
-    let drone_mesh = meshes.add(Sphere::new(DRONE_RADIUS));
+    let drone_mesh = meshes.add(Sphere::new(DRONE_VISUAL_RADIUS));
     // Initial colors come from the palette; `apply_theme` keeps them in sync on
     // theme toggles (these entities carry ThemeRole markers).
     let drone_mat = materials.add(StandardMaterial {
@@ -426,6 +434,7 @@ fn spawn_deployment_drone(
             ThemeRole::Drone,
             crate::SimulationEntity,
         ))
+        .insert(HoverWind::new(index, WIND_INTENSITY))
         .observe(
             |mut t: On<Pointer<Click>>, orbit: Res<OrbitCamera>, mut sel: ResMut<SelectedDrone>| {
                 t.propagate(false);

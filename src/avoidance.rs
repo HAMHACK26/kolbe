@@ -90,12 +90,10 @@ use crate::world::DRONE_RADIUS;
 /// points. 3 m is a typical usable range for the cheap-sensor class described
 /// in the module docs.
 ///
-/// Note the render scale: the simulation draws a drone as a
-/// [`DRONE_RADIUS`]-km sphere (180 m) so it is visible on a 20 km map, which
-/// makes the modeled body enormously larger than a real airframe. Keeping this
-/// constant in true meters means the number stays honest — and because the gap
-/// is measured surface-to-surface, avoidance still triggers exactly when the
-/// drawn spheres are about to touch, which is what reads correctly on screen.
+/// Note the simulation scale: the avoidance model treats a drone as a
+/// [`DRONE_RADIUS`]-km body (180 m), independently of its smaller rendered
+/// marker. Keeping this constant in true meters means the sensor range stays
+/// honest even though the collision body is exaggerated for a 20 km map.
 pub const SENSOR_RANGE_M: f32 = 3.0;
 
 /// [`SENSOR_RANGE_M`] in the kilometer units the simulation world uses.
