@@ -105,6 +105,18 @@ pub enum PickMode {
 #[derive(Resource, Default, Clone, Copy)]
 pub struct BasePosition(pub Option<(f64, f64)>);
 
+/// Set when the most recent click while placing the base landed in water
+/// rather than on land, so `update_status_text` can explain *why* the click
+/// did nothing instead of it just failing silently. Cleared on leaving
+/// `PlacingBase` mode or on any click that isn't in water.
+///
+/// Land/water is approximated with `sweden_geo::point_in_sweden` — the same
+/// coastline check that already gates polygon points — so this catches the
+/// sea and any land outside Sweden, but not inland lakes: `sweden_geo`'s
+/// polygons don't cut lake-shaped holes out of the mainland ring.
+#[derive(Resource, Default, Clone, Copy)]
+pub(crate) struct BaseInWaterWarning(pub bool);
+
 /// The (possibly rotated) minimum-area square enclosing the picked points —
 /// the "network area". Recomputed live as points are added/removed; the
 /// version present when "Generate terrain" is pressed is what gets fetched
@@ -369,6 +381,7 @@ pub fn setup(
     commands.insert_resource(recompute_network_area(&[]));
     commands.insert_resource(MapView::default());
     commands.insert_resource(BasePosition::default());
+    commands.insert_resource(BaseInWaterWarning::default());
     commands.insert_resource(SpawnedTiles::default());
 
     let p = theme.palette();
@@ -762,35 +775,64 @@ pub fn add_point_on_click(
 /// Base placements farther than this from the network-area square are rejected.
 const MAX_BASE_DISTANCE_KM: f64 = 3.0;
 
+/// What a single click while placing the base resolves to. Split out of
+/// `place_base_on_click` as a pure function — mirrors `distance_to_square_km`
+/// and `recompute_network_area` — so the water/distance rejection logic is
+/// testable without spinning up ECS scaffolding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseClickOutcome {
+    /// On land and within `MAX_BASE_DISTANCE_KM` — the base goes here.
+    Placed,
+    /// Not on land (sea, or outside Sweden) — see `BaseInWaterWarning`.
+    Water,
+    /// On land, but farther than `MAX_BASE_DISTANCE_KM` from the area.
+    TooFar,
+}
+
+fn evaluate_base_click(lon: f64, lat: f64, net: &NetworkArea) -> BaseClickOutcome {
+    if !sweden_geo::point_in_sweden(lon, lat) {
+        return BaseClickOutcome::Water;
+    }
+    if net.distance_to_square_km(lat, lon) <= MAX_BASE_DISTANCE_KM {
+        BaseClickOutcome::Placed
+    } else {
+        BaseClickOutcome::TooFar
+    }
+}
+
 /// Place (or cancel placing) the base while in `PlacingBase` mode. Must land
-/// within `MAX_BASE_DISTANCE_KM` of the network-area square.
+/// on land (see `BaseInWaterWarning`) and within `MAX_BASE_DISTANCE_KM` of
+/// the network-area square.
 pub fn place_base_on_click(
     map_q: Query<(&Interaction, &RelativeCursorPosition), (With<MapViewport>, Changed<Interaction>)>,
     mut mode: ResMut<PickMode>,
     net: Res<NetworkArea>,
     view: Res<MapView>,
     mut base: ResMut<BasePosition>,
+    mut water_warning: ResMut<BaseInWaterWarning>,
 ) {
     if *mode != PickMode::PlacingBase {
+        // Leaving the mode shouldn't leave a stale "that's water" warning
+        // sitting around the next time this mode is entered.
+        water_warning.0 = false;
         return;
     }
     for (interaction, cursor) in &map_q {
-        info!("[base] viewport interaction changed to {interaction:?} while placing base");
         if *interaction != Interaction::Pressed {
             continue;
         }
         let Some(normalized) = cursor.normalized else {
-            warn!("[base] click registered but cursor.normalized was None — no position to place at");
             continue;
         };
         let (lon, lat) = cursor_to_lonlat(normalized, &view);
-        let distance = net.distance_to_square_km(lat, lon);
-        info!(
-            "[base] click at normalized {normalized:?} -> lon={lon:.5} lat={lat:.5}, {distance:.3} km from area (limit {MAX_BASE_DISTANCE_KM})"
-        );
-        if distance <= MAX_BASE_DISTANCE_KM {
-            base.0 = Some((lat, lon));
-            *mode = PickMode::Reviewing;
+        match evaluate_base_click(lon, lat, &net) {
+            BaseClickOutcome::Placed => {
+                base.0 = Some((lat, lon));
+                *mode = PickMode::Reviewing;
+                water_warning.0 = false;
+            }
+            BaseClickOutcome::Water => water_warning.0 = true,
+            BaseClickOutcome::TooFar => water_warning.0 = false,
         }
     }
 }
@@ -1306,6 +1348,7 @@ pub fn update_status_text(
     net: Res<NetworkArea>,
     mode: Res<PickMode>,
     base: Res<BasePosition>,
+    water_warning: Res<BaseInWaterWarning>,
     theme: Res<Theme>,
     mut summary_q: Query<&mut Text, (With<SummaryText>, Without<WarningText>, Without<AddStopLabel>, Without<SetBaseLabel>)>,
     mut warning_q: Query<&mut Text, (With<WarningText>, Without<SummaryText>, Without<AddStopLabel>, Without<SetBaseLabel>)>,
@@ -1335,6 +1378,8 @@ pub fn update_status_text(
     if let Ok(mut text) = warning_q.single_mut() {
         **text = if net.over_limit {
             format!("Area is {:.1} km — over the {MAX_SIDE_KM:.0} km limit. Remove or move points.", net.side_km)
+        } else if *mode == PickMode::PlacingBase && water_warning.0 {
+            "That's water — the base needs to sit on land. Try a spot closer to the area.".into()
         } else if *mode == PickMode::PlacingBase {
             format!("Click within {MAX_BASE_DISTANCE_KM:.0} km of the network area to place the base.")
         } else if net.valid && base.0.is_none() {
@@ -1579,5 +1624,47 @@ mod tests {
                 "clicking the area's own center at zoom {zoom} landed {distance:.4} km away — should be ~0"
             );
         }
+    }
+
+    /// A click on land, within range of the area, places the base.
+    #[test]
+    fn base_click_on_land_within_range_is_placed() {
+        // Tight triangle around Stockholm City Hall, on solid ground (not
+        // one of the city's many waterways) — unlike the wider Stockholm-
+        // area triangle used elsewhere in this module, whose computed
+        // bounding-square center can itself land in water in an archipelago
+        // city, which isn't what this test is checking.
+        let points = [(59.3275, 18.0645), (59.3300, 18.0700), (59.3250, 18.0700)];
+        let net = recompute_network_area(&points);
+        assert!(net.valid, "test setup: 3 points should form a valid area");
+
+        assert_eq!(evaluate_base_click(18.0645, 59.3275, &net), BaseClickOutcome::Placed);
+    }
+
+    /// A click out in open water — nowhere near any coastline — is rejected
+    /// as water, not silently treated as "too far".
+    #[test]
+    fn base_click_in_open_sea_is_rejected_as_water() {
+        let points = [(59.0, 18.0), (59.05, 18.05), (58.98, 18.06)];
+        let net = recompute_network_area(&points);
+        assert!(net.valid, "test setup: 3 points should form a valid area");
+
+        // Open Baltic Sea east of Stockholm — far enough out to clear any
+        // coastline/archipelago detail in `sweden_geo`'s polygons.
+        let (lon, lat) = (19.8, 59.0);
+        assert_eq!(evaluate_base_click(lon, lat, &net), BaseClickOutcome::Water);
+    }
+
+    /// A click on land, but well outside `MAX_BASE_DISTANCE_KM` of the area,
+    /// is rejected as too far — not confused with a water rejection.
+    #[test]
+    fn base_click_on_distant_land_is_rejected_as_too_far() {
+        let points = [(59.0, 18.0), (59.05, 18.05), (58.98, 18.06)];
+        let net = recompute_network_area(&points);
+        assert!(net.valid, "test setup: 3 points should form a valid area");
+
+        // Goteborg — on land, but nowhere near this Stockholm-area network.
+        let (lon, lat) = (11.9746, 57.7089);
+        assert_eq!(evaluate_base_click(lon, lat, &net), BaseClickOutcome::TooFar);
     }
 }
