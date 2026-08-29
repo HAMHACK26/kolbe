@@ -143,6 +143,7 @@ fn main() {
         .init_resource::<networking::ReconnectBus>()
         .init_resource::<networking::ReconnectRequests>()
         .init_resource::<ui::NetworkTablePanelOpen>()
+        .init_resource::<ui::UiPointerCapture>()
         .init_resource::<tiles::TileCache>()
         // `OnEnter(AreaSelection)` can run before deferred Startup commands
         // are applied, while its UI builders require this resource. A default
@@ -199,6 +200,7 @@ fn main() {
         .add_systems(OnExit(AppState::Simulation), teardown_simulation)
         .add_systems(Update, ui::reset_button_interactions.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_speed_label.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, ui::update_network_table.run_if(in_state(AppState::Simulation)))
         .add_systems(
             Update,
             (
@@ -260,6 +262,7 @@ fn main() {
                 seeking::seek_lost_links,
                 networking::detect_links_and_send_headers,
                 networking::detect_base_links_and_send_headers,
+                networking::retain_mutual_links,
                 networking::route_packets,
                 base::update_base_comms,
                 // Partition detection + recovery run last — they need the
@@ -272,6 +275,7 @@ fn main() {
                 // them. Both write velocity, so they must land after recovery
                 // (which owns velocity for the drones it is flying home).
                 navigation::reroll_drift_vectors,
+                navigation::navigate_launch_targets,
                 navigation::drift_navigate,
                 // Last word on velocity: the proximity ring deflects whatever
                 // the navigators above just committed to, before

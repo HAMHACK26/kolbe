@@ -14,8 +14,8 @@ use crate::{
     seeking::SeekState,
     theme::{Theme, ThemeRole},
     ui::{
-        InfoPopup, InfoPopupTable, InfoPopupTitle, NetworkTableButton, NetworkTablePanelText,
-        NetworkTablePopup,
+        InfoPopup, InfoPopupTable, InfoPopupTitle, NetworkTableButton, NetworkTableGrid,
+        NetworkTablePopup, NetworkTableSummary, NetworkTableTitle,
     },
 };
 
@@ -25,13 +25,18 @@ pub const WORLD_SIZE: f32 = 20.0;
 pub const COVERAGE_REDUNDANCY: f32 = 0.15;
 /// A temporary mesh always launches enough nodes for multiple redundant
 /// routes, even when its selected target fits inside one radio cell.
-pub const MIN_MESH_DRONES: usize = 6;
+pub const MIN_MESH_DRONES: usize = 5;
 /// Physical safety radius of a drone, km, used by ground clearance and
 /// avoidance.
 pub const DRONE_RADIUS: f32 = 0.045;
 /// Rendered marker radius, km. Kept separate from the safety envelope so the
 /// map reads as aircraft rather than oversized balls.
-pub const DRONE_RENDER_RADIUS: f32 = DRONE_RADIUS / 4.0;
+pub const DRONE_RENDER_RADIUS: f32 = DRONE_RADIUS / 2.0;
+
+/// A pre-briefed, base-relative mission slot. Drones launch from the base and
+/// fly to this target before beginning random in-area patrol.
+#[derive(Component)]
+pub struct LaunchTarget(pub Vec3);
 
 /// Fixed seed for the spawn scatter and each drone's drift stream, so a run is
 /// reproducible: same layout, same sequence of direction changes.
@@ -227,7 +232,7 @@ pub fn setup(
         })
         .collect();
 
-    for (i, (_drone_pos, networking)) in placed.into_iter().enumerate() {
+    for (i, (drone_pos, networking)) in placed.into_iter().enumerate() {
         // Airframes launch from the ground station. `drone_pos` remains in
         // the pre-flight briefing as this slot's base-relative reference,
         // while the live transform begins at the shared base origin.
@@ -290,6 +295,7 @@ pub fn setup(
                 },
             )
             .id();
+        commands.entity(drone_entity).insert(LaunchTarget(drone_pos));
 
         for (antenna_index, antenna) in antennas.iter().enumerate() {
             commands.spawn((
@@ -370,38 +376,73 @@ pub fn setup(
             });
         });
 
-    // Network table window — a separate popup, same look as the info popup.
-    // Its lifecycle is tied to the info popup (see `update_popup_position`):
-    // closing the info popup closes this too.
+    // Mesh debug panel. Docked to the left edge rather than floating beside
+    // the selected node: this is read while watching drones move, so it must
+    // hold still and stay wide enough for aligned columns. Visibility is
+    // still tied to having something selected *and* the button toggled on
+    // (see `ui::update_network_table`).
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                top: Val::Px(0.0),
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(8.0)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
+                left: Val::Px(16.0),
+                top: Val::Px(62.0),
+                bottom: Val::Px(16.0),
+                width: Val::Px(470.0),
+                padding: UiRect::all(Val::Px(12.0)),
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(2.0),
-                max_width: Val::Px(280.0),
+                row_gap: Val::Px(8.0),
+                overflow: Overflow::clip_y(),
                 ..default()
             },
-            BackgroundColor(pal.surface.with_alpha(0.88)),
+            BackgroundColor(pal.surface.with_alpha(0.93)),
             Visibility::Hidden,
             NetworkTablePopup,
             crate::SimulationEntity,
         ))
         .with_children(|p| {
             p.spawn((
-                Text::new("Network Table"),
-                TextFont { font_size: FontSize::Px(13.0), ..default() },
-                TextColor(pal.text),
+                Text::new("MESH DEBUG"),
+                TextFont { font_size: FontSize::Px(12.0), ..default() },
+                TextColor(pal.accent),
+                NetworkTableTitle,
+            ));
+            // Selected node's own state: what it knows, where it thinks it
+            // is, and whether it believes it is inside the target area.
+            p.spawn((
+                Node {
+                    display: Display::Grid,
+                    grid_template_columns: vec![
+                        RepeatedGridTrack::px(1, 132.0),
+                        RepeatedGridTrack::flex(1, 1.0),
+                    ],
+                    column_gap: Val::Px(8.0),
+                    row_gap: Val::Px(2.0),
+                    ..default()
+                },
+                NetworkTableSummary,
             ));
             p.spawn((
-                Text::new(""),
-                TextFont { font_size: FontSize::Px(11.0), ..default() },
-                TextColor(pal.subtext),
-                NetworkTablePanelText,
+                Node { height: Val::Px(1.0), width: Val::Percent(100.0), ..default() },
+                BackgroundColor(pal.text.with_alpha(0.18)),
+            ));
+            // The gossiped mesh body table, one row per known peer.
+            p.spawn((
+                Node {
+                    display: Display::Grid,
+                    grid_template_columns: vec![
+                        RepeatedGridTrack::px(1, 76.0),
+                        RepeatedGridTrack::px(1, 28.0),
+                        RepeatedGridTrack::px(1, 46.0),
+                        RepeatedGridTrack::px(1, 54.0),
+                        RepeatedGridTrack::px(1, 54.0),
+                        RepeatedGridTrack::flex(1, 1.0),
+                    ],
+                    column_gap: Val::Px(6.0),
+                    row_gap: Val::Px(1.0),
+                    ..default()
+                },
+                NetworkTableGrid,
             ));
         });
 }
@@ -498,7 +539,7 @@ mod tests {
 
     #[test]
     fn redundant_formation_keeps_neighbour_spacing_safe() {
-        let volume = PatrolVolume::inset(30.0, BOUNDARY_MARGIN_KM);
+        let volume = PatrolVolume::inset(20.0, BOUNDARY_MARGIN_KM);
         let count = drones_required_for_coverage(&volume);
         let columns = (count as f32).sqrt().ceil() as usize;
         let rows = count.div_ceil(columns);

@@ -4,7 +4,7 @@ use crate::{
     antenna::Antenna,
     base::{Base, BaseNetworkState},
     drone::{Drone, DroneType, SelectedDrone},
-    networking::MeshTable,
+    networking::{DroneClock, DroneUuid, LinkSet, MeshTable, TargetAreaVectors},
     navigation::{MAX_MOVEMENT_SPEED, MIN_MOVEMENT_SPEED, MOVEMENT_SPEED_STEP, MovementSpeed},
     theme::Theme,
 };
@@ -83,9 +83,17 @@ pub struct InfoPopupTable;
 #[derive(Component)]
 pub struct NetworkTableButton;
 
-/// Text node showing the selected drone's mesh body table.
+/// Heading of the mesh debug panel.
 #[derive(Component)]
-pub struct NetworkTablePanelText;
+pub struct NetworkTableTitle;
+
+/// Grid holding the selected node's own state (label/value pairs).
+#[derive(Component)]
+pub struct NetworkTableSummary;
+
+/// Grid holding one row per known mesh peer.
+#[derive(Component)]
+pub struct NetworkTableGrid;
 
 /// Whether the network table panel is expanded. Toggled by `NetworkTableButton`.
 #[derive(Resource, Default)]
@@ -96,6 +104,11 @@ pub struct SpeedLabel;
 
 #[derive(Component)]
 pub struct SpeedFill;
+
+/// True while a UI control owns a pointer gesture. World/map navigation must
+/// not interpret the same drag as an orbit or pan.
+#[derive(Resource, Default)]
+pub struct UiPointerCapture(pub bool);
 
 const SPEED_SLIDER_WIDTH_PX: f32 = 120.0;
 
@@ -152,6 +165,14 @@ pub fn spawn_speed_control(mut commands: Commands, theme: Res<Theme>) {
                 },
                 BackgroundColor(pal.text.with_alpha(0.18)),
             ))
+            .observe(|mut event: On<Pointer<Press>>, mut capture: ResMut<UiPointerCapture>| {
+                event.propagate(false);
+                capture.0 = true;
+            })
+            .observe(|mut event: On<Pointer<Release>>, mut capture: ResMut<UiPointerCapture>| {
+                event.propagate(false);
+                capture.0 = false;
+            })
             .observe(|mut event: On<Pointer<Drag>>, mut speed: ResMut<MovementSpeed>| {
                 event.propagate(false);
                 let span = MAX_MOVEMENT_SPEED - MIN_MOVEMENT_SPEED;
@@ -219,13 +240,6 @@ pub fn update_popup_position(
     mut popup_q: Query<(&mut Node, &mut Visibility), With<InfoPopup>>,
     mut title_q: Query<&mut Text, With<InfoPopupTitle>>,
     table_q: Query<(Entity, Option<&Children>), With<InfoPopupTable>>,
-    table_open: Res<NetworkTablePanelOpen>,
-    mesh_tables_q: Query<&MeshTable>,
-    mut net_popup_q: Query<
-        (&mut Node, &mut Visibility),
-        (With<NetworkTablePopup>, Without<InfoPopup>),
-    >,
-    mut table_text_q: Query<&mut Text, (With<NetworkTablePanelText>, Without<InfoPopupTitle>)>,
     theme: Res<Theme>,
     mut last_sig: Local<String>,
 ) {
@@ -239,48 +253,12 @@ pub fn update_popup_position(
     let Ok((table_entity, table_children)) = table_q.single() else {
         return;
     };
-    let mut net_popup = net_popup_q.single_mut().ok();
-    let mut table_text = table_text_q.single_mut().ok();
 
     let Some(entity) = selected.0 else {
         *vis = Visibility::Hidden;
         last_sig.clear();
-        if let Some((_, ref mut net_vis)) = net_popup {
-            **net_vis = Visibility::Hidden;
-        }
-        if let Some(ref mut t) = table_text {
-            **t = Text::new("");
-        }
         return;
     };
-
-    // Live network-table readout — refreshed every frame while the panel is
-    // open, independent of the antenna-table rebuild below.
-    if let Some(ref mut t) = table_text {
-        **t = Text::new(if let Ok(mesh) = mesh_tables_q.get(entity) {
-            if mesh.0.is_empty() {
-                "no known peers yet".into()
-            } else {
-                let mut rows: Vec<_> = mesh.0.values().collect();
-                rows.sort_by(|a, b| a.id.cmp(&b.id));
-                rows.iter()
-                    .map(|r| {
-                        format!(
-                            "id: {}\n  t: {:.3}  loc: {:.3?}\n  dist: {}  conn: [{}]",
-                            r.id,
-                            r.timestamp,
-                            r.location,
-                            r.neighbour_distance,
-                            r.connections.join(", ")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        } else {
-            "base has no network table".into()
-        });
-    }
 
     // Resolve world position + table content from either a drone or the base.
     let (world_pos, title_str, rows) = if let Ok((gt, drone)) = drones.get(entity) {
@@ -298,9 +276,6 @@ pub fn update_popup_position(
     } else {
         *vis = Visibility::Hidden;
         last_sig.clear();
-        if let Some((_, ref mut net_vis)) = net_popup {
-            **net_vis = Visibility::Hidden;
-        }
         return;
     };
 
@@ -309,28 +284,12 @@ pub fn update_popup_position(
     };
     let Ok(screen_pos) = camera.world_to_viewport(cam_gt, world_pos) else {
         *vis = Visibility::Hidden;
-        if let Some((_, ref mut net_vis)) = net_popup {
-            **net_vis = Visibility::Hidden;
-        }
         return;
     };
 
     *vis = Visibility::Visible;
     node.left = Val::Px(screen_pos.x + 14.0);
     node.top = Val::Px(screen_pos.y - 10.0);
-
-    // Network table window — a second window tied to this one's lifecycle:
-    // open only while a drone/base is selected (above) *and* the button has
-    // toggled it on; closing the info popup always closes this too.
-    if let Some((ref mut net_node, ref mut net_vis)) = net_popup {
-        if table_open.0 {
-            **net_vis = Visibility::Visible;
-            net_node.left = Val::Px(screen_pos.x + 14.0);
-            net_node.top = Val::Px(screen_pos.y + 130.0);
-        } else {
-            **net_vis = Visibility::Hidden;
-        }
-    }
 
     // Rebuild the grid only when the selected content (or theme) changes.
     let sig = format!("{}|{title_str}|{rows:?}", theme.dark);
@@ -398,4 +357,318 @@ fn antenna_rows(antennas: &[Antenna]) -> Vec<[String; COLS]> {
             ]
         })
         .collect()
+}
+
+// ─── Mesh debug panel ───────────────────────────────────────────────────────
+
+/// Columns of the mesh body table, in display order.
+const MESH_HEADER: [&str; 6] = ["ID", "HOP", "AGE", "X", "Z", "CONN"];
+
+/// How many peer rows the panel will draw before summarising the remainder.
+/// Enough to see a whole 74-airframe mesh's near neighbourhood without the
+/// grid running off the bottom of the window.
+const MAX_MESH_ROWS: usize = 26;
+
+/// Fill the docked mesh debug panel for whatever node is selected.
+///
+/// Kept out of `update_popup_position` because it answers a different
+/// question: that popup says what the antennas are doing, this says what the
+/// node *knows* — the gossiped table, the target-area vectors it was briefed
+/// with, and whether it currently believes itself inside that area. Those
+/// three together are what a stuck or wandering drone has to be diagnosed
+/// from, so they belong side by side and pinned in place.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // Queries are distinct Bevy system inputs.
+pub fn update_network_table(
+    mut commands: Commands,
+    selected: Res<SelectedDrone>,
+    table_open: Res<NetworkTablePanelOpen>,
+    theme: Res<Theme>,
+    fonts: Res<crate::UiFonts>,
+    drones: Query<(
+        &Drone,
+        &GlobalTransform,
+        &DroneUuid,
+        &DroneClock,
+        &LinkSet,
+        &MeshTable,
+        &TargetAreaVectors,
+        Option<&crate::world::LaunchTarget>,
+    )>,
+    node_bases: Query<(
+        &Base,
+        &DroneUuid,
+        &DroneClock,
+        &LinkSet,
+        &MeshTable,
+        &TargetAreaVectors,
+    )>,
+    bases: Query<&Base>,
+    mut panel_q: Query<&mut Visibility, With<NetworkTablePopup>>,
+    mut title_q: Query<&mut Text, With<NetworkTableTitle>>,
+    summary_q: Query<(Entity, Option<&Children>), With<NetworkTableSummary>>,
+    grid_q: Query<(Entity, Option<&Children>), (With<NetworkTableGrid>, Without<NetworkTableSummary>)>,
+    mut last_sig: Local<String>,
+) {
+    let Ok(mut vis) = panel_q.single_mut() else {
+        return;
+    };
+    let open = table_open.0 && selected.0.is_some();
+    *vis = if open { Visibility::Visible } else { Visibility::Hidden };
+    if !open {
+        last_sig.clear();
+        return;
+    }
+    let entity = selected.0.expect("checked by `open`");
+    let base_pos = bases.iter().next().map(|base| base.position);
+
+    let (title, summary, mesh) = if let Ok(node) = drones.get(entity) {
+        drone_debug(node, base_pos)
+    } else if let Ok(node) = node_bases.get(entity) {
+        base_debug(node)
+    } else {
+        last_sig.clear();
+        return;
+    };
+
+    // The signature is built from the *rendered* strings, so the grid only
+    // rebuilds when something a reader could actually see has changed. That
+    // also throttles it naturally: a position formatted to 2 dp settles long
+    // before the float does.
+    let sig = format!("{}|{title}|{summary:?}|{mesh:?}", theme.dark);
+    if *last_sig == sig {
+        return;
+    }
+    *last_sig = sig;
+
+    let pal = theme.palette();
+    if let Ok(mut text) = title_q.single_mut() {
+        **text = title;
+    }
+
+    let label_font = || TextFont { font_size: FontSize::Px(10.0), ..default() };
+    let value_font = || TextFont {
+        font: fonts.mono.clone().into(),
+        font_size: FontSize::Px(11.0),
+        ..default()
+    };
+
+    if let Ok((summary_entity, children)) = summary_q.single() {
+        if let Some(children) = children {
+            for &child in children {
+                commands.entity(child).despawn();
+            }
+        }
+        commands.entity(summary_entity).with_children(|grid| {
+            for (label, value, tone) in &summary {
+                grid.spawn((Text::new(label.clone()), label_font(), TextColor(pal.subtext)));
+                grid.spawn((
+                    Text::new(value.clone()),
+                    value_font(),
+                    TextColor(match tone {
+                        Tone::Normal => pal.text,
+                        Tone::Good => pal.accent,
+                        Tone::Bad => pal.danger,
+                    }),
+                ));
+            }
+        });
+    }
+
+    if let Ok((grid_entity, children)) = grid_q.single() {
+        if let Some(children) = children {
+            for &child in children {
+                commands.entity(child).despawn();
+            }
+        }
+        commands.entity(grid_entity).with_children(|grid| {
+            for header in MESH_HEADER {
+                grid.spawn((Text::new(header), label_font(), TextColor(pal.accent)));
+            }
+            for row in &mesh {
+                for cell in row {
+                    grid.spawn((Text::new(cell.clone()), value_font(), TextColor(pal.text)));
+                }
+            }
+        });
+    }
+}
+
+/// How a summary value should read at a glance.
+#[derive(Debug, PartialEq, Eq)]
+enum Tone {
+    Normal,
+    /// The system is where it should be.
+    Good,
+    /// Something the operator has to act on.
+    Bad,
+}
+
+type SummaryRow = (String, String, Tone);
+type MeshRowCells = [String; 6];
+
+/// Short form of a UUID — enough to tell rows apart, not so much that the
+/// column eats the panel.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn vec_xz(v: Vec3) -> String {
+    format!("{:+.2} {:+.2}", v.x, v.z)
+}
+
+fn drone_debug(
+    (drone, transform, uuid, clock, links, table, target_area, launch): (
+        &Drone,
+        &GlobalTransform,
+        &DroneUuid,
+        &DroneClock,
+        &LinkSet,
+        &MeshTable,
+        &TargetAreaVectors,
+        Option<&crate::world::LaunchTarget>,
+    ),
+    base_pos: Option<Vec3>,
+) -> (String, Vec<SummaryRow>, Vec<MeshRowCells>) {
+    let position = transform.translation();
+    let from_base = base_pos.map(|base| position - base);
+
+    let mut summary = vec![
+        ("UUID".into(), short_id(&uuid.0), Tone::Normal),
+        ("CLOCK".into(), format!("{:.3} s", clock.now), Tone::Normal),
+        (
+            "DIRECT LINKS".into(),
+            format!("{}", links.connected.len()),
+            if links.connected.is_empty() { Tone::Bad } else { Tone::Good },
+        ),
+        ("TABLE ROWS".into(), format!("{}", table.0.len()), Tone::Normal),
+        ("POSITION".into(), vec_xz(position), Tone::Normal),
+        (
+            "FROM BASE".into(),
+            from_base.map_or_else(|| "no base".into(), vec_xz),
+            Tone::Normal,
+        ),
+    ];
+
+    // The whole point of the briefing: did the corners arrive, and what does
+    // this drone conclude from them about its own position?
+    match target_area.corners_from_base.as_deref() {
+        Some(corners) => {
+            summary.push((
+                "AREA VECTORS".into(),
+                format!("{} pts @ {:.2} s", corners.len(), target_area.received_at),
+                Tone::Good,
+            ));
+            for (i, corner) in corners.iter().enumerate() {
+                summary.push((format!("  CORNER {}", i + 1), vec_xz(*corner), Tone::Normal));
+            }
+            let inside = from_base.map(|v| crate::navigation::target_contains(v, corners));
+            summary.push(match inside {
+                Some(true) => ("INSIDE AREA".into(), "YES".into(), Tone::Good),
+                Some(false) => ("INSIDE AREA".into(), "NO — INGRESS".into(), Tone::Bad),
+                None => ("INSIDE AREA".into(), "unknown".into(), Tone::Bad),
+            });
+        }
+        None => summary.push(("AREA VECTORS".into(), "NOT RECEIVED".into(), Tone::Bad)),
+    }
+
+    summary.push(match launch {
+        Some(target) => ("LAUNCH TARGET".into(), vec_xz(target.0), Tone::Normal),
+        None => ("LAUNCH TARGET".into(), "on station".into(), Tone::Normal),
+    });
+
+    (
+        format!("MESH DEBUG  ·  {}", drone.id),
+        summary,
+        mesh_rows(table, clock.now),
+    )
+}
+
+fn base_debug(
+    (base, uuid, clock, links, table, target_area): (
+        &Base,
+        &DroneUuid,
+        &DroneClock,
+        &LinkSet,
+        &MeshTable,
+        &TargetAreaVectors,
+    ),
+) -> (String, Vec<SummaryRow>, Vec<MeshRowCells>) {
+    let mut summary = vec![
+        ("UUID".into(), short_id(&uuid.0), Tone::Normal),
+        ("CLOCK".into(), format!("{:.3} s", clock.now), Tone::Normal),
+        (
+            "DIRECT LINKS".into(),
+            format!("{}", links.connected.len()),
+            if links.connected.is_empty() { Tone::Bad } else { Tone::Good },
+        ),
+        ("TABLE ROWS".into(), format!("{}", table.0.len()), Tone::Normal),
+        ("POSITION".into(), vec_xz(base.position), Tone::Normal),
+    ];
+
+    // Where each sector antenna is currently pointed. All five reading the
+    // same bearing means they are all aimed at co-located drones — which is
+    // exactly what launch looks like before anything has moved.
+    for (i, antenna) in base.antennas.iter().enumerate() {
+        summary.push((
+            format!("  ANT {} AZ/EL", i + 1),
+            format!("{:>6.1} {:>6.1}", antenna.azimuth_deg, antenna.elevation_deg),
+            Tone::Normal,
+        ));
+    }
+
+    match target_area.corners_from_base.as_deref() {
+        Some(corners) => {
+            summary.push((
+                "AREA VECTORS".into(),
+                format!("BROADCASTING {} pts", corners.len()),
+                Tone::Good,
+            ));
+            for (i, corner) in corners.iter().enumerate() {
+                summary.push((format!("  CORNER {}", i + 1), vec_xz(*corner), Tone::Normal));
+            }
+        }
+        None => summary.push(("AREA VECTORS".into(), "NONE — NOT SENT".into(), Tone::Bad)),
+    }
+
+    (
+        format!("MESH DEBUG  ·  {}", base.id),
+        summary,
+        mesh_rows(table, clock.now),
+    )
+}
+
+/// Mesh body table as display rows, nearest hop first then by age.
+fn mesh_rows(table: &MeshTable, now: f64) -> Vec<MeshRowCells> {
+    let mut rows: Vec<_> = table.0.values().collect();
+    rows.sort_by(|a, b| {
+        a.neighbour_distance
+            .cmp(&b.neighbour_distance)
+            .then((now - a.timestamp).total_cmp(&(now - b.timestamp)))
+    });
+
+    let shown = rows.len().min(MAX_MESH_ROWS);
+    let mut cells: Vec<MeshRowCells> = rows[..shown]
+        .iter()
+        .map(|row| {
+            [
+                short_id(&row.id),
+                format!("{}", row.neighbour_distance),
+                format!("{:.2}", now - row.timestamp),
+                format!("{:+.2}", row.location.x),
+                format!("{:+.2}", row.location.z),
+                format!("{}", row.connections.len()),
+            ]
+        })
+        .collect();
+    if rows.len() > shown {
+        cells.push([
+            format!("+{}", rows.len() - shown),
+            "more".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ]);
+    }
+    cells
 }

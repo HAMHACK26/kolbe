@@ -276,6 +276,38 @@ pub fn avoidance_velocity(
     Vec3::new(commanded.x, planned_velocity.y, commanded.z)
 }
 
+/// A reproducible horizontal bearing used only when two solid bodies begin at
+/// exactly the same point.  A geometric offset has no direction in that case;
+/// using one global fallback (formerly `+X`) makes an entire launch stack fly
+/// as one.  Per-airframe bearings let the launch controller keep its distinct
+/// target for each drone while the proximity ring separates the stack.
+fn coincident_offset(self_entity: Entity, other: Option<Entity>) -> Vec3 {
+    let direction = |seed: u64| {
+        let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let angle = (mixed as f64 / (u64::MAX as f64 + 1.0) * std::f64::consts::TAU) as f32;
+        Vec3::new(angle.cos(), 0.0, angle.sin())
+    };
+
+    match other {
+        Some(other_entity) => {
+            let self_id = self_entity.to_bits();
+            let other_id = other_entity.to_bits();
+            let bearing = direction(self_id.min(other_id) ^ self_id.max(other_id).rotate_left(32));
+            // The two airframes must see one another on opposite bearings so
+            // their avoidance commands are opposite too.
+            if self_id < other_id {
+                bearing
+            } else {
+                -bearing
+            }
+        }
+        // A co-located ground station has no entity in the solid snapshot.
+        // Point its synthetic offset *toward* the station, making the escape
+        // vector point out along this drone's own stable launch bearing.
+        None => -direction(self_entity.to_bits()),
+    }
+}
+
 /// Run every drone's proximity ring and deflect its velocity accordingly.
 ///
 /// Must be ordered after the systems that write [`DroneKinematics::velocity`]
@@ -301,10 +333,16 @@ pub fn avoid_collisions(
     // access to its own kinematics while still reading every *other* drone's
     // position, which it can't do while holding an iterator over the same
     // query.
-    let mut solids: Vec<(Option<Entity>, Vec3, f32)> =
-        drones.iter().map(|(e, t, _)| (Some(e), t.translation, DRONE_RADIUS)).collect();
+    let mut solids: Vec<(Option<Entity>, Vec3, f32)> = drones
+        .iter()
+        .map(|(e, t, _)| (Some(e), t.translation, DRONE_RADIUS))
+        .collect();
     solids.extend(bases.iter().map(|t| (None, t.translation, BASE_RADIUS_KM)));
-    solids.extend(props.iter().map(|(t, o)| (None, t.translation, o.radius_km)));
+    solids.extend(
+        props
+            .iter()
+            .map(|(t, o)| (None, t.translation, o.radius_km)),
+    );
 
     for (entity, transform, mut kinematics) in &mut drones {
         let self_pos = transform.translation;
@@ -312,9 +350,18 @@ pub fn avoid_collisions(
             .iter()
             // A drone is not an obstacle to itself.
             .filter(|(other, ..)| *other != Some(entity))
-            .map(|(_, pos, radius_km)| Detection {
-                offset: *pos - self_pos,
-                radius_km: *radius_km,
+            .map(|(other, pos, radius_km)| {
+                let mut offset = *pos - self_pos;
+                if Vec2::new(offset.x, offset.z).length_squared() <= 1e-12 {
+                    // Avoidance needs a bearing even for the launch stack.
+                    // Feed it a tiny, identity-derived offset rather than
+                    // allowing every drone to fall back to the same +X axis.
+                    offset = coincident_offset(entity, *other) * 1e-6;
+                }
+                Detection {
+                    offset,
+                    radius_km: *radius_km,
+                }
             })
             .collect();
 
@@ -404,8 +451,10 @@ mod demo {
     /// then let the ring veto, then integrate the vetoed velocity — the same
     /// order `run_recovery` → `avoid_collisions` → `apply_velocity` runs in.
     fn step(bodies: &mut [Body], limits: &FlightLimits, dt: f32) {
-        let snapshot: Vec<(Vec3, f32)> =
-            bodies.iter().map(|b| (b.state.position, b.radius_km)).collect();
+        let snapshot: Vec<(Vec3, f32)> = bodies
+            .iter()
+            .map(|b| (b.state.position, b.radius_km))
+            .collect();
 
         // Iterating mutably is safe alongside `snapshot` because that is an
         // independent copy taken before the loop — every body reacts to where
@@ -509,7 +558,9 @@ mod demo {
 
             // Settled into a standoff: everything mobile has effectively
             // stopped with the ring still holding it off.
-            let moving = bodies.iter().any(|b| b.waypoint.is_some() && b.speed_mps() > 0.01);
+            let moving = bodies
+                .iter()
+                .any(|b| b.waypoint.is_some() && b.speed_mps() > 0.01);
             if !moving && gap <= ring_m {
                 println!("  >> settled at t={t:.2}s");
                 break;
@@ -647,6 +698,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn co_located_airframes_receive_opposite_escape_bearings() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+
+        let a_to_b = coincident_offset(a, Some(b));
+        let b_to_a = coincident_offset(b, Some(a));
+        assert!(
+            (a_to_b + b_to_a).length() < 1e-6,
+            "offsets must oppose: {a_to_b:?}, {b_to_a:?}"
+        );
+        assert!(a_to_b.length() > 0.9, "synthetic bearing must be usable");
+    }
+
     /// Clear air is a strict no-op: a drone with nothing in sensor range must
     /// fly exactly the velocity its navigator planned.
     #[test]
@@ -663,7 +729,10 @@ mod tests {
         let planned = Vec3::new(0.01, 0.0, 0.0);
         let edge = detection_at(Vec3::X, SENSOR_RANGE_KM);
         let flown = avoid(planned, &[edge], 0.02);
-        assert!((flown - planned).length() < 1e-6, "deflected at the edge: {flown:?}");
+        assert!(
+            (flown - planned).length() < 1e-6,
+            "deflected at the edge: {flown:?}"
+        );
     }
 
     /// Flying straight at something close pushes back against the plan.
@@ -672,7 +741,10 @@ mod tests {
         let planned = Vec3::new(0.01, 0.0, 0.0);
         let ahead = detection_at(Vec3::X, SENSOR_RANGE_KM * 0.1);
         let flown = avoid(planned, &[ahead], 0.02);
-        assert!(flown.x < planned.x, "should have slowed or reversed: {flown:?}");
+        assert!(
+            flown.x < planned.x,
+            "should have slowed or reversed: {flown:?}"
+        );
     }
 
     /// The drone's own vertical velocity is the navigator's business — this
@@ -683,7 +755,10 @@ mod tests {
         // Obstacle directly overhead: same X/Z, far above. Its *horizontal*
         // separation is zero, so it is very much detected — and the response
         // must still be purely horizontal.
-        let overhead = Detection { offset: Vec3::new(0.0, 0.5, 0.0), radius_km: DRONE_RADIUS };
+        let overhead = Detection {
+            offset: Vec3::new(0.0, 0.5, 0.0),
+            radius_km: DRONE_RADIUS,
+        };
         assert_eq!(avoid(planned, &[overhead], 0.02).y, planned.y);
     }
 
@@ -693,7 +768,10 @@ mod tests {
     fn stationary_drone_is_pushed_clear() {
         let close = detection_at(Vec3::X, SENSOR_RANGE_KM * 0.05);
         let flown = avoid(Vec3::ZERO, &[close], 0.02);
-        assert!(flown.x < 0.0, "should back away from +X obstacle: {flown:?}");
+        assert!(
+            flown.x < 0.0,
+            "should back away from +X obstacle: {flown:?}"
+        );
     }
 
     /// Pinched between two obstacles on opposite sides, the repulsions cancel
@@ -774,8 +852,14 @@ mod tests {
     fn head_on(limits: &FlightLimits, runway_km: f32) -> (f32, f32) {
         let dt = 0.02;
         let half_separation = DRONE_RADIUS + runway_km / 2.0;
-        let mut a = DroneState { position: Vec3::new(-half_separation, 0.0, 0.0), ..default() };
-        let mut b = DroneState { position: Vec3::new(half_separation, 0.0, 0.0), ..default() };
+        let mut a = DroneState {
+            position: Vec3::new(-half_separation, 0.0, 0.0),
+            ..default()
+        };
+        let mut b = DroneState {
+            position: Vec3::new(half_separation, 0.0, 0.0),
+            ..default()
+        };
         let mut min_gap = f32::MAX;
 
         for _ in 0..8000 {
@@ -791,7 +875,10 @@ mod tests {
                 a_flown,
                 a.velocity,
                 DRONE_RADIUS,
-                &[Detection { offset: b_pos - a_pos, radius_km: DRONE_RADIUS }],
+                &[Detection {
+                    offset: b_pos - a_pos,
+                    radius_km: DRONE_RADIUS,
+                }],
                 SENSOR_RANGE_KM,
                 limits,
                 dt,
@@ -800,7 +887,10 @@ mod tests {
                 b_flown,
                 b.velocity,
                 DRONE_RADIUS,
-                &[Detection { offset: a_pos - b_pos, radius_km: DRONE_RADIUS }],
+                &[Detection {
+                    offset: a_pos - b_pos,
+                    radius_km: DRONE_RADIUS,
+                }],
                 SENSOR_RANGE_KM,
                 limits,
                 dt,
@@ -817,7 +907,10 @@ mod tests {
                 break;
             }
         }
-        (min_gap, (b.position - a.position).length() - DRONE_RADIUS * 2.0)
+        (
+            min_gap,
+            (b.position - a.position).length() - DRONE_RADIUS * 2.0,
+        )
     }
 
     /// The headline behavior: two drones whose navigators are actively flying
@@ -838,7 +931,11 @@ mod tests {
         // anything.
         let (min_gap, final_gap) = head_on(&limits, 0.05);
 
-        assert!(min_gap > 0.0, "drones touched: closest gap was {} m", min_gap * 1000.0);
+        assert!(
+            min_gap > 0.0,
+            "drones touched: closest gap was {} m",
+            min_gap * 1000.0
+        );
         // And they should end in a standoff rather than still grinding
         // inward: the stable point is where the inward plan and the outward
         // escape run cancel, i.e. partway into the ring.
@@ -863,7 +960,11 @@ mod tests {
         assert!(6.8 > safe_closing_speed_mps(SENSOR_RANGE_M, accel));
 
         let (min_gap, _) = head_on(&limits, 0.05);
-        assert!(min_gap > 0.0, "drones touched: closest gap was {} m", min_gap * 1000.0);
+        assert!(
+            min_gap > 0.0,
+            "drones touched: closest gap was {} m",
+            min_gap * 1000.0
+        );
     }
 
     /// The documented limitation, pinned so it can't quietly rot into an
@@ -877,7 +978,7 @@ mod tests {
     #[test]
     fn cruise_speed_defeats_the_ring() {
         let limits = limits(); // default 15 m/s cap — 30 m/s closing
-        // 400 m of runway: `navigate` needs ~28 m to wind up to 15 m/s.
+                               // 400 m of runway: `navigate` needs ~28 m to wind up to 15 m/s.
         let (min_gap, _) = head_on(&limits, 0.4);
         assert!(
             min_gap <= 0.0,
@@ -900,7 +1001,11 @@ mod tests {
         use std::time::Duration;
 
         fn drone(id: &str) -> Drone {
-            Drone { id: id.into(), drone_type: DroneType::Node, antennas: Vec::new() }
+            Drone {
+                id: id.into(),
+                drone_type: DroneType::Node,
+                antennas: Vec::new(),
+            }
         }
 
         let mut app = App::new();
@@ -913,7 +1018,10 @@ mod tests {
             .spawn((
                 drone("A"),
                 Transform::from_xyz(0.0, 0.0, 0.0),
-                DroneKinematics { velocity: commanded, ..default() },
+                DroneKinematics {
+                    velocity: commanded,
+                    ..default()
+                },
             ))
             .id();
         // Sitting just inside the ring, straight ahead on +X.
@@ -923,10 +1031,17 @@ mod tests {
             DroneKinematics::default(),
         ));
 
-        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_millis(20));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(20));
         app.update();
 
-        let flown = app.world().entity(mover).get::<DroneKinematics>().unwrap().velocity;
+        let flown = app
+            .world()
+            .entity(mover)
+            .get::<DroneKinematics>()
+            .unwrap()
+            .velocity;
         assert!(flown.x < commanded.x, "system did not deflect: {flown:?}");
         assert_eq!(flown.y, commanded.y, "system touched vertical velocity");
     }
@@ -946,7 +1061,10 @@ mod tests {
     /// produce a finite, deterministic escape rather than a NaN.
     #[test]
     fn coincident_bodies_escape_deterministically() {
-        let coincident = Detection { offset: Vec3::ZERO, radius_km: DRONE_RADIUS };
+        let coincident = Detection {
+            offset: Vec3::ZERO,
+            radius_km: DRONE_RADIUS,
+        };
         let flown = avoid(Vec3::ZERO, &[coincident], 0.02);
         assert!(flown.is_finite());
         assert!(flown.length() > 0.0);

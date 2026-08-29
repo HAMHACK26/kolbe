@@ -94,6 +94,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -110,6 +111,18 @@ pub const FLIGHT_LOOKAHEAD_SECS: f32 = 0.1;
 
 /// How often a header resends while a link stays up (on the sender's own clock).
 pub const HEADER_INTERVAL_SECS: f64 = 0.1;
+
+/// Angular width of one ground-station antenna sector. Five antennas cover
+/// the full circle, so this is what `base::spawn_base` lays them out on.
+pub const BASE_SECTOR_DEG: f32 = 72.0;
+/// Resting elevation of a sector antenna with nobody in it — matches the
+/// initial aim `base::spawn_base` builds them with.
+pub const BASE_SECTOR_ELEVATION_DEG: f32 = 5.0;
+
+/// Signed difference `a - b`, folded into `[-180, 180)`.
+fn shortest_angle_deg(a: f32, b: f32) -> f32 {
+    (a - b + 540.0).rem_euclid(360.0) - 180.0
+}
 
 /// Speed of light (km/s) — ranging is in km.
 pub const SPEED_OF_LIGHT_KM_S: f64 = 299_792.458;
@@ -190,6 +203,19 @@ pub struct MeshRow {
 #[derive(Component, Default)]
 pub struct MeshTable(pub HashMap<String, MeshRow>);
 
+/// Target-area geometry as vectors from the ground station, one per corner of
+/// the mission boundary. The base is the source of truth; every mesh node
+/// relays the most recent copy in its regular 0.1 s header traffic.
+///
+/// Held behind an `Arc` because it rides in every header packet and those are
+/// cloned per link per tick — the geometry itself never changes during a run,
+/// so a refcount bump is the whole cost of passing it on.
+#[derive(Component, Clone, Debug, Default)]
+pub struct TargetAreaVectors {
+    pub corners_from_base: Option<Arc<[Vec3]>>,
+    pub received_at: f64,
+}
+
 /// This drone's fixed position in the ring formation (0..N). Used only to
 /// pick its two direct mesh neighbors — see `crate::tracking::maintain_mesh_antennas`.
 #[derive(Component)]
@@ -243,6 +269,7 @@ pub struct NetworkingBundle {
     pub sent: SentHeaders,
     pub ranging: RangingResults,
     pub mesh_table: MeshTable,
+    pub target_area: TargetAreaVectors,
     pub ring_index: RingIndex,
     pub tracked_peers: TrackedPeers,
     pub pairing: Pairing,
@@ -257,6 +284,7 @@ impl NetworkingBundle {
             sent: SentHeaders::default(),
             ranging: RangingResults::default(),
             mesh_table: MeshTable::default(),
+            target_area: TargetAreaVectors::default(),
             ring_index: RingIndex(ring_index),
             tracked_peers: TrackedPeers::default(),
             pairing: Pairing::default(),
@@ -311,6 +339,11 @@ pub struct Packet {
     /// UUIDs the sender is *directly* connected to right now — how the
     /// receiver fills in `connections` for the sender's own upserted row.
     pub origin_connections: Vec<String>,
+    /// The selected area, expressed only as vectors from the base. Present on
+    /// base headers and relayed verbatim by every drone that has received it.
+    /// The mission boundary, as vectors from the base. See
+    /// [`TargetAreaVectors`].
+    pub target_area: Option<Arc<[Vec3]>>,
 
     // Echo-only fields, filled by the responder.
     pub responder_pos: Vec3,
@@ -422,6 +455,7 @@ pub fn detect_links_and_send_headers(
         &mut LinkSet,
         &mut SentHeaders,
         &MeshTable,
+        &TargetAreaVectors,
     )>,
     positions: Query<(Entity, &GlobalTransform), With<Drone>>,
     uuids: Query<&DroneUuid>,
@@ -439,7 +473,7 @@ pub fn detect_links_and_send_headers(
     let base_peers: Vec<(Entity, Vec3)> =
         bases.iter().map(|(entity, base, _)| (entity, base.position)).collect();
 
-    for (self_entity, self_gt, drone, kin, clock, uuid, mut links, mut sent, table) in &mut drones
+    for (self_entity, self_gt, drone, kin, clock, uuid, mut links, mut sent, table, target_area) in &mut drones
     {
         let self_pos = self_gt.translation();
         let vector_from_base = self_pos - base_pos;
@@ -465,10 +499,10 @@ pub fn detect_links_and_send_headers(
         // participates in normal header/table routing.
         detected.extend(base_peers.iter().filter_map(|(entity, peer_pos)| {
             let distance_km = (*peer_pos - self_pos).length();
-            drone.antennas.iter().any(|antenna| {
+            (distance_km <= f32::EPSILON || drone.antennas.iter().any(|antenna| {
                 let theta = antenna.off_boresight_deg(kin.heading_deg, self_pos, *peer_pos);
                 antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm
-            }).then_some(*entity)
+            })).then_some(*entity)
         }));
         let origin_connections: Vec<String> =
             detected.iter().filter_map(|e| uuids.get(*e).ok().map(|u| u.0.clone())).collect();
@@ -506,6 +540,7 @@ pub fn detect_links_and_send_headers(
                     header: header.clone(),
                     body: body.clone(),
                     origin_connections: origin_connections.clone(),
+                    target_area: target_area.corners_from_base.clone(),
                     responder_pos: Vec3::ZERO,
                     responder_delay: 0.0,
                     arrival_time: 0.0,
@@ -526,31 +561,85 @@ pub fn detect_base_links_and_send_headers(
     mut mailbox: ResMut<Mailbox>,
     mut bases: Query<(
         Entity, &mut Base, &DroneClock, &DroneUuid, &mut LinkSet, &mut SentHeaders, &MeshTable,
+        &TargetAreaVectors,
     )>,
     drones: Query<(Entity, &GlobalTransform, &DroneUuid), With<Drone>>,
 ) {
-    for (base_entity, mut base, clock, uuid, mut links, mut sent, table) in &mut bases {
+    for (base_entity, mut base, clock, uuid, mut links, mut sent, table, target_area) in &mut bases {
         let base_pos = base.position;
         let mut peers: Vec<(Entity, Vec3, String)> = drones
             .iter()
             .map(|(entity, transform, peer_uuid)| (entity, transform.translation(), peer_uuid.0.clone()))
             .collect();
         peers.sort_by(|a, b| (a.1 - base_pos).length().total_cmp(&(b.1 - base_pos).length()));
-        peers.truncate(base.antennas.len());
 
-        // Each connector points at one closest candidate; the link budget is
-        // then evaluated from that connector's actual boresight.
-        for (antenna, (_, peer_pos, _)) in base.antennas.iter_mut().zip(&peers) {
-            let (azimuth_deg, elevation_deg) = crate::antenna::angles_toward(base_pos, *peer_pos);
-            antenna.azimuth_deg = azimuth_deg;
-            antenna.elevation_deg = elevation_deg;
+        // Point one antenna at each connected drone.
+        //
+        // Two earlier versions of this got it wrong in opposite directions.
+        // Zipping antennas against the five nearest peers aimed every one of
+        // them at the same cluster. Pinning each antenna to its own 72 degree
+        // sector fixed that but broke the more important case: with four
+        // drones on one bearing, one antenna tracked them and the other four
+        // sat at their sector centres pointing at empty sky.
+        //
+        // So: peers claim antennas nearest-first, each taking the free antenna
+        // whose sector it falls closest to. Sector geometry still decides *who
+        // gets whom*, which keeps beams spread while there is spread to be
+        // had, but it never leaves a connected drone untracked while an
+        // antenna is idle. Only genuinely spare antennas rest on their sector.
+        let mut assigned: Vec<Option<Vec3>> = vec![None; base.antennas.len()];
+        for (_, peer_pos, _) in &peers {
+            // At zero range there is no bearing to aim at. Those launch links
+            // are held open by the zero-distance rule below instead.
+            if (*peer_pos - base_pos).length() <= f32::EPSILON {
+                continue;
+            }
+            let (azimuth_deg, _) = crate::antenna::angles_toward(base_pos, *peer_pos);
+            let free = assigned
+                .iter()
+                .enumerate()
+                .filter(|(_, taken)| taken.is_none())
+                .min_by(|(a, _), (b, _)| {
+                    let offset = |index: usize| {
+                        shortest_angle_deg(azimuth_deg, index as f32 * BASE_SECTOR_DEG).abs()
+                    };
+                    offset(*a).total_cmp(&offset(*b))
+                })
+                .map(|(index, _)| index);
+            match free {
+                Some(index) => assigned[index] = Some(*peer_pos),
+                // Every antenna is already tracking someone.
+                None => break,
+            }
+        }
+        for (index, antenna) in base.antennas.iter_mut().enumerate() {
+            match assigned[index] {
+                Some(peer_pos) => {
+                    let (azimuth_deg, elevation_deg) =
+                        crate::antenna::angles_toward(base_pos, peer_pos);
+                    antenna.azimuth_deg = azimuth_deg;
+                    antenna.elevation_deg = elevation_deg;
+                }
+                None => {
+                    antenna.azimuth_deg = index as f32 * BASE_SECTOR_DEG;
+                    antenna.elevation_deg = BASE_SECTOR_ELEVATION_DEG;
+                }
+            }
         }
 
         let mut detected_now = HashMap::new();
-        for ((peer_entity, peer_pos, _peer_uuid), antenna) in peers.iter().zip(&base.antennas) {
+        for (peer_entity, peer_pos, _peer_uuid) in &peers {
             let distance_km = (*peer_pos - base_pos).length();
-            let theta = antenna.off_boresight_deg(0.0, base_pos, *peer_pos);
-            if antenna.rssi_dbm(theta, 0.0, distance_km) < antenna.sensitivity_dbm {
+            // Every airframe begins exactly on the ground station. At zero
+            // range there is no meaningful bearing for a directional antenna,
+            // but the physical link is unambiguously present; preserve that
+            // reciprocal launch connection until the normal antenna check can
+            // take over once the drone has moved away.
+            let linked = distance_km <= f32::EPSILON || base.antennas.iter().any(|antenna| {
+                let theta = antenna.off_boresight_deg(0.0, base_pos, *peer_pos);
+                antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm
+            });
+            if !linked {
                 continue;
             }
             let last_sent = links.connected.get(peer_entity).copied();
@@ -572,6 +661,7 @@ pub fn detect_base_links_and_send_headers(
                 header: header.clone(),
                 body: table.0.values().cloned().collect(),
                 origin_connections: peers.iter().map(|(_, _, id)| id.clone()).collect(),
+                target_area: target_area.corners_from_base.clone(),
                 responder_pos: Vec3::ZERO,
                 responder_delay: 0.0,
                 arrival_time: 0.0,
@@ -582,9 +672,29 @@ pub fn detect_base_links_and_send_headers(
     }
 }
 
-/// Give the base and its first five launch drones reciprocal live links before
-/// their first flight tick. The normal antenna detector takes ownership on the
-/// next frame; this only removes the cold-start gap in header/table exchange.
+/// Keep only antenna links that both endpoints independently detected this
+/// frame. The drone and base detectors each evaluate their own antenna
+/// boresight/RSSI, so their intersection is the physical two-antenna link.
+///
+/// This runs after both detectors and before packet routing: a one-way beam
+/// can never be displayed, used for navigation, or carry a header.
+pub fn retain_mutual_links(
+    mut sets: ParamSet<(Query<(Entity, &LinkSet)>, Query<(Entity, &mut LinkSet)>)>,
+) {
+    let directed: std::collections::HashSet<(Entity, Entity)> = sets
+        .p0()
+        .iter()
+        .flat_map(|(entity, links)| links.connected.keys().map(move |peer| (entity, *peer)))
+        .collect();
+
+    for (entity, mut links) in &mut sets.p1() {
+        links.connected.retain(|peer, _| directed.contains(&(*peer, entity)));
+    }
+}
+
+/// Give the base and every launch drone reciprocal live links before their
+/// first flight tick. Its five antennas are directional sectors, not a
+/// five-drone capacity cap; co-located launch drones share a sector.
 pub fn bootstrap_base_links(
     mut commands: Commands,
     mut bases: Query<
@@ -597,9 +707,7 @@ pub fn bootstrap_base_links(
     >,
 ) {
     for (base_entity, base_uuid, mut base_links, mut base_table, base) in &mut bases {
-        for (drone_entity, drone_uuid, mut drone_links, mut drone_table) in
-            (&mut drones).into_iter().take(base.antennas.len())
-        {
+        for (drone_entity, drone_uuid, mut drone_links, mut drone_table) in &mut drones {
             base_links.connected.insert(drone_entity, 0.0);
             drone_links.connected.insert(base_entity, 0.0);
             base_table.0.insert(drone_uuid.0.clone(), MeshRow {
@@ -632,6 +740,7 @@ pub fn route_packets(
         &DroneClock,
         &mut MeshTable,
         &mut TrackedPeers,
+        &mut TargetAreaVectors,
     )>,
 ) {
     let packets = std::mem::take(&mut mailbox.0);
@@ -641,12 +750,17 @@ pub fn route_packets(
         match pkt.kind {
             PacketKind::Header => {
                 // `target` is the responder.
-                let Ok((resp_gt, _, resp_uuid, resp_clock, mut resp_table, mut resp_tracked)) =
+                let Ok((resp_gt, _, resp_uuid, resp_clock, mut resp_table, mut resp_tracked, mut target_area)) =
                     drones.get_mut(target)
                 else {
                     continue;
                 };
                 let responder_pos = resp_gt.translation();
+
+                if let Some(corners) = pkt.target_area.clone() {
+                    target_area.corners_from_base = Some(corners);
+                    target_area.received_at = resp_clock.now;
+                }
 
                 // Antenna-tracking only: the sender told us, in this header,
                 // where it believes it will be `FLIGHT_LOOKAHEAD_SECS` from
@@ -1187,4 +1301,23 @@ mod tests {
         let mut app = App::new();
         app.add_systems(Update, bootstrap_base_links);
         app.update();
+    }
+
+    #[test]
+    fn one_way_antenna_detection_is_not_a_connection() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        let a = world.spawn(LinkSet::default()).id();
+        let b = world.spawn(LinkSet::default()).id();
+        world.get_mut::<LinkSet>(a).unwrap().connected.insert(b, 0.0);
+
+        world.run_system_once(retain_mutual_links).unwrap();
+        assert!(world.get::<LinkSet>(a).unwrap().connected.is_empty());
+
+        world.get_mut::<LinkSet>(a).unwrap().connected.insert(b, 0.0);
+        world.get_mut::<LinkSet>(b).unwrap().connected.insert(a, 0.0);
+        world.run_system_once(retain_mutual_links).unwrap();
+        assert!(world.get::<LinkSet>(a).unwrap().connected.contains_key(&b));
+        assert!(world.get::<LinkSet>(b).unwrap().connected.contains_key(&a));
     }

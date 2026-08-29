@@ -43,7 +43,7 @@ use bevy::prelude::*;
 use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
-use crate::networking::{DroneClock, DroneUuid, LinkSet, MeshTable};
+use crate::networking::{DroneClock, DroneUuid, LinkSet, MeshTable, TargetAreaVectors};
 use crate::recovery::RecoveryState;
 use crate::tracking::TrackedPeers;
 
@@ -422,6 +422,43 @@ impl PatrolVolume {
     }
 }
 
+/// True when `point` lies in the convex target polygon described by vectors
+/// from the base. The area geometry is received over the mesh; this helper
+/// never needs a global area coordinate.
+pub(crate) fn target_contains(point: Vec3, corners: &[Vec3]) -> bool {
+    if corners.len() < 3 {
+        return false;
+    }
+    let mut sign = 0.0_f32;
+    for i in 0..corners.len() {
+        let a = corners[i];
+        let b = corners[(i + 1) % corners.len()];
+        let cross = (b.x - a.x) * (point.z - a.z) - (b.z - a.z) * (point.x - a.x);
+        if cross.abs() <= 1e-4 { continue; }
+        if sign != 0.0 && cross.signum() != sign { return false; }
+        sign = cross.signum();
+    }
+    true
+}
+
+/// Nearest horizontal point on the target boundary, still in the base-relative
+/// coordinate frame carried in the radio update.
+fn nearest_target_point(point: Vec3, corners: &[Vec3]) -> Vec3 {
+    let mut best = corners.first().copied().unwrap_or(Vec3::ZERO);
+    let mut best_dist = f32::INFINITY;
+    for i in 0..corners.len() {
+        let a = corners[i];
+        let b = corners[(i + 1) % corners.len()];
+        let edge = Vec2::new(b.x - a.x, b.z - a.z);
+        let offset = Vec2::new(point.x - a.x, point.z - a.z);
+        let t = (offset.dot(edge) / edge.length_squared().max(f32::EPSILON)).clamp(0.0, 1.0);
+        let candidate = a + (b - a) * t;
+        let dist = (Vec2::new(point.x - candidate.x, point.z - candidate.z)).length_squared();
+        if dist < best_dist { best = candidate; best_dist = dist; }
+    }
+    best
+}
+
 // ─── Random drift ─────────────────────────────────────────────────────────────
 
 /// The direction this drone is currently flying, plus when it next picks a new
@@ -674,9 +711,11 @@ pub fn drift_navigate(
     mut drones: Query<
         (
             &Transform,
+            Option<&crate::world::LaunchTarget>,
             &DriftVector,
             &LinkSet,
             &MeshTable,
+            &TargetAreaVectors,
             &TrackedPeers,
             &RecoveryState,
             &mut DroneKinematics,
@@ -703,35 +742,45 @@ pub fn drift_navigate(
     // base's own location — which every drone was briefed with at launch.
     let base_pos = bases.iter().next().map(|b| b.position);
 
-    for (transform, drift, links, table, tracked, recovery, mut kin) in &mut drones {
+    for (transform, launch, drift, links, table, target_area, tracked, recovery, mut kin) in &mut drones {
+        // The deterministic ingress navigator owns velocity until the drone
+        // reaches its briefed in-area mission slot.
+        if launch.is_some() {
+            continue;
+        }
         if matches!(recovery, RecoveryState::Recovering { .. }) {
             continue;
         }
         let self_pos = transform.translation;
+        // `as_deref` keeps this a borrow, so the tuple stays `Copy` and the
+        // per-frame path never clones the geometry.
+        let received_target = base_pos.zip(target_area.corners_from_base.as_deref());
 
-        // No link, no flight. Brake to a hold and wait to be reacquired rather
-        // than drifting further out of reach of the mesh.
-        if links.connected.is_empty() {
-            let mut state = DroneState {
-                position: self_pos,
-                velocity: kin.velocity,
-                heading_deg: kin.heading_deg,
-            };
-            navigate(&mut state, self_pos, &limits, dt);
-            kin.velocity = state.velocity;
-            kin.heading_deg = state.heading_deg;
-            continue;
-        }
+        // A launch base may sit outside the selected target, so a drone can
+        // legitimately start out of bounds and has to fly itself in. It
+        // re-enters at the nearest point on the boundary described by the
+        // vectors the base broadcast, measured against its own offset from
+        // the base — it never needs a global area coordinate.
+        let inside_target = received_target.map_or_else(
+            || volume.contains_horizontally(self_pos),
+            |(base, corners)| target_contains(self_pos - base, corners),
+        );
 
-        // A launch base may sit outside the selected target. A connected
-        // drone must therefore re-enter at the nearest point inside the
-        // patrol footprint, rather than treating an out-of-bounds launch as a
-        // reason to hold forever.
-        if !volume.contains_horizontally(self_pos) {
-            let entry = Vec3::new(
-                self_pos.x.clamp(volume.min.x, volume.max.x),
-                self_pos.y,
-                self_pos.z.clamp(volume.min.z, volume.max.z),
+        // Ingress outranks the live-link rule below. Holding station is only
+        // a safe failure mode *inside* the operating area; out here it is what
+        // makes the loss permanent, because the mesh this drone has to rejoin
+        // is inside the area and will not come to it. So an out-of-area drone
+        // flies for the boundary whether or not it currently holds a link.
+        if !inside_target {
+            let entry = received_target.map_or_else(
+                || Vec3::new(
+                    self_pos.x.clamp(volume.min.x, volume.max.x), self_pos.y,
+                    self_pos.z.clamp(volume.min.z, volume.max.z),
+                ),
+                |(base, corners)| {
+                    let local = nearest_target_point(self_pos - base, corners);
+                    Vec3::new(base.x + local.x, self_pos.y, base.z + local.z)
+                },
             );
             let ground = terrain.height_at(entry.x, entry.z);
             let (floor, ceiling) = PatrolVolume::altitude_band(ground);
@@ -742,6 +791,22 @@ pub fn drift_navigate(
                 heading_deg: kin.heading_deg,
             };
             navigate(&mut state, target, &limits, dt);
+            kin.velocity = state.velocity;
+            kin.heading_deg = state.heading_deg;
+            continue;
+        }
+
+        // Inside the area, no link means no flight: brake to a hold and wait
+        // to be reacquired rather than drifting further out of reach of the
+        // mesh. There is nowhere this drone needs to be that is worth leaving
+        // the formation blind for.
+        if links.connected.is_empty() {
+            let mut state = DroneState {
+                position: self_pos,
+                velocity: kin.velocity,
+                heading_deg: kin.heading_deg,
+            };
+            navigate(&mut state, self_pos, &limits, dt);
             kin.velocity = state.velocity;
             kin.heading_deg = state.heading_deg;
             continue;
@@ -783,7 +848,11 @@ pub fn drift_navigate(
         // formation terrain-following — as the ground climbs ahead, so does
         // the target.
         let ahead = self_pos + heading * lookahead_km;
-        let level = if volume.contains_horizontally(ahead) { ahead } else { self_pos };
+        let ahead_inside = received_target.map_or_else(
+            || volume.contains_horizontally(ahead),
+            |(base, corners)| target_contains(ahead - base, corners),
+        );
+        let level = if ahead_inside { ahead } else { self_pos };
         let ground = terrain.height_at(level.x, level.z);
         let (floor, ceiling) = PatrolVolume::altitude_band(ground);
         let target = Vec3::new(level.x, level.y.clamp(floor, ceiling), level.z);
@@ -822,9 +891,140 @@ pub fn drift_navigate(
     }
 }
 
+/// Navigate launch drones from the base to their briefed target-area slot.
+/// The same live-link rule as patrol applies: a disconnected drone holds and
+/// lets the radio search recover the connection before moving again.
+pub fn navigate_launch_targets(
+    mut commands: Commands,
+    time: Res<Time>,
+    speed: Res<MovementSpeed>,
+    mut drones: Query<
+        (Entity, &Transform, &crate::world::LaunchTarget, &LinkSet, &TargetAreaVectors, &RecoveryState, &mut DroneKinematics),
+        With<Drone>,
+    >,
+    bases: Query<&Base>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 { return; }
+    let limits = speed.limits_km();
+    let base_pos = bases.iter().next().map(|base| base.position);
+    for (entity, transform, launch, links, target_area, recovery, mut kin) in &mut drones {
+        let self_pos = transform.translation;
+        // Connectivity is a flight invariant, including during ingress. A
+        // launch drone that loses every antenna link brakes to a hold and
+        // waits for spiral search/reconnection; it must not fly farther from
+        // the mesh merely because its assigned slot lies inside the area.
+        if !matches!(recovery, RecoveryState::Nominal) || links.connected.is_empty() {
+            let mut state = DroneState { position: self_pos, velocity: kin.velocity, heading_deg: kin.heading_deg };
+            navigate(&mut state, self_pos, &limits, dt);
+            kin.velocity = state.velocity;
+            kin.heading_deg = state.heading_deg;
+            continue;
+        }
+        let target = base_pos.zip(target_area.corners_from_base.as_deref()).map_or(launch.0, |(base, corners)| {
+            target_contains(launch.0 - base, corners)
+                .then_some(launch.0)
+                .unwrap_or_else(|| {
+                    let local = nearest_target_point(launch.0 - base, corners);
+                    Vec3::new(base.x + local.x, launch.0.y, base.z + local.z)
+                })
+        });
+        if (target - self_pos).length() <= 0.05 {
+            kin.velocity = Vec3::ZERO;
+            commands.entity(entity).remove::<crate::world::LaunchTarget>();
+            continue;
+        }
+        let mut state = DroneState { position: self_pos, velocity: kin.velocity, heading_deg: kin.heading_deg };
+        navigate(&mut state, target, &limits, dt);
+        kin.velocity = state.velocity;
+        kin.heading_deg = state.heading_deg;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn received_target_vectors_define_the_navigation_boundary() {
+        let corners = [
+            Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.0, 1.0), Vec3::new(-1.0, 0.0, 1.0),
+        ];
+        assert!(target_contains(Vec3::new(0.5, 0.0, 0.5), &corners));
+        assert!(!target_contains(Vec3::new(1.5, 0.0, 0.5), &corners));
+        let entry = nearest_target_point(Vec3::new(1.5, 0.0, 0.5), &corners);
+        assert!((entry - Vec3::new(1.0, 0.0, 0.5)).length() < 1e-4);
+    }
+
+    /// A drone outside the briefed area must be given a boundary point to fly
+    /// to, and the point must be the nearest one on the edge — not the centre,
+    /// and not its own position.
+    #[test]
+    fn out_of_area_drone_is_sent_to_the_nearest_boundary_point() {
+        let corners = [
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+        ];
+        // 3 km east of the area's eastern edge, level with its middle.
+        let outside = Vec3::new(5.0, 0.0, 0.5);
+        assert!(!target_contains(outside, &corners));
+
+        let entry = nearest_target_point(outside, &corners);
+        assert!(
+            (entry - Vec3::new(2.0, 0.0, 0.5)).length() < 1e-4,
+            "entry {entry:?} should be the nearest edge point"
+        );
+
+        // And flying at it actually closes the gap.
+        let limits = FlightLimits::default();
+        let mut state = DroneState { position: outside, ..default() };
+        for _ in 0..2000 {
+            navigate(&mut state, entry, &limits, 0.02);
+            state.position += state.velocity * 0.02;
+        }
+        assert!(
+            target_contains(state.position, &corners)
+                || (state.position - entry).length() < 0.05,
+            "ended at {:?}, never reached the area",
+            state.position
+        );
+    }
+
+    /// The whole formation launches from the ground station, which may sit
+    /// outside the area. If ingress were gated on holding a live link, a drone
+    /// that lost one on the way would stop where it stood — outside, out of
+    /// reach, and unable to rejoin the mesh it needs in order to be allowed to
+    /// move again. Being outside the area has to outrank the link rule.
+    #[test]
+    fn being_outside_the_area_is_what_decides_ingress_not_the_link_state() {
+        // Corners are vectors *from the base*, so the base itself is the
+        // local origin — "the station sits outside the area" is exactly "the
+        // origin is not inside these corners". This area lies 3-5 km
+        // north-east of the station.
+        let corners = [
+            Vec3::new(3.0, 0.0, 3.0),
+            Vec3::new(5.0, 0.0, 3.0),
+            Vec3::new(5.0, 0.0, 5.0),
+            Vec3::new(3.0, 0.0, 5.0),
+        ];
+        let base = Vec3::new(10.0, 0.2, 10.0);
+        // A drone still sitting on the pad, i.e. at the local origin.
+        let on_the_pad = base;
+        assert!(!target_contains(on_the_pad - base, &corners));
+
+        let entry = nearest_target_point(on_the_pad - base, &corners);
+        assert!(
+            target_contains(entry, &corners),
+            "the ingress point {entry:?} must itself be inside the area"
+        );
+        assert!(
+            (entry - Vec3::new(3.0, 0.0, 3.0)).length() < 1e-4,
+            "ingress point {entry:?} should be the near corner of the area"
+        );
+    }
 
     /// Repeatedly navigating toward a far-away target should never exceed
     /// the configured max speed, even after many ticks of acceleration.

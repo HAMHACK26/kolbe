@@ -51,7 +51,13 @@ pub fn orbit_camera(
     mouse_button: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
+    ui_capture: Res<crate::ui::UiPointerCapture>,
 ) {
+    // A slider drag belongs to the UI; do not rotate or pan the world with
+    // the same physical pointer motion.
+    if ui_capture.0 {
+        return;
+    }
     if mouse_button.just_pressed(MouseButton::Left) {
         orbit.drag_total = 0.0;
     }

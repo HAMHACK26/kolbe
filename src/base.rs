@@ -22,7 +22,7 @@ use crate::{
     camera::OrbitCamera,
     drone::{Drone, SelectedDrone, make_antenna},
     factories::{movement::DroneKinematics, track::Track},
-    networking::{BootstrapBaseLinks, NetworkingBundle},
+    networking::{BootstrapBaseLinks, LinkSet, NetworkingBundle},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     theme::ThemeRole,
     world::DRONE_RADIUS,
@@ -104,6 +104,7 @@ pub fn spawn_base(
     theme: Res<crate::theme::Theme>,
     base_position: Res<crate::area::BasePosition>,
     area: Res<crate::area::ScenarioArea>,
+    network_area: Res<crate::area::NetworkArea>,
 ) {
     // Initial colors from the palette; `apply_theme` re-syncs on toggle
     // (these entities carry ThemeRole markers).
@@ -120,10 +121,44 @@ pub fn spawn_base(
         None => (0.0, -terrain.size_km() / 2.0 + 1.0),
     };
     let pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
+    // The shape the operator drew is the mission boundary — `NetworkArea::hull`,
+    // not the `corners` square derived from it. That square only ever sized the
+    // terrain fetch and the airframe count, and it always covers ground nobody
+    // selected.
+    //
+    // Convert once here, then send only base-relative vectors over the mesh:
+    // drones navigate the boundary from their own offset to the station and
+    // never need a global area coordinate.
+    let target_area: Option<std::sync::Arc<[Vec3]>> = (network_area.valid
+        && network_area.hull.len() >= 3)
+        .then(|| {
+            network_area
+                .hull
+                .iter()
+                .map(|&(lon, lat)| {
+                    Vec3::new(
+                        ((lon - area.longitude) * 111.320 * area.latitude.to_radians().cos()) as f32,
+                        pos.y,
+                        ((lat - area.latitude) * 110.574) as f32,
+                    ) - pos
+                })
+                .collect()
+        });
 
-    // 5 connections — same hardware as the drones, one antenna per 72° sector.
-    let antennas: Vec<Antenna> =
-        (0..5).map(|k| make_antenna(k as f32 * 72.0, 5.0, 200 + k)).collect();
+    // 5 connections — same hardware as the drones, one antenna per sector.
+    // `networking::detect_base_links_and_send_headers` re-aims each one within
+    // its own sector every frame, so these are the resting bearings.
+    let antennas: Vec<Antenna> = (0..5)
+        .map(|k| {
+            make_antenna(
+                k as f32 * crate::networking::BASE_SECTOR_DEG,
+                crate::networking::BASE_SECTOR_ELEVATION_DEG,
+                200 + k,
+            )
+        })
+        .collect();
+    let mut networking = NetworkingBundle::random(usize::MAX);
+    networking.target_area.corners_from_base = target_area;
 
     let base_entity = commands
         .spawn((
@@ -143,7 +178,7 @@ pub fn spawn_base(
         BaseNetworkState::default(),
         // The station is a static mesh node: same header/table protocol as a
         // drone, but five antenna slots and no flight systems.
-        NetworkingBundle::random(usize::MAX),
+        networking,
         BootstrapBaseLinks,
         DroneKinematics::default(),
         ThemeRole::BaseMarker,
@@ -184,40 +219,25 @@ pub fn spawn_base(
 
 // ─── Systems (stubs) ──────────────────────────────────────────────────────────
 
-/// Compute RSSI from base to every drone; populate `BaseNetworkState::reachable_drones`.
+/// Mirror the base's live radio links into the UI-facing network state.
 ///
-/// Use `Antenna::off_boresight_deg(0.0, base_pos, drone_pos)` for θ_tx — 0.0
-/// because a base has no heading, so its antennas' azimuth is already
-/// world-frame — then `antenna.rssi_dbm(θ_tx, 0.0, d)` (θ_rx = 0 until drones
-/// expose their own antenna direction to the base).
+/// `detect_base_links_and_send_headers` is the authority for the physical
+/// antenna link. Reading its `LinkSet` here keeps the displayed connection
+/// count, mesh routing, and recovery logic on one shared definition of a link.
 pub fn update_base_comms(
-    mut bases: Query<(&Base, &mut BaseNetworkState)>,
-    drones: Query<(Entity, &GlobalTransform, &Drone)>,
+    mut bases: Query<(&LinkSet, &mut BaseNetworkState), With<Base>>,
+    drones: Query<(), With<Drone>>,
 ) {
-    for (base, mut state) in &mut bases {
-        let mut reachable = Vec::new();
-        let mut best_rssi = f32::NEG_INFINITY;
-        for (entity, transform, drone) in &drones {
-            let drone_pos = transform.translation();
-            let distance_km = (drone_pos - base.position).length();
-            // A drone reserves antenna #2 for the known ground station.  The
-            // station is a multi-sector receiver, so it can listen to any
-            // correctly aimed in-range drone; this makes the south row a real
-            // gateway into the mesh rather than a decorative base marker.
-            let rssi = drone.antennas.get(1).map_or(f32::NEG_INFINITY, |antenna| {
-                antenna.rssi_dbm(
-                    antenna.off_boresight_deg(0.0, drone_pos, base.position),
-                    0.0,
-                    distance_km,
-                )
-            });
-            if rssi >= drone.antennas.get(1).map_or(f32::INFINITY, |a| a.sensitivity_dbm) {
-                reachable.push(entity);
-                best_rssi = best_rssi.max(rssi);
-            }
-        }
-        state.reachable_drones = reachable;
-        state.best_rssi_dbm = best_rssi;
+    for (links, mut state) in &mut bases {
+        state.reachable_drones = links
+            .connected
+            .keys()
+            .copied()
+            .filter(|entity| drones.get(*entity).is_ok())
+            .collect();
+        // Detailed link-budget reporting is not currently surfaced, and a
+        // stale RSSI is worse than an explicit unavailable value.
+        state.best_rssi_dbm = f32::NEG_INFINITY;
     }
 }
 

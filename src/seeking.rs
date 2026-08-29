@@ -80,6 +80,12 @@ pub const OMEGA_MIN_RAD_S: f32 = 0.5;
 /// Mechanical/electronic scan speed ceiling, rad/s (~57 rpm).
 pub const OMEGA_MAX_RAD_S: f32 = 6.0;
 
+/// A dropped peer was recently tracked, and recovery first retraces a recent
+/// position, so a wide-area sweep is counterproductive. Keep the full search
+/// cone narrow enough for fast reacquisition rather than letting stale timing
+/// request a near-global scan.
+pub const MAX_SEARCH_CONE_DEG: f32 = 12.0;
+
 /// How many full spiral turns it takes to sweep from the center out to the
 /// edge of the search cone before the pattern resets and sweeps outward
 /// again from scratch. Not part of the given search-cone/scan-speed specs —
@@ -103,9 +109,10 @@ pub fn search_cone_angle_deg(uncertainty_radius_km: f32, target_distance_km: f32
         // Last-known position is (effectively) right on top of us — there's
         // no meaningful direction to narrow the search to, so search
         // everywhere.
-        return 180.0;
+        return MAX_SEARCH_CONE_DEG;
     }
-    2.0 * (uncertainty_radius_km / target_distance_km).atan().to_degrees()
+    (2.0 * (uncertainty_radius_km / target_distance_km).atan().to_degrees())
+        .min(MAX_SEARCH_CONE_DEG)
 }
 
 /// Δr = v_rel · Δt, with the worst-case relative speed v_rel = 2·v_max (both
@@ -193,6 +200,9 @@ pub fn spiral_offset_deg(
 pub struct SeekState {
     pub next_elapsed_secs: f32,
     pub prev_elapsed_secs: f32,
+    /// A slot may search only after it has first held a real mutual link.
+    pub next_was_linked: bool,
+    pub prev_was_linked: bool,
 }
 
 /// When a ring neighbor's direct link has dropped, spiral-search around its
@@ -253,9 +263,13 @@ pub fn seek_lost_links(
         if n == 0 {
             continue;
         }
-        // "Stopped" for a reconnection handshake — hold antenna slew steady,
-        // don't spiral-search this frame.
-        if pairing.frozen {
+        // An accepting peer is the exception: it deliberately holds its
+        // normal tracking plan aside so a requested link can be reacquired.
+        let accepted_connection_request = matches!(
+            pairing.state,
+            PairingState::AcceptedAwaitingPosition { .. }
+        );
+        if pairing.frozen && !accepted_connection_request {
             continue;
         }
         let self_pos = self_transform.translation;
@@ -270,38 +284,48 @@ pub fn seek_lost_links(
         let (_, next_entity, next_uuid) = ring[(self_ring.0 + 1) % n].clone();
         let (_, prev_entity, prev_uuid) = ring[(self_ring.0 + n - 1) % n].clone();
 
-        seek_one_slot(SeekSlotArgs {
-            drone: &mut drone,
-            antenna_idx: 0,
-            neighbor_entity: next_entity,
-            neighbor_uuid: &next_uuid,
-            links,
-            table,
-            self_pos,
-            base_pos,
-            self_heading_deg: kin.heading_deg,
-            self_clock_now: clock.now,
-            max_speed_mps,
-            omega_rad_s: omega,
-            dt,
-            elapsed: &mut seek.next_elapsed_secs,
-        });
-        seek_one_slot(SeekSlotArgs {
-            drone: &mut drone,
-            antenna_idx: 2,
-            neighbor_entity: prev_entity,
-            neighbor_uuid: &prev_uuid,
-            links,
-            table,
-            self_pos,
-            base_pos,
-            self_heading_deg: kin.heading_deg,
-            self_clock_now: clock.now,
-            max_speed_mps,
-            omega_rad_s: omega,
-            dt,
-            elapsed: &mut seek.prev_elapsed_secs,
-        });
+        {
+            let (elapsed, was_linked) = (&mut seek.next_elapsed_secs, &mut seek.next_was_linked);
+            seek_one_slot(SeekSlotArgs {
+                drone: &mut drone,
+                antenna_idx: 0,
+                neighbor_entity: next_entity,
+                neighbor_uuid: &next_uuid,
+                links,
+                table,
+                self_pos,
+                base_pos,
+                self_heading_deg: kin.heading_deg,
+                self_clock_now: clock.now,
+                max_speed_mps,
+                omega_rad_s: omega,
+                dt,
+                elapsed,
+                was_linked,
+                accepted_connection_request,
+            });
+        }
+        {
+            let (elapsed, was_linked) = (&mut seek.prev_elapsed_secs, &mut seek.prev_was_linked);
+            seek_one_slot(SeekSlotArgs {
+                drone: &mut drone,
+                antenna_idx: 2,
+                neighbor_entity: prev_entity,
+                neighbor_uuid: &prev_uuid,
+                links,
+                table,
+                self_pos,
+                base_pos,
+                self_heading_deg: kin.heading_deg,
+                self_clock_now: clock.now,
+                max_speed_mps,
+                omega_rad_s: omega,
+                dt,
+                elapsed,
+                was_linked,
+                accepted_connection_request,
+            });
+        }
     }
 }
 
@@ -322,6 +346,8 @@ struct SeekSlotArgs<'a> {
     omega_rad_s: f32,
     dt: f32,
     elapsed: &'a mut f32,
+    was_linked: &'a mut bool,
+    accepted_connection_request: bool,
 }
 
 fn seek_one_slot(args: SeekSlotArgs) {
@@ -340,11 +366,20 @@ fn seek_one_slot(args: SeekSlotArgs) {
         omega_rad_s,
         dt,
         elapsed,
+        was_linked,
+        accepted_connection_request,
     } = args;
 
     if links.connected.contains_key(&neighbor_entity) {
         // Locked — nothing to search for. Reset so the *next* loss starts
         // the spiral over from the center, not wherever it last reached.
+        *elapsed = 0.0;
+        *was_linked = true;
+        return;
+    }
+    if !*was_linked && !accepted_connection_request {
+        // A merely briefed/gossiped row is not a lost connection. Do not
+        // begin an antenna sweep until this slot has actually linked once.
         *elapsed = 0.0;
         return;
     }

@@ -123,7 +123,8 @@ pub fn peer_is_orphaned(table: &MeshTable, peer_uuid: &str, self_uuid: &str) -> 
     true
 }
 
-/// Update contact memory and, when a sole-link peer drops, enter recovery.
+/// Update contact memory and enter recovery after a total link loss (or when
+/// a sole-link peer becomes partitioned).
 ///
 /// Runs after links are (re)detected each frame so `LinkSet` is current.
 pub fn detect_partitions(
@@ -154,10 +155,22 @@ pub fn detect_partitions(
 
         // Any peer linked last frame but not now = a drop this frame.
         let dropped: Vec<String> = memory.prev_linked.difference(&linked_now).cloned().collect();
+        let lost_all_links = !memory.prev_linked.is_empty() && linked_now.is_empty();
         memory.prev_linked = linked_now;
 
         // Only consider entering recovery if not already recovering.
         if matches!(*recovery, RecoveryState::Nominal) {
+            // The controlled exception to the normal no-link flight rule:
+            // retrace the continuously saved one-second position, then search
+            // from there. Every drone that loses all of its links makes the
+            // same local decision, so two disconnected peers naturally fly
+            // back toward their most recent shared contact region.
+            if lost_all_links {
+                let lost_peer = dropped.first().cloned().unwrap_or_else(|| "mesh".into());
+                let return_to = history.one_second_ago().unwrap_or(self_pos - base_pos);
+                *recovery = RecoveryState::Recovering { lost_peer, return_to };
+                continue;
+            }
             for peer in dropped {
                 if peer_is_orphaned(table, &peer, &self_uuid.0) {
                     let return_to = history.one_second_ago().unwrap_or(self_pos - base_pos);
@@ -169,8 +182,8 @@ pub fn detect_partitions(
     }
 }
 
-/// Fly recovering drones back to their last-contact waypoint, and exit
-/// recovery once the lost peer is re-acquired.
+/// Fly recovering drones back to their one-second-ago waypoint, then hold
+/// there while the antenna search attempts to re-acquire a peer.
 ///
 /// Only sets `DroneKinematics::velocity`; `factories::movement::apply_velocity`
 /// integrates it — so there's no double integration and non-recovering drones
@@ -196,17 +209,10 @@ pub fn run_recovery(
     let Some(base_pos) = bases.iter().next().map(|base| base.position) else {
         return;
     };
-    for (transform, _self_uuid, links, mut kin, mut recovery) in &mut drones {
-        let RecoveryState::Recovering { lost_peer, return_to } = &*recovery else {
+    for (transform, _self_uuid, _links, mut kin, mut recovery) in &mut drones {
+        let RecoveryState::Recovering { lost_peer: _, return_to } = &*recovery else {
             continue;
         };
-
-        // Never fly while disconnected. `seeking` keeps scanning for a peer;
-        // the return leg only starts after that scan restores a live link.
-        if links.connected.is_empty() {
-            kin.velocity = Vec3::ZERO;
-            continue;
-        }
 
         let target = base_pos + *return_to;
         if (target - transform.translation).length() <= RECOVERY_ARRIVE_KM {

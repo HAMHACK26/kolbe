@@ -340,17 +340,29 @@ pub fn draw_network_area(
         (x, z)
     };
 
-    // Keep the operational target square unmistakable over both terrain and
-    // the 50 m forest canopy. The fetched terrain boundary is intentionally
-    // quieter, while the target square remains the dominant amber outline.
-    let fetch_color = Color::srgba(0.9, 0.95, 1.0, 0.65);
-    let square_color = Color::srgb(1.0, 0.65, 0.05);
-    let polygon_color = Color::srgb(0.1, 0.95, 1.0);
+    // Draw in order of what the drones actually obey. The hull is the mission
+    // boundary the base broadcasts and every drone navigates against, so it is
+    // the one bright line. The bounding square and the fetch box are both
+    // construction geometry — they size the terrain pull and the airframe
+    // count — and are drawn faint so they read as scaffolding, not as the
+    // area. This used to be the other way round, which is why the square read
+    // as the target.
+    let fetch_color = Color::srgba(0.9, 0.95, 1.0, 0.25);
+    let square_color = Color::srgba(1.0, 0.65, 0.05, 0.35);
+    let boundary_color = Color::srgb(0.1, 0.95, 1.0);
 
-    draw_ring(&mut gizmos, &terrain, net.fetch_corners.map(|(lat, lon)| to_local(lat, lon)), fetch_color);
-    draw_ring(&mut gizmos, &terrain, net.corners.map(|(lat, lon)| to_local(lat, lon)), square_color);
+    // `fetch_corners`, `corners` and `hull` are `(lon, lat)`; `points` is
+    // `(lat, lon)`, the order clicks are recorded in. See
+    // `area::recompute_network_area`.
+    draw_ring(&mut gizmos, &terrain, net.fetch_corners.map(|(lon, lat)| to_local(lat, lon)), fetch_color);
+    draw_ring(&mut gizmos, &terrain, net.corners.map(|(lon, lat)| to_local(lat, lon)), square_color);
+    // The raw click order, faint. Identical to the hull for a convex
+    // selection; where it differs, it shows the operator exactly how much of
+    // a concave outline the mesh is actually going to treat as inside.
     let points: Vec<(f32, f32)> = net.points.iter().map(|&(lat, lon)| to_local(lat, lon)).collect();
-    draw_ring(&mut gizmos, &terrain, points, polygon_color);
+    draw_ring(&mut gizmos, &terrain, points, boundary_color.with_alpha(0.3));
+    let hull: Vec<(f32, f32)> = net.hull.iter().map(|&(lon, lat)| to_local(lat, lon)).collect();
+    draw_ring(&mut gizmos, &terrain, hull, boundary_color);
 }
 
 fn draw_ring(

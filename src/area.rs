@@ -35,10 +35,10 @@ const HAIRLINE: f32 = 1.0;
 const RAIL_PAD: f32 = 18.0;
 
 const MIN_POINTS: usize = 3;
-/// Largest practical side length for a temporary, self-healing drone mesh.
-/// With the 3 km radio pitch and 15% redundancy this caps a square mission at
-/// about 74 airframes, keeping link checks and reconnection traffic responsive.
-const MAX_SIDE_KM: f64 = 30.0;
+/// Largest terrain square we will download for a temporary, self-healing
+/// drone mesh. This limits the actual axis-aligned terrain request, not just
+/// the selected rotated square, so a diagonal selection cannot evade it.
+const MAX_SIDE_KM: f64 = 20.0;
 const POINT_DOT_SIZE: f32 = 8.0;
 const EDGE_THICKNESS: f32 = 1.0;
 const SQUARE_THICKNESS: f32 = 2.0;
@@ -132,6 +132,18 @@ pub struct NetworkArea {
     /// Corners of that axis-aligned fetch square — "the area it's going to
     /// pull." The base must land inside this box.
     pub fetch_corners: [(f64, f64); 4],
+    /// The mission boundary the drones actually fly to: the convex hull of the
+    /// points the operator drew, `(lon, lat)`, counter-clockwise.
+    ///
+    /// Not `corners`. That square exists to size the terrain fetch and the
+    /// airframe count, and it is always bigger than what was asked for — a
+    /// rotated selection can enclose a lot of ground nobody picked. The hull
+    /// is the shape on screen, so it is the shape the mesh covers.
+    ///
+    /// Hull rather than the raw click order because `navigation`'s containment
+    /// test is a convex one; a concave outline would otherwise report points
+    /// inside it as out.
+    pub hull: Vec<(f64, f64)>,
     pub valid: bool,
     pub over_limit: bool,
 }
@@ -182,11 +194,23 @@ fn recompute_network_area(points: &[(f64, f64)]) -> NetworkArea {
 
     let center = polygon::unproject(ref_lon, ref_lat, square.center);
     let corners = square.corners().map(|lp| polygon::unproject(ref_lon, ref_lat, lp));
+    let hull: Vec<(f64, f64)> = polygon::convex_hull(&locals)
+        .into_iter()
+        .map(|lp| polygon::unproject(ref_lon, ref_lat, lp))
+        .collect();
 
-    let (clat, clon) = center;
+    // `unproject` yields `(lon, lat)`, and so do `center` and `corners`.
+    // Reading them as `(lat, lon)` here used to measure the north-south half
+    // span from a longitude delta and vice versa, which at Swedish latitudes
+    // inflated `fetch_size_km` by about 2.2x — every mission fetched twice
+    // the terrain it needed and tripped `over_limit` at well under the real
+    // side limit. Same class of bug as the one `distance_to_square_km`
+    // documents; the convention is `(lon, lat)` everywhere this struct is
+    // read.
+    let (clon, clat) = center;
     let mut half_ns_km = 0.0_f64;
     let mut half_ew_km = 0.0_f64;
-    for &(lat, lon) in &corners {
+    for &(lon, lat) in &corners {
         half_ns_km = half_ns_km.max((lat - clat).abs() * 110.574);
         half_ew_km = half_ew_km.max((lon - clon).abs() * 111.320 * clat.to_radians().cos());
     }
@@ -197,22 +221,26 @@ fn recompute_network_area(points: &[(f64, f64)]) -> NetworkArea {
     let lat_delta = fetch_half_km / 110.574;
     let lon_delta = fetch_half_km / (111.320 * clat.to_radians().cos());
     let fetch_corners = [
-        (clat + lat_delta, clon + lon_delta),
-        (clat + lat_delta, clon - lon_delta),
-        (clat - lat_delta, clon - lon_delta),
-        (clat - lat_delta, clon + lon_delta),
+        (clon + lon_delta, clat + lat_delta),
+        (clon - lon_delta, clat + lat_delta),
+        (clon - lon_delta, clat - lat_delta),
+        (clon + lon_delta, clat - lat_delta),
     ];
 
     NetworkArea {
         points: points.to_vec(),
         corners,
+        hull,
         center,
         side_km,
         rotation_deg: square.rotation.to_degrees(),
         fetch_size_km,
         fetch_corners,
         valid: true,
-        over_limit: side_km > MAX_SIDE_KM,
+        // `fetch_size_km` is the axis-aligned square sent to the terrain
+        // service. A 20 km square rotated by 45° needs a ~28 km fetch, so
+        // checking `side_km` alone would still let an oversized pull through.
+        over_limit: fetch_size_km as f64 > MAX_SIDE_KM,
     }
 }
 
@@ -368,6 +396,11 @@ pub(crate) struct RemovePointButton(usize);
 
 #[derive(Component)]
 pub(crate) struct SetBaseButton;
+
+/// The KOLBE wordmark in the title strip, which doubles as "show me
+/// everything" — the way a map app's own logo returns you to the whole map.
+#[derive(Component)]
+pub(crate) struct ResetViewButton;
 
 #[derive(Component)]
 pub(crate) struct ZoomInButton;
@@ -670,12 +703,24 @@ fn spawn_title_strip(root: &mut ChildSpawnerCommands, p: &Palette) {
         UiStroke::new(Slot::Line),
     ))
     .with_children(|strip| {
-        strip.spawn((
-            Text::new(tracked("KOLBE")),
-            sans(13.0),
-            TextColor(p.signal),
-            UiInk::new(Slot::Signal),
-        ));
+        strip
+            .spawn((
+                Button,
+                Node {
+                    padding: UiRect::axes(Val::Px(4.0), Val::Px(3.0)),
+                    margin: UiRect::left(Val::Px(-4.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::NONE),
+                ResetViewButton,
+            ))
+            .with_child((
+                Text::new(tracked("KOLBE")),
+                sans(13.0),
+                TextColor(p.signal),
+                UiInk::new(Slot::Signal),
+                Pickable::IGNORE,
+            ));
         strip.spawn((
             Node { width: Val::Px(HAIRLINE), height: Val::Px(16.0), ..default() },
             BackgroundColor(p.line),
@@ -1204,6 +1249,7 @@ pub fn point_table_and_buttons(
     remove_buttons: Query<(&Interaction, &RemovePointButton), Changed<Interaction>>,
     add_stop: Query<&Interaction, (Changed<Interaction>, With<AddStopButton>)>,
     clear: Query<&Interaction, (Changed<Interaction>, With<ClearButton>)>,
+    reset_view: Query<&Interaction, (Changed<Interaction>, With<ResetViewButton>)>,
     set_base: Query<&Interaction, (Changed<Interaction>, With<SetBaseButton>)>,
     mut points: ResMut<PendingPoints>,
     mut mode: ResMut<PickMode>,
@@ -1244,11 +1290,19 @@ pub fn point_table_and_buttons(
         );
     }
 
+    // Clear discards the *selection*, not the view. Zooming back out to the
+    // whole country on every clear meant that fixing one badly placed vertex
+    // cost the operator their framing as well, and they had to fly back in to
+    // where they were already working.
     if clear.iter().any(|i| *i == Interaction::Pressed) {
         points.0.clear();
         *mode = PickMode::Adding;
-        view.reset();
         base.0 = None;
+    }
+
+    // Resetting the view is its own action, on the wordmark.
+    if reset_view.iter().any(|i| *i == Interaction::Pressed) {
+        view.reset();
     }
 }
 
@@ -1262,7 +1316,10 @@ fn rezoom_around(view: &mut MapView, anchor_px: Vec2, new_zoom: u8) {
     view.zoom = new_zoom;
     let anchor_world = tiles::lonlat_to_world_px(lon, lat, new_zoom);
     let new_center_world = anchor_world - anchor_px + view.size * 0.5;
-    view.center = clamp_to_sweden(tiles::world_px_to_lonlat(new_center_world, new_zoom));
+    // Do not clamp here: clamping after this cursor-anchor calculation moves
+    // the location under the cursor, which is why zooming near Sweden's edge
+    // felt like the map slid away. Panning still keeps the normal view bound.
+    view.center = tiles::world_px_to_lonlat(new_center_world, new_zoom);
 }
 
 /// Zoom (scroll) works in any mode. Pan works two ways: left-drag while
@@ -1548,7 +1605,7 @@ pub fn redraw_polygon(
             let fetch_px: Vec<Vec2> = net
                 .fetch_corners
                 .iter()
-                .map(|&(lat, lon)| lonlat_to_screen_px(lon, lat, &view))
+                .map(|&(lon, lat)| lonlat_to_screen_px(lon, lat, &view))
                 .collect();
             for i in 0..4 {
                 spawn_edge(parent, fetch_px[i], fetch_px[(i + 1) % 4], p.line, HAIRLINE);
@@ -1562,7 +1619,7 @@ pub fn redraw_polygon(
             let corners_px: Vec<Vec2> = net
                 .corners
                 .iter()
-                .map(|&(lat, lon)| lonlat_to_screen_px(lon, lat, &view))
+                .map(|&(lon, lat)| lonlat_to_screen_px(lon, lat, &view))
                 .collect();
             for i in 0..4 {
                 spawn_edge(parent, corners_px[i], corners_px[(i + 1) % 4], square_color, SQUARE_THICKNESS);
@@ -2073,6 +2130,23 @@ mod tests {
         assert!(net.over_limit);
     }
 
+    #[test]
+    fn rotated_selection_cannot_download_more_than_the_limit() {
+        // A diamond whose minimum rotated square is approximately 20 km per
+        // side. Its axis-aligned terrain request is about 28 km, and must be
+        // rejected even though the rotated selection itself is within 20 km.
+        let net = recompute_network_area(&[
+            (59.115, 18.000),
+            (59.000, 18.222),
+            (58.885, 18.000),
+            (59.000, 17.778),
+        ]);
+        assert!(net.valid);
+        assert!(net.side_km <= MAX_SIDE_KM, "side={} fetch={}", net.side_km, net.fetch_size_km);
+        assert!(net.fetch_size_km as f64 > MAX_SIDE_KM, "side={} fetch={}", net.side_km, net.fetch_size_km);
+        assert!(net.over_limit);
+    }
+
     /// `lonlat_to_screen_px`/`cursor_to_lonlat` must invert each other at any
     /// pan/zoom, or clicks stop landing where they visually appear to (the
     /// bug that made point-adding and base-placement feel broken once zoom
@@ -2093,6 +2167,70 @@ mod tests {
         }
     }
 
+
+    /// The mission boundary the base broadcasts is the hull of what was drawn,
+    /// not the bounding square. It must enclose every clicked point, and be
+    /// no bigger than it has to be — a square around a triangle is roughly
+    /// twice the area nobody asked for.
+    #[test]
+    fn the_hull_is_the_drawn_shape_not_the_bounding_square() {
+        // A right triangle: the bounding square covers twice its area.
+        let (lat, lon): (f64, f64) = (63.1792, 14.6357);
+        let d = 2.0 / 110.574;
+        let points = vec![(lat, lon), (lat, lon + d), (lat + d, lon)];
+
+        let net = recompute_network_area(&points);
+        assert!(net.valid);
+        assert_eq!(net.hull.len(), 3, "hull of a triangle is the triangle");
+
+        // Every clicked point lies on the hull (in `(lon, lat)` order).
+        for &(plat, plon) in &points {
+            assert!(
+                net.hull.iter().any(|&(hlon, hlat)| {
+                    (hlon - plon).abs() < 1e-9 && (hlat - plat).abs() < 1e-9
+                }),
+                "clicked point ({plat}, {plon}) missing from the hull {:?}",
+                net.hull
+            );
+        }
+    }
+
+    /// `polygon::unproject` returns `(lon, lat)`, so every consumer of
+    /// `NetworkArea::corners` / `center` has to read it in that order. This
+    /// pins the convention down: a small axis-aligned square in Sweden must
+    /// come back with a fetch span close to its own side length, and a centre
+    /// whose `.0` is the longitude.
+    #[test]
+    fn network_area_reports_lon_lat_and_a_sane_fetch_span() {
+        // ~4 km square around Ostersund, given as (lat, lon) click points.
+        let (lat, lon): (f64, f64) = (63.1792, 14.6357);
+        let dlat = 2.0 / 110.574;
+        let dlon = 2.0 / (111.320 * lat.to_radians().cos());
+        let points = vec![
+            (lat - dlat, lon - dlon),
+            (lat - dlat, lon + dlon),
+            (lat + dlat, lon + dlon),
+            (lat + dlat, lon - dlon),
+        ];
+
+        let net = recompute_network_area(&points);
+        assert!(net.valid);
+        assert!((net.center.0 - lon).abs() < 1e-3, "center.0 should be lon, got {}", net.center.0);
+        assert!((net.center.1 - lat).abs() < 1e-3, "center.1 should be lat, got {}", net.center.1);
+        assert!(
+            (net.side_km - 4.0).abs() < 0.2,
+            "side_km {} should be about 4",
+            net.side_km
+        );
+        // An axis-aligned square needs no bounding slack, so the fetch span
+        // should match the side. A swapped lat/lon here inflates it by the
+        // ratio of the two degree scales (~2.2x at this latitude).
+        assert!(
+            (net.fetch_size_km - 4.0).abs() < 0.3,
+            "fetch_size_km {} should be about 4",
+            net.fetch_size_km
+        );
+    }
     /// Zooming in/out around an anchor point must leave the lon/lat under
     /// that anchor unchanged — the actual fix for "zoom doesn't follow the
     /// cursor" / "goes through the map".
