@@ -83,6 +83,169 @@ pub struct DroneKinematics {
     pub heading_deg: f32,
 }
 
+/// Small, temporary wind disturbances around a drone's intended trajectory.
+///
+/// This is deliberately a lightweight hover model rather than atmospheric
+/// simulation. A gust applies a short horizontal acceleration, while a damped
+/// virtual position-hold controller pulls the drone back toward the path it
+/// would have flown in still air. Consequently a hovering drone wanders and
+/// corrects instead of accumulating an unbounded random walk.
+#[derive(Component, Debug)]
+pub struct HoverWind {
+    /// Strength multiplier: 0 disables wind, 1 is the baseline, 2 doubles it.
+    intensity: f32,
+    /// Displacement from the still-air trajectory, km.
+    offset: Vec3,
+    /// Velocity contributed by the disturbance, km/s.
+    velocity: Vec3,
+    /// Smoothed acceleration of the current gust, km/s².
+    gust_acceleration: Vec3,
+    /// Acceleration the current gust is building toward, km/s².
+    target_acceleration: Vec3,
+    /// Seconds until the current gust or lull changes state.
+    phase_remaining_secs: f32,
+    gusting: bool,
+    rng_state: u32,
+}
+
+// These excursions are intentionally a little larger than GPS position-hold
+// error on a consumer quad: the map is 20 km wide, so centimetre-scale motion
+// would be invisible. They remain tiny relative to the simulation scale.
+const MAX_WIND_OFFSET_KM: f32 = 0.015; // 15 m
+const MAX_WIND_SPEED_KM_S: f32 = 0.006; // 6 m/s
+const MAX_GUST_ACCEL_KM_S2: f32 = 0.005; // 5 m/s² at the strongest instant
+const POSITION_HOLD_OMEGA: f32 = 0.65;
+const POSITION_HOLD_DAMPING: f32 = 0.85;
+const GUST_RESPONSE_SECS: f32 = 0.30;
+
+impl HoverWind {
+    /// Create a deterministic but distinct wind response for one drone.
+    ///
+    /// `intensity` is a linear strength multiplier. Negative values are
+    /// treated as zero.
+    pub fn new(seed: usize, intensity: f32) -> Self {
+        let mut wind = Self {
+            intensity: intensity.max(0.0),
+            offset: Vec3::ZERO,
+            velocity: Vec3::ZERO,
+            gust_acceleration: Vec3::ZERO,
+            target_acceleration: Vec3::ZERO,
+            phase_remaining_secs: 0.0,
+            gusting: false,
+            rng_state: Self::mixed_seed(seed),
+        };
+
+        // Do not put every drone at the start of a gust on the same frame.
+        // Each independently seeded stream chooses its own initial phase.
+        if wind.random_range(0.0, 1.0) < 0.5 {
+            wind.begin_gust();
+        } else {
+            wind.begin_lull();
+        }
+        wind
+    }
+
+    /// Avalanche adjacent drone indices into unrelated PRNG states. Feeding
+    /// sequential seeds directly into a linear generator leaves visible
+    /// correlations between drones even though their state is technically
+    /// separate.
+    fn mixed_seed(seed: usize) -> u32 {
+        let mut x = (seed as u32).wrapping_add(0x9e37_79b9);
+        x = (x ^ (x >> 16)).wrapping_mul(0x21f0_aaad);
+        x = (x ^ (x >> 15)).wrapping_mul(0x735a_2d97);
+        (x ^ (x >> 15)).max(1)
+    }
+
+    /// Advance the disturbance and return its extra displacement this frame.
+    /// Returning displacement, rather than mutating commanded velocity, keeps
+    /// wind independent of navigation and recovery logic.
+    fn advance(&mut self, frame_dt: f32) -> Vec3 {
+        // A long debugger pause must not launch the drone across the map. The
+        // normal render timestep is far below this cap.
+        let dt = frame_dt.clamp(0.0, 0.1);
+        if dt == 0.0 {
+            return Vec3::ZERO;
+        }
+
+        self.phase_remaining_secs -= dt;
+        if self.phase_remaining_secs <= 0.0 {
+            if self.gusting {
+                self.begin_lull();
+            } else {
+                self.begin_gust();
+            }
+        }
+
+        // Rotor/controller response rounds off the beginning and end of a
+        // gust instead of changing acceleration discontinuously.
+        let response = 1.0 - (-dt / GUST_RESPONSE_SECS).exp();
+        self.gust_acceleration =
+            self.gust_acceleration.lerp(self.target_acceleration, response);
+
+        // Damped spring about the still-air trajectory: the position-hold
+        // flight controller correcting the accumulated wind error.
+        let restoring_acceleration = -POSITION_HOLD_OMEGA.powi(2) * self.offset
+            - 2.0 * POSITION_HOLD_DAMPING * POSITION_HOLD_OMEGA * self.velocity;
+        self.velocity += (self.gust_acceleration + restoring_acceleration) * dt;
+        let max_speed = MAX_WIND_SPEED_KM_S * self.intensity;
+        self.velocity = self.velocity.clamp_length_max(max_speed);
+
+        let previous_offset = self.offset;
+        self.offset += self.velocity * dt;
+        self.offset.y = 0.0;
+        let max_offset = MAX_WIND_OFFSET_KM * self.intensity;
+        self.offset = self.offset.clamp_length_max(max_offset);
+
+        // Do not keep integrating outward velocity against the displacement
+        // limiter; allow the next controller update to move inward at once.
+        if self.offset.length_squared() >= max_offset.powi(2)
+            && self.velocity.dot(self.offset) > 0.0
+        {
+            self.velocity -= self.velocity.project_onto(self.offset);
+        }
+
+        self.offset - previous_offset
+    }
+
+    fn begin_gust(&mut self) {
+        self.gusting = true;
+        self.phase_remaining_secs = self.random_range(0.7, 1.8);
+
+        let mut direction = Vec3::new(
+            self.random_range(-1.0, 1.0),
+            0.0,
+            self.random_range(-1.0, 1.0),
+        );
+        if direction.length_squared() < 1e-4 {
+            direction = Vec3::X;
+        }
+        let magnitude = self.random_range(0.25, 1.0) * MAX_GUST_ACCEL_KM_S2 * self.intensity;
+        self.target_acceleration = direction.normalize() * magnitude;
+    }
+
+    fn begin_lull(&mut self) {
+        self.gusting = false;
+        self.phase_remaining_secs = self.random_range(0.4, 1.2);
+        self.target_acceleration = Vec3::ZERO;
+    }
+
+    fn random_range(&mut self, min: f32, max: f32) -> f32 {
+        // Xorshift32: each HoverWind owns this state, so drones advance wholly
+        // independent streams while scenarios remain deterministic.
+        self.rng_state ^= self.rng_state << 13;
+        self.rng_state ^= self.rng_state >> 17;
+        self.rng_state ^= self.rng_state << 5;
+        let unit = (self.rng_state >> 8) as f32 / 0x00ff_ffff as f32;
+        min + (max - min) * unit
+    }
+}
+
+impl Default for HoverWind {
+    fn default() -> Self {
+        Self::new(0, 1.0)
+    }
+}
+
 /// A static or dynamic obstacle this drone must avoid.
 #[derive(Component)]
 pub struct Obstacle {
@@ -151,15 +314,18 @@ impl MovementLogic for RustMove {
 /// Clamps altitude to [DRONE_RADIUS, max_altitude_km].
 pub fn apply_velocity(
     time: Res<Time>,
-    mut drones: Query<(&mut Transform, &mut DroneKinematics)>,
+    mut drones: Query<(&mut Transform, &mut DroneKinematics, Option<&mut HoverWind>)>,
 ) {
     let dt = time.delta_secs();
-    for (mut transform, mut kin) in &mut drones {
+    for (mut transform, mut kin, wind) in &mut drones {
+        let wind_displacement = wind.map_or(Vec3::ZERO, |mut wind| wind.advance(dt));
+        let wind_velocity = if dt > 0.0 { wind_displacement / dt } else { Vec3::ZERO };
+
         // Everything that gets a say in this frame's velocity has now had it,
         // so this is what the airframe actually flies — record it before
         // integrating, for next frame's avoidance to measure against.
-        kin.flown_velocity = kin.velocity;
-        transform.translation += kin.velocity * dt;
+        kin.flown_velocity = kin.velocity + wind_velocity;
+        transform.translation += kin.velocity * dt + wind_displacement;
 
         // Keep above ground
         transform.translation.y = transform.translation.y
@@ -169,6 +335,74 @@ pub fn apply_velocity(
         if kin.velocity.xz().length_squared() > 1e-6 {
             kin.heading_deg = kin.velocity.x.atan2(kin.velocity.z).to_degrees();
         }
+    }
+}
+
+#[cfg(test)]
+mod hover_wind_tests {
+    use super::*;
+
+    #[test]
+    fn hover_wind_moves_but_stays_bounded_and_horizontal() {
+        let mut wind = HoverWind::new(7, 1.0);
+        let mut greatest_excursion = 0.0_f32;
+
+        // Four simulated minutes exercises many independent gust/lull cycles.
+        for _ in 0..12_000 {
+            wind.advance(0.02);
+            greatest_excursion = greatest_excursion.max(wind.offset.length());
+            assert!(wind.offset.is_finite());
+            assert!(wind.velocity.is_finite());
+            assert_eq!(wind.offset.y, 0.0);
+            assert!(wind.offset.length() <= MAX_WIND_OFFSET_KM + 1e-6);
+            assert!(wind.velocity.length() <= MAX_WIND_SPEED_KM_S + 1e-6);
+        }
+
+        assert!(greatest_excursion > 0.001, "gusts never produced visible movement");
+    }
+
+    #[test]
+    fn drone_seeds_have_independent_phases_and_motion() {
+        let mut winds: Vec<_> = (0..12).map(|seed| HoverWind::new(seed, 1.0)).collect();
+
+        let gusting_count = winds.iter().filter(|wind| wind.gusting).count();
+        assert!(
+            gusting_count > 0 && gusting_count < winds.len(),
+            "all drones started in the same wind phase"
+        );
+
+        for _ in 0..500 {
+            for wind in &mut winds {
+                wind.advance(0.02);
+            }
+        }
+
+        for pair in winds.windows(2) {
+            assert!(
+                pair[0].offset.distance(pair[1].offset) > 1e-5,
+                "adjacent drone seeds moved in lockstep"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_timestep_is_a_noop() {
+        let mut wind = HoverWind::new(3, 1.0);
+        let before = wind.offset;
+        assert_eq!(wind.advance(0.0), Vec3::ZERO);
+        assert_eq!(wind.offset, before);
+    }
+
+    #[test]
+    fn zero_intensity_disables_wind() {
+        let mut wind = HoverWind::new(4, 0.0);
+
+        for _ in 0..1_000 {
+            assert_eq!(wind.advance(0.02), Vec3::ZERO);
+        }
+
+        assert_eq!(wind.offset, Vec3::ZERO);
+        assert_eq!(wind.velocity, Vec3::ZERO);
     }
 }
 

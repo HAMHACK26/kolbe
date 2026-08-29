@@ -4,7 +4,10 @@ use crate::{
     base::CommandQueue,
     camera::OrbitCamera,
     drone::{Drone, DroneType, SelectedDrone, drone_id, make_antenna},
-    factories::{DroneAi, movement::DroneKinematics},
+    factories::{
+        DroneAi,
+        movement::{DroneKinematics, HoverWind},
+    },
     networking::NetworkingBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     recovery::{ContactMemory, RecoveryState},
@@ -18,7 +21,28 @@ use crate::{
 
 pub const WORLD_SIZE: f32 = 20.0;
 pub const DRONE_COUNT: usize = 12;
+/// Collision/avoidance radius. This intentionally remains independent of the
+/// rendered sphere size below.
 pub const DRONE_RADIUS: f32 = 0.18;
+/// Radius of the visible drone sphere, in world-space kilometres.
+pub const DRONE_VISUAL_RADIUS: f32 = 0.05;
+pub const MIN_WIND_INTENSITY: f32 = 0.0;
+pub const MAX_WIND_INTENSITY: f32 = 20.0;
+pub const WIND_INTENSITY_STEP: f32 = 1.0;
+pub const DEFAULT_WIND_INTENSITY: f32 = 3.0;
+
+/// Wind strength chosen on the setup screen. 0 disables wind, 1 is the
+/// baseline disturbance, and values up to 20 progressively amplify it.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct WindSettings {
+    pub intensity: f32,
+}
+
+impl Default for WindSettings {
+    fn default() -> Self {
+        Self { intensity: DEFAULT_WIND_INTENSITY }
+    }
+}
 
 pub fn setup(
     mut commands: Commands,
@@ -26,6 +50,7 @@ pub fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
     theme: Res<Theme>,
+    wind: Res<WindSettings>,
 ) {
     let pal = theme.palette();
     // `AmbientLight` is a per-camera override of `GlobalAmbientLight` and so
@@ -50,7 +75,7 @@ pub fn setup(
         (9.1, 17.8), (13.5, 14.0), (19.0, 18.5), (6.7, 7.3),
     ];
 
-    let drone_mesh = meshes.add(Sphere::new(DRONE_RADIUS));
+    let drone_mesh = meshes.add(Sphere::new(DRONE_VISUAL_RADIUS));
     // Initial colors come from the palette; `apply_theme` keeps them in sync on
     // theme toggles (these entities carry ThemeRole markers).
     let drone_mat = materials.add(StandardMaterial {
@@ -101,6 +126,7 @@ pub fn setup(
                 Transform::from_translation(drone_pos),
                 Drone { id: drone_id(i), drone_type, antennas: antennas.clone() },
                 DroneKinematics::default(),
+                HoverWind::new(i, wind.intensity),
                 DroneAi::default(),
                 CommandQueue::default(),
                 NetworkingBundle::random(i),
