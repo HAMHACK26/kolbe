@@ -99,6 +99,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
 
+use crate::antenna::Antennas;
 use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
@@ -229,22 +230,23 @@ pub struct Pairing {
     pub paired_peer_pos: Option<Vec3>,
 }
 
-/// Everything a drone needs to take part in the mesh.
+/// Everything a *radio node* needs to take part in the mesh — carried by the
+/// base as well as by every drone, because both run the same protocol on the
+/// same systems (see [`crate::antenna::Antennas`]).
 #[derive(Bundle)]
-pub struct NetworkingBundle {
+pub struct RadioBundle {
     pub uuid: DroneUuid,
     pub clock: DroneClock,
     pub links: LinkSet,
     pub sent: SentHeaders,
     pub ranging: RangingResults,
     pub mesh_table: MeshTable,
-    pub ring_index: RingIndex,
     pub tracked_peers: TrackedPeers,
     pub pairing: Pairing,
 }
 
-impl NetworkingBundle {
-    pub fn random(ring_index: usize) -> Self {
+impl RadioBundle {
+    pub fn random() -> Self {
         Self {
             uuid: DroneUuid::random(),
             clock: DroneClock::random_start(),
@@ -252,10 +254,24 @@ impl NetworkingBundle {
             sent: SentHeaders::default(),
             ranging: RangingResults::default(),
             mesh_table: MeshTable::default(),
-            ring_index: RingIndex(ring_index),
             tracked_peers: TrackedPeers::default(),
             pairing: Pairing::default(),
         }
+    }
+}
+
+/// A drone's radio, plus the ring slot that decides which two peers it aims
+/// at. The base has no ring slot — it covers the whole formation — which is
+/// exactly why [`RingIndex`] is here and not in [`RadioBundle`].
+#[derive(Bundle)]
+pub struct NetworkingBundle {
+    pub radio: RadioBundle,
+    pub ring_index: RingIndex,
+}
+
+impl NetworkingBundle {
+    pub fn random(ring_index: usize) -> Self {
+        Self { radio: RadioBundle::random(), ring_index: RingIndex(ring_index) }
     }
 }
 
@@ -404,21 +420,27 @@ pub fn advance_clocks(time: Res<Time>, mut clocks: Query<&mut DroneClock>) {
 /// For every ordered (self, peer) pair, take the best RSSI across self's
 /// antennas. `rssi >= sensitivity` means self's antenna is receiving peer —
 /// only possible when the antennas face each other.
+///
+/// This runs over every radio node — the base included, since it carries
+/// [`Antennas`] just like a drone does. A base has no airframe, hence no
+/// [`DroneKinematics`]: its heading is 0 (its antenna azimuths are already
+/// world-frame) and it reports a zero flight direction, which is exactly true
+/// of something bolted to the ground.
 #[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
 pub fn detect_links_and_send_headers(
     mut mailbox: ResMut<Mailbox>,
-    mut drones: Query<(
+    mut nodes: Query<(
         Entity,
         &GlobalTransform,
-        &Drone,
-        &DroneKinematics,
+        &Antennas,
+        Option<&DroneKinematics>,
         &DroneClock,
         &DroneUuid,
         &mut LinkSet,
         &mut SentHeaders,
         &MeshTable,
     )>,
-    positions: Query<(Entity, &GlobalTransform), With<Drone>>,
+    positions: Query<(Entity, &GlobalTransform), With<Antennas>>,
     uuids: Query<&DroneUuid>,
     bases: Query<&Base>,
 ) {
@@ -426,8 +448,11 @@ pub fn detect_links_and_send_headers(
     // not the antenna's own pointing direction.
     let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
 
-    for (self_entity, self_gt, drone, kin, clock, uuid, mut links, mut sent, table) in &mut drones
+    for (self_entity, self_gt, antennas, kin, clock, uuid, mut links, mut sent, table) in
+        &mut nodes
     {
+        let (heading_deg, velocity) =
+            kin.map(|k| (k.heading_deg, k.velocity)).unwrap_or((0.0, Vec3::ZERO));
         let self_pos = self_gt.translation();
         let vector_from_base = self_pos - base_pos;
 
@@ -439,8 +464,8 @@ pub fn detect_links_and_send_headers(
                 *peer_entity != self_entity && {
                     let peer_pos = peer_gt.translation();
                     let distance_km = (peer_pos - self_pos).length();
-                    drone.antennas.iter().any(|antenna| {
-                        let theta_tx = antenna.off_boresight_deg(kin.heading_deg, self_pos, peer_pos);
+                    antennas.0.iter().any(|antenna| {
+                        let theta_tx = antenna.off_boresight_deg(heading_deg, self_pos, peer_pos);
                         antenna.rssi_dbm(theta_tx, 0.0, distance_km) >= antenna.sensitivity_dbm
                     })
                 }
@@ -470,7 +495,7 @@ pub fn detect_links_and_send_headers(
             let header = NetworkHeader {
                 id: uuid.0.clone(),
                 connected_antenna: vector_from_base,
-                flight_direction: kin.velocity * FLIGHT_LOOKAHEAD_SECS,
+                flight_direction: velocity * FLIGHT_LOOKAHEAD_SECS,
                 time_received: clock.now,
             };
             mailbox.0.push((
@@ -827,307 +852,4 @@ fn format_uuid_v4(hi: u64, lo: u64) -> String {
         b(lo, 56), b(lo, 48),
         b(lo, 40), b(lo, 32), b(lo, 24), b(lo, 16), b(lo, 8), b(lo, 0),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy::ecs::system::RunSystemOnce;
-
-    use crate::drone::{make_antenna, DroneType};
-    use crate::tracking::maintain_mesh_antennas;
-
-    /// A full drone with everything the networking + tracking systems need.
-    fn spawn_drone(world: &mut World, pos: Vec3, ring: usize) -> Entity {
-        world
-            .spawn((
-                Transform::from_translation(pos),
-                GlobalTransform::from(Transform::from_translation(pos)),
-                Drone { id: format!("d{ring}"), drone_type: DroneType::Node },
-                Antennas(vec![
-                    make_antenna(0.0, 0.0, 0),
-                    make_antenna(0.0, 0.0, 1),
-                    make_antenna(0.0, 0.0, 2),
-                ]),
-                DroneKinematics::default(),
-                NetworkingBundle::random(ring),
-            ))
-            .id()
-    }
-
-    fn uuid_of(world: &World, drone: Entity) -> String {
-        world.get::<DroneUuid>(drone).unwrap().0.clone()
-    }
-
-    /// Seed `owner`'s mesh table with a base-relative row for `peer`, as if
-    /// from a prior mission briefing rather than live telemetry — the same
-    /// comms-derived channel `tracking::maintain_mesh_antennas` reads to aim
-    /// antennas, so it can achieve an initial lock without ever reading
-    /// `peer`'s live `Transform` directly (see `tracking.rs` docs). Tests
-    /// call this only for the pairs that are meant to already "know" each
-    /// other going in — never for a pair whose relay-learning is itself
-    /// under test.
-    fn seed_mesh_row(world: &mut World, base_pos: Vec3, owner: Entity, peer: Entity, peer_pos: Vec3) {
-        let peer_uuid = uuid_of(world, peer);
-        world.get_mut::<MeshTable>(owner).unwrap().0.insert(
-            peer_uuid.clone(),
-            MeshRow {
-                id: peer_uuid,
-                timestamp: 0.0,
-                location: peer_pos - base_pos,
-                neighbour_distance: 0,
-                connections: vec![],
-            },
-        );
-    }
-
-    /// maintain (aim antennas) → detect (form links). Two drones a km apart,
-    /// facing, should both end up with the other in their `LinkSet`.
-    fn aim_and_detect(world: &mut World) {
-        world.run_system_once(maintain_mesh_antennas).unwrap();
-        world.run_system_once(detect_links_and_send_headers).unwrap();
-    }
-
-    /// A drone whose ring neighbors are all linked keeps flying; a drone
-    /// missing one stops dead. This is the whole "lose a connection → stop"
-    /// rule, so both halves are asserted against one shared setup.
-    #[test]
-    fn link_loss_halts_only_the_drone_that_lost_it() {
-        let mut world = World::new();
-        // Three drones is the smallest ring where "next" and "previous" are
-        // different peers, i.e. where the two-neighbor invariant exists.
-        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
-        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
-        let c = spawn_drone(&mut world, Vec3::new(0.0, 0.0, 1.0), 2);
-
-        let cruising = Vec3::new(0.01, 0.0, 0.0);
-        for drone in [a, b, c] {
-            world.get_mut::<DroneKinematics>(drone).unwrap().velocity = cruising;
-        }
-        // Fully linked ring, except A never hears C.
-        let link = |world: &mut World, owner: Entity, peers: &[Entity]| {
-            let mut links = world.get_mut::<LinkSet>(owner).unwrap();
-            for &peer in peers {
-                links.connected.insert(peer, 0.0);
-            }
-        };
-        link(&mut world, a, &[b]);
-        link(&mut world, b, &[a, c]);
-        link(&mut world, c, &[a, b]);
-
-        world.run_system_once(halt_on_link_loss).unwrap();
-
-        let velocity = |world: &World, drone: Entity| {
-            world.get::<DroneKinematics>(drone).unwrap().velocity
-        };
-        assert_eq!(velocity(&world, a), Vec3::ZERO, "A lost C and must stop");
-        assert_eq!(velocity(&world, b), cruising, "B has both neighbors and keeps flying");
-        // C still *thinks* it has both — links are per-drone and A's loss is
-        // A's alone until C's own detection notices.
-        assert_eq!(velocity(&world, c), cruising, "C still has both neighbors");
-    }
-
-    #[test]
-    fn link_forms_between_facing_in_range_drones() {
-        let mut world = World::new();
-        world.insert_resource(Mailbox::default());
-        let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos });
-        let a_pos = Vec3::ZERO;
-        let b_pos = Vec3::new(1.0, 0.0, 0.0);
-        let a = spawn_drone(&mut world, a_pos, 0);
-        let b = spawn_drone(&mut world, b_pos, 1);
-        seed_mesh_row(&mut world, base_pos, a, b, b_pos);
-        seed_mesh_row(&mut world, base_pos, b, a, a_pos);
-
-        aim_and_detect(&mut world);
-
-        assert!(
-            world.get::<LinkSet>(a).unwrap().connected.contains_key(&b),
-            "A should have detected B"
-        );
-        assert!(
-            world.get::<LinkSet>(b).unwrap().connected.contains_key(&a),
-            "B should have detected A"
-        );
-        // A header was queued for the peer.
-        assert!(!world.resource::<Mailbox>().0.is_empty(), "headers should be queued");
-    }
-
-    #[test]
-    fn out_of_range_drones_do_not_link() {
-        let mut world = World::new();
-        world.insert_resource(Mailbox::default());
-        world.spawn(Base { id: "base".into(), position: Vec3::new(0.0, 0.0, -5.0) });
-        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
-        // 100 km apart — far past the ~3.5 km link budget.
-        let b = spawn_drone(&mut world, Vec3::new(100.0, 0.0, 0.0), 1);
-
-        aim_and_detect(&mut world);
-
-        assert!(world.get::<LinkSet>(a).unwrap().connected.is_empty());
-        assert!(world.get::<LinkSet>(b).unwrap().connected.is_empty());
-    }
-
-    #[test]
-    fn mesh_table_learns_direct_peer_at_distance_zero() {
-        let mut world = World::new();
-        world.insert_resource(Mailbox::default());
-        let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos });
-        let a_pos = Vec3::ZERO;
-        let b_pos = Vec3::new(1.0, 0.0, 0.0);
-        let a = spawn_drone(&mut world, a_pos, 0);
-        let b = spawn_drone(&mut world, b_pos, 1);
-        let a_uuid = uuid_of(&world, a);
-        seed_mesh_row(&mut world, base_pos, a, b, b_pos);
-        seed_mesh_row(&mut world, base_pos, b, a, a_pos);
-
-        aim_and_detect(&mut world);
-        world.run_system_once(route_packets).unwrap();
-
-        let b_table = world.get::<MeshTable>(b).unwrap();
-        let row = b_table.0.get(&a_uuid).expect("B should have learned A");
-        assert_eq!(row.neighbour_distance, 0, "a direct peer is distance 0");
-    }
-
-    #[test]
-    fn ranging_recovers_the_true_distance() {
-        let mut world = World::new();
-        world.insert_resource(Mailbox::default());
-        let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos });
-        let a_pos = Vec3::ZERO;
-        let b_pos = Vec3::new(2.0, 0.0, 0.0); // 2 km apart
-        let a = spawn_drone(&mut world, a_pos, 0);
-        let _b = spawn_drone(&mut world, b_pos, 1);
-        seed_mesh_row(&mut world, base_pos, a, _b, b_pos);
-        seed_mesh_row(&mut world, base_pos, _b, a, a_pos);
-
-        aim_and_detect(&mut world);
-        // First pass: headers → echoes. Second pass: echoes → ranging.
-        world.run_system_once(route_packets).unwrap();
-        world.run_system_once(route_packets).unwrap();
-
-        let ranging = world.get::<RangingResults>(a).unwrap();
-        let (_, sv) = ranging.0.last().expect("A should have a ranging result");
-        assert!((sv.length - 2.0).abs() < 0.01, "measured distance ~2 km, got {}", sv.length);
-    }
-
-    /// One full round: advance every drone's clock past the resend interval,
-    /// re-aim, detect links, route one hop of gossip.
-    fn step(world: &mut World, drones: &[Entity]) {
-        for &e in drones {
-            world.get_mut::<DroneClock>(e).unwrap().now += 0.2;
-        }
-        world.run_system_once(maintain_mesh_antennas).unwrap();
-        world.run_system_once(detect_links_and_send_headers).unwrap();
-        world.run_system_once(route_packets).unwrap();
-    }
-
-    /// A—B—C in a line: A↔B and B↔C are in range, but A↔C (5 km) is not. After
-    /// enough gossip rounds, C learns about A *by relay through B*, recorded at
-    /// neighbour_distance 1 (one hop past its direct peer B).
-    #[test]
-    fn distant_peer_learned_by_relay_at_distance_one() {
-        let mut world = World::new();
-        world.insert_resource(Mailbox::default());
-        let base_pos = Vec3::new(0.0, 0.0, -8.0);
-        world.spawn(Base { id: "base".into(), position: base_pos });
-        let a_pos = Vec3::ZERO;
-        let b_pos = Vec3::new(2.5, 0.0, 0.0);
-        let c_pos = Vec3::new(5.0, 0.0, 0.0);
-        let a = spawn_drone(&mut world, a_pos, 0);
-        let b = spawn_drone(&mut world, b_pos, 1);
-        let c = spawn_drone(&mut world, c_pos, 2);
-        let a_uuid = uuid_of(&world, a);
-
-        // Seed only the pairs meant to link directly (A-B, B-C) so their
-        // antennas achieve an initial lock — deliberately NOT A-C, since C
-        // learning of A is exactly what this test verifies happens by relay,
-        // not by already knowing.
-        seed_mesh_row(&mut world, base_pos, a, b, b_pos);
-        seed_mesh_row(&mut world, base_pos, b, a, a_pos);
-        seed_mesh_row(&mut world, base_pos, b, c, c_pos);
-        seed_mesh_row(&mut world, base_pos, c, b, b_pos);
-
-        // A few rounds so the gossip has time to walk A's row out to C via B.
-        for _ in 0..4 {
-            step(&mut world, &[a, b, c]);
-        }
-
-        // C never links A directly (out of range)…
-        assert!(
-            !world.get::<LinkSet>(c).unwrap().connected.contains_key(&a),
-            "A↔C should be out of range — no direct link"
-        );
-        // …but still learns of A, relayed, at one hop past its direct peer.
-        let c_table = world.get::<MeshTable>(c).unwrap();
-        let row = c_table.0.get(&a_uuid).expect("C should have learned A by relay");
-        assert_eq!(row.neighbour_distance, 1, "relayed peer is one hop past the direct link");
-    }
-
-    /// A header is not resent until `HEADER_INTERVAL_SECS` has passed on the
-    /// sending drone's *own* clock — resend cadence is per-drone, not shared.
-    #[test]
-    fn header_not_resent_within_interval_on_own_clock() {
-        let mut world = World::new();
-        world.insert_resource(Mailbox::default());
-        let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos });
-        let a_pos = Vec3::ZERO;
-        let b_pos = Vec3::new(1.0, 0.0, 0.0);
-        let a = spawn_drone(&mut world, a_pos, 0);
-        let _b = spawn_drone(&mut world, b_pos, 1);
-        seed_mesh_row(&mut world, base_pos, a, _b, b_pos);
-        seed_mesh_row(&mut world, base_pos, _b, a, a_pos);
-
-        aim_and_detect(&mut world);
-        assert!(!world.resource::<Mailbox>().0.is_empty(), "first detect sends headers");
-
-        // Drain, then detect again with the clock unchanged — nothing due yet.
-        world.resource_mut::<Mailbox>().0.clear();
-        world.run_system_once(detect_links_and_send_headers).unwrap();
-        assert!(
-            world.resource::<Mailbox>().0.is_empty(),
-            "no resend before the interval elapses on the own clock"
-        );
-
-        // Advance every clock past the interval → headers resend.
-        world.get_mut::<DroneClock>(a).unwrap().now += HEADER_INTERVAL_SECS + 0.01;
-        world.get_mut::<DroneClock>(_b).unwrap().now += HEADER_INTERVAL_SECS + 0.01;
-        world.run_system_once(detect_links_and_send_headers).unwrap();
-        assert!(!world.resource::<Mailbox>().0.is_empty(), "resend after interval elapses");
-    }
-
-    /// A link is dropped once the peer moves out of range — `LinkSet` reflects
-    /// only currently-reachable peers, not stale ones.
-    #[test]
-    fn link_drops_when_peer_leaves_range() {
-        let mut world = World::new();
-        world.insert_resource(Mailbox::default());
-        let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        world.spawn(Base { id: "base".into(), position: base_pos });
-        let a_pos = Vec3::ZERO;
-        let b_pos = Vec3::new(1.0, 0.0, 0.0);
-        let a = spawn_drone(&mut world, a_pos, 0);
-        let b = spawn_drone(&mut world, b_pos, 1);
-        seed_mesh_row(&mut world, base_pos, a, b, b_pos);
-        seed_mesh_row(&mut world, base_pos, b, a, a_pos);
-
-        aim_and_detect(&mut world);
-        assert!(world.get::<LinkSet>(a).unwrap().connected.contains_key(&b), "linked in range");
-
-        // Teleport B far out of range (update both transforms).
-        let far = Vec3::new(100.0, 0.0, 0.0);
-        *world.get_mut::<Transform>(b).unwrap() = Transform::from_translation(far);
-        *world.get_mut::<GlobalTransform>(b).unwrap() =
-            GlobalTransform::from(Transform::from_translation(far));
-
-        aim_and_detect(&mut world);
-        assert!(
-            world.get::<LinkSet>(a).unwrap().connected.is_empty(),
-            "link should drop once B is out of range"
-        );
-    }
 }

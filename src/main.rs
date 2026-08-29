@@ -205,6 +205,7 @@ fn main() {
                 // the lock on a moving neighbor, then the spiral search takes
                 // over only on the slots that have gone dark.
                 tracking::maintain_mesh_antennas,
+                tracking::maintain_base_antennas,
                 seeking::seek_lost_links,
                 networking::detect_links_and_send_headers,
                 networking::route_packets,

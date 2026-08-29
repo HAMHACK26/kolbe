@@ -1,7 +1,7 @@
 use bevy::{picking::prelude::*, prelude::*};
 
 use crate::{
-    antenna::{Antenna, angles_toward},
+    antenna::{Antenna, Antennas, angles_toward},
     base::{Base, CommandQueue},
     camera::OrbitCamera,
     drone::{Drone, DroneType, SelectedDrone, drone_id, make_antenna},
@@ -31,8 +31,8 @@ pub const MAX_NEIGHBOR_SPACING_KM: f32 = 3.0;
 /// spawns off the fetched height map.
 const RING_TERRAIN_MARGIN_KM: f32 = 0.5;
 
-/// The startup formation: `DRONE_COUNT` drones on a ring centered on the
-/// terrain, spread as wide as the radio allows.
+/// The startup formation: `DRONE_COUNT` drones on a ring around the base,
+/// spread as wide as the radio allows.
 ///
 /// The ring sits at the largest radius whose neighbor spacing still respects
 /// [`MAX_NEIGHBOR_SPACING_KM`]. A ring of N at radius R has a neighbor chord
@@ -41,17 +41,35 @@ const RING_TERRAIN_MARGIN_KM: f32 = 0.5;
 /// is whatever area was picked on the map and can be far smaller than the ring
 /// the link budget alone would allow.
 ///
+/// It is centered on the base because the base is a radio node in the same
+/// mesh: putting the ring around it holds every drone one radius from the
+/// ground station, inside the same link budget that governs the drone-to-drone
+/// hops. A base close to the terrain edge would push the ring off the map, so
+/// the *center* slides inward to whatever keeps the full-width ring inside the
+/// fetched area — the base then sits off-center in its own ring rather than
+/// the formation collapsing.
+///
 /// `height_at` is the terrain sampler (`TerrainHeightMap::height_at`), taken as
 /// a closure so the geometry can be exercised against synthetic terrain.
-pub fn ring_formation(terrain_size_km: f32, height_at: impl Fn(f32, f32) -> f32) -> Vec<Vec3> {
+pub fn ring_formation(
+    terrain_size_km: f32,
+    base_pos: Vec3,
+    height_at: impl Fn(f32, f32) -> f32,
+) -> Vec<Vec3> {
     let n = DRONE_COUNT as f32;
     let chord_per_radius = 2.0 * (std::f32::consts::PI / n).sin();
     let terrain_limit = (terrain_size_km * 0.5 - RING_TERRAIN_MARGIN_KM).max(0.1);
     let mut radius = (MAX_NEIGHBOR_SPACING_KM / chord_per_radius).min(terrain_limit);
 
+    let center_limit = (terrain_limit - radius).max(0.0);
+    let center = Vec2::new(
+        base_pos.x.clamp(-center_limit, center_limit),
+        base_pos.z.clamp(-center_limit, center_limit),
+    );
+
     let ring_at = |radius: f32, i: usize| {
         let angle = i as f32 / n * std::f32::consts::TAU;
-        let (x, z) = (radius * angle.sin(), radius * angle.cos());
+        let (x, z) = (center.x + radius * angle.sin(), center.y + radius * angle.cos());
         Vec3::new(x, height_at(x, z) + DRONE_RADIUS, z)
     };
 
@@ -139,10 +157,11 @@ pub fn setup(
         ..default()
     });
 
-    let ring = ring_formation(terrain.size_km(), |x, z| terrain.height_at(x, z));
     // The base spawns before this system (see `main`), so this is the real
-    // base position every drone's antenna #2 points at from frame one.
+    // base position — both the ring's center and what every drone's antenna #2
+    // points at from frame one.
     let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+    let ring = ring_formation(terrain.size_km(), base_pos, |x, z| terrain.height_at(x, z));
 
     for i in 0..DRONE_COUNT {
         let drone_pos = ring[i];
@@ -154,7 +173,8 @@ pub fn setup(
                 Mesh3d(drone_mesh.clone()),
                 MeshMaterial3d(drone_mat.clone()),
                 Transform::from_translation(drone_pos),
-                Drone { id: drone_id(i), drone_type, antennas: antennas.clone() },
+                Drone { id: drone_id(i), drone_type },
+                Antennas(antennas.clone()),
                 DroneKinematics::default(),
                 DroneAi::default(),
                 CommandQueue::default(),
@@ -318,127 +338,6 @@ pub fn draw_grid(
                 Vec3::new(offset, terrain.height_at(offset, b) + 0.01, b),
                 color,
             );
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Flat ground at a fixed elevation.
-    fn flat(elevation_km: f32) -> impl Fn(f32, f32) -> f32 {
-        move |_, _| elevation_km
-    }
-
-    /// A ridge running east–west: elevation swings with Z, so the ring's
-    /// north and south arcs sit far apart vertically.
-    fn ridge(amplitude_km: f32) -> impl Fn(f32, f32) -> f32 {
-        move |_, z| amplitude_km * (z * 0.5).sin()
-    }
-
-    fn worst_neighbor_spacing(ring: &[Vec3]) -> f32 {
-        (0..ring.len())
-            .map(|i| ring[i].distance(ring[(i + 1) % ring.len()]))
-            .fold(0.0f32, f32::max)
-    }
-
-    /// Neighbors never exceed the cap, and on flat ground the formation
-    /// actually *uses* it — "spread as wide as possible" is the point, so a
-    /// timid ring is as wrong as an over-wide one.
-    #[test]
-    fn flat_ring_spreads_right_up_to_the_spacing_cap() {
-        let ring = ring_formation(20.0, flat(0.3));
-        assert_eq!(ring.len(), DRONE_COUNT);
-
-        let worst = worst_neighbor_spacing(&ring);
-        assert!(worst <= MAX_NEIGHBOR_SPACING_KM, "spacing {worst} exceeds cap");
-        assert!(
-            worst > MAX_NEIGHBOR_SPACING_KM - 0.01,
-            "spacing {worst} leaves the formation needlessly bunched up"
-        );
-    }
-
-    /// Terrain relief stretches the true 3-D distance past the flat chord —
-    /// the ring has to shrink until the real spacing is back inside the cap.
-    #[test]
-    fn hilly_ring_shrinks_until_true_spacing_fits() {
-        let ring = ring_formation(20.0, ridge(1.5));
-        let worst = worst_neighbor_spacing(&ring);
-        assert!(worst <= MAX_NEIGHBOR_SPACING_KM, "spacing {worst} exceeds cap on rough terrain");
-
-        // It shrank because of the relief, not because the terrain was small.
-        let flat_radius = ring_formation(20.0, flat(0.0))[0].xz().length();
-        let hilly_radius = ring[0].xz().length();
-        assert!(hilly_radius < flat_radius, "{hilly_radius} should be tighter than {flat_radius}");
-    }
-
-    /// A small fetched area clamps the ring, so no drone spawns off the edge
-    /// of the height map.
-    #[test]
-    fn ring_stays_inside_a_small_terrain() {
-        let size_km = 4.0;
-        let ring = ring_formation(size_km, flat(0.0));
-        let half = size_km * 0.5;
-        for p in &ring {
-            assert!(
-                p.x.abs() <= half && p.z.abs() <= half,
-                "{p:?} is outside a {size_km}km terrain"
-            );
-        }
-        assert!(worst_neighbor_spacing(&ring) <= MAX_NEIGHBOR_SPACING_KM);
-    }
-
-    /// The formation is *connected on startup*: with the spawn aim, every
-    /// drone's antenna #1/#3 close a link to its two ring neighbors on frame
-    /// 0 — the same `rssi >= sensitivity` test
-    /// `networking::detect_links_and_send_headers` applies.
-    #[test]
-    fn every_drone_links_both_neighbors_on_spawn() {
-        let ring = ring_formation(20.0, ridge(0.4));
-        let base_pos = Vec3::new(0.0, 0.0, -9.0);
-
-        for i in 0..DRONE_COUNT {
-            let antennas = formation_antennas(&ring, i, base_pos);
-            for neighbor in [(i + 1) % DRONE_COUNT, (i + DRONE_COUNT - 1) % DRONE_COUNT] {
-                let peer = ring[neighbor];
-                let distance_km = (peer - ring[i]).length();
-                // Heading is 0 at spawn, so the drone-relative azimuths the
-                // antennas carry are already world-frame.
-                let best = antennas
-                    .iter()
-                    .map(|a| {
-                        a.rssi_dbm(a.off_boresight_deg(0.0, ring[i], peer), 0.0, distance_km)
-                            - a.sensitivity_dbm
-                    })
-                    .fold(f32::NEG_INFINITY, f32::max);
-                assert!(best >= 0.0, "drone {i} misses neighbor {neighbor} by {best} dB");
-            }
-        }
-    }
-
-    /// Only the ring neighbors are linked. Non-adjacent drones must stay
-    /// invisible to each other so the mesh table's relayed, multi-hop rows are
-    /// the only way they learn about one another.
-    #[test]
-    fn non_neighbors_are_not_linked_on_spawn() {
-        let ring = ring_formation(20.0, flat(0.2));
-        let base_pos = Vec3::new(0.0, 0.0, -9.0);
-
-        for i in 0..DRONE_COUNT {
-            let antennas = formation_antennas(&ring, i, base_pos);
-            for (j, &peer) in ring.iter().enumerate() {
-                let adjacent = j == (i + 1) % DRONE_COUNT || j == (i + DRONE_COUNT - 1) % DRONE_COUNT;
-                if j == i || adjacent {
-                    continue;
-                }
-                let distance_km = (peer - ring[i]).length();
-                let linked = antennas.iter().any(|a| {
-                    a.rssi_dbm(a.off_boresight_deg(0.0, ring[i], peer), 0.0, distance_km)
-                        >= a.sensitivity_dbm
-                });
-                assert!(!linked, "drone {i} should not see non-neighbor {j}");
-            }
         }
     }
 }

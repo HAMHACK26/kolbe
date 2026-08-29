@@ -18,10 +18,11 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 
 use crate::{
-    antenna::Antenna,
+    antenna::{Antenna, Antennas, angles_toward},
     camera::OrbitCamera,
     drone::{Drone, SelectedDrone, make_antenna},
     factories::{movement::DroneKinematics, track::Track},
+    networking::RadioBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     theme::ThemeRole,
     world::DRONE_RADIUS,
@@ -103,9 +104,24 @@ pub fn spawn_base(
     };
     let pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
 
-    // 5 connections — same hardware as the drones, one antenna per 72° sector.
-    let antennas: Vec<Antenna> =
-        (0..5).map(|k| make_antenna(k as f32 * 72.0, 5.0, 200 + k)).collect();
+    // Same hardware as the drones, one antenna per drone, each already aimed
+    // at that drone's slot in the deployment formation — the base is briefed
+    // on where the ring is being flown, the same plan `world::setup` spawns
+    // the drones onto, so its links are up on frame 0 alongside theirs.
+    // `crate::tracking::maintain_base_antennas` keeps them aimed from there.
+    let ring = crate::world::ring_formation(terrain.size_km(), pos, |x, z| {
+        terrain.height_at(x, z)
+    });
+    let antennas: Vec<Antenna> = ring
+        .iter()
+        .enumerate()
+        .map(|(k, &drone_pos)| {
+            // A base has no heading, so a world-frame bearing is already the
+            // drone-relative azimuth its antennas are expressed in.
+            let (az, el) = angles_toward(pos, drone_pos);
+            make_antenna(az, el, 200 + k)
+        })
+        .collect();
 
     let base_entity = commands
         .spawn((
@@ -117,11 +133,14 @@ pub fn spawn_base(
             ..default()
         })),
         Transform::from_translation(pos),
-        Base {
-            id: "GCS-ALPHA".into(),
-            position: pos,
-            antennas: antennas.clone(),
-        },
+        Base { id: "GCS-ALPHA".into(), position: pos },
+        Antennas(antennas.clone()),
+        // The base is a radio node like any other: it detects links, ranges,
+        // gossips the mesh table and relays reconnection floods on the very
+        // same systems the drones run. It deliberately gets no `RingIndex`
+        // (it is not in the ring) and no `DroneKinematics` (it does not fly),
+        // which is what keeps the flight-side systems off it.
+        RadioBundle::random(),
         BaseNetworkState::default(),
         ThemeRole::BaseMarker,
         crate::SimulationEntity,

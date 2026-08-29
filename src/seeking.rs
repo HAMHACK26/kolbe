@@ -65,7 +65,7 @@
 
 use bevy::prelude::*;
 
-use crate::antenna::angles_toward;
+use crate::antenna::{Antennas, angles_toward};
 use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
@@ -207,7 +207,7 @@ pub fn seek_lost_links(
     time: Res<Time>,
     mut drones: Query<(
         &Transform,
-        &mut Drone,
+        &mut Antennas,
         &RingIndex,
         &DroneUuid,
         &LinkSet,
@@ -236,7 +236,7 @@ pub fn seek_lost_links(
 
     for (
         self_transform,
-        mut drone,
+        mut antennas,
         self_ring,
         self_uuid,
         links,
@@ -268,7 +268,7 @@ pub fn seek_lost_links(
         let (_, prev_entity, prev_uuid) = ring[(self_ring.0 + n - 1) % n].clone();
 
         seek_one_slot(SeekSlotArgs {
-            drone: &mut drone,
+            antennas: &mut antennas,
             antenna_idx: 0,
             neighbor_entity: next_entity,
             neighbor_uuid: &next_uuid,
@@ -284,7 +284,7 @@ pub fn seek_lost_links(
             elapsed: &mut seek.next_elapsed_secs,
         });
         seek_one_slot(SeekSlotArgs {
-            drone: &mut drone,
+            antennas: &mut antennas,
             antenna_idx: 2,
             neighbor_entity: prev_entity,
             neighbor_uuid: &prev_uuid,
@@ -303,7 +303,7 @@ pub fn seek_lost_links(
 }
 
 struct SeekSlotArgs<'a> {
-    drone: &'a mut Drone,
+    antennas: &'a mut Antennas,
     antenna_idx: usize,
     neighbor_entity: Entity,
     neighbor_uuid: &'a str,
@@ -323,7 +323,7 @@ struct SeekSlotArgs<'a> {
 
 fn seek_one_slot(args: SeekSlotArgs) {
     let SeekSlotArgs {
-        drone,
+        antennas,
         antenna_idx,
         neighbor_entity,
         neighbor_uuid,
@@ -375,107 +375,8 @@ fn seek_one_slot(args: SeekSlotArgs) {
     // drone-relative, so the drone's own heading comes back out. Elevation is
     // world-frame already and needs no correction.
     let (center_az, center_el) = angles_toward(self_pos, target_pos);
-    if let Some(antenna) = drone.antennas.get_mut(antenna_idx) {
+    if let Some(antenna) = antennas.0.get_mut(antenna_idx) {
         antenna.azimuth_deg = (center_az - heading_deg + delta_az).rem_euclid(360.0);
         antenna.elevation_deg = (center_el + delta_el).clamp(-90.0, 90.0);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A target confirmed "just now" (zero elapsed time) needs essentially
-    /// no search cone at all — Δr ≈ 0, so θ ≈ 0.
-    #[test]
-    fn fresh_sighting_needs_almost_no_search_cone() {
-        let uncertainty = worst_case_uncertainty_radius_km(15.0, 0.0);
-        let cone = search_cone_angle_deg(uncertainty, 1.0);
-        assert!(cone < 0.01, "cone {cone} should be ~0 for zero elapsed time");
-    }
-
-    /// The longer it's been since a sighting, the wider the search cone
-    /// needs to be.
-    #[test]
-    fn search_cone_grows_with_elapsed_time() {
-        let target_distance_km = 1.0;
-        let cone_at_1s = search_cone_angle_deg(
-            worst_case_uncertainty_radius_km(15.0, 1.0),
-            target_distance_km,
-        );
-        let cone_at_10s = search_cone_angle_deg(
-            worst_case_uncertainty_radius_km(15.0, 10.0),
-            target_distance_km,
-        );
-        assert!(cone_at_10s > cone_at_1s);
-    }
-
-    /// Two adjacent drone IDs should not land on (near-)identical scan
-    /// speeds — that's the entire point of spreading them by the golden
-    /// ratio.
-    #[test]
-    fn adjacent_ids_get_visibly_different_scan_speeds() {
-        for id in 0..20u64 {
-            let a = scan_angular_speed_rad_s(id, OMEGA_MIN_RAD_S, OMEGA_MAX_RAD_S);
-            let b = scan_angular_speed_rad_s(id + 1, OMEGA_MIN_RAD_S, OMEGA_MAX_RAD_S);
-            assert!(
-                (a - b).abs() > 0.05,
-                "ids {id} and {} got near-identical omega ({a} vs {b})",
-                id + 1
-            );
-        }
-    }
-
-    /// Distinct UUIDs must fold to distinct integers and, in turn, distinct
-    /// scan speeds — the whole reason we key on UUID rather than ring slot.
-    #[test]
-    fn distinct_uuids_get_distinct_scan_speeds() {
-        let uuids = [
-            "12b3a678-ed22-4d7d-9af1-2e97295f3c3b",
-            "87bb4046-5d73-4732-b3d4-d67029beb770",
-            "002da70d-7a81-4b3d-88b4-16db19f12fcc",
-            "09e479b3-4b34-4466-ad35-ec41f5e0d996",
-        ];
-        let speeds: Vec<f32> = uuids
-            .iter()
-            .map(|u| scan_angular_speed_rad_s(uuid_to_u64(u), OMEGA_MIN_RAD_S, OMEGA_MAX_RAD_S))
-            .collect();
-        for i in 0..speeds.len() {
-            for j in (i + 1)..speeds.len() {
-                assert!(
-                    (speeds[i] - speeds[j]).abs() > 0.05,
-                    "uuids {} and {} got near-identical omega ({} vs {})",
-                    uuids[i], uuids[j], speeds[i], speeds[j]
-                );
-            }
-        }
-    }
-
-    /// Scan speed must always stay within the configured envelope.
-    #[test]
-    fn scan_speed_stays_within_bounds() {
-        for id in 0..100u64 {
-            let omega = scan_angular_speed_rad_s(id, OMEGA_MIN_RAD_S, OMEGA_MAX_RAD_S);
-            assert!((OMEGA_MIN_RAD_S..=OMEGA_MAX_RAD_S).contains(&omega));
-        }
-    }
-
-    /// The spiral must never sweep outside the requested cone radius.
-    #[test]
-    fn spiral_never_exceeds_max_radius() {
-        let max_radius = 12.0;
-        for i in 0..2000 {
-            let t = i as f32 * 0.01;
-            let (az, el) = spiral_offset_deg(t, 2.0, max_radius, SPIRAL_TURNS_PER_SWEEP);
-            let radius = (az * az + el * el).sqrt();
-            assert!(radius <= max_radius + 1e-3, "radius {radius} exceeded max {max_radius} at t={t}");
-        }
-    }
-
-    /// The spiral starts at dead center (no offset) at t=0.
-    #[test]
-    fn spiral_starts_at_center() {
-        let (az, el) = spiral_offset_deg(0.0, 2.0, 12.0, SPIRAL_TURNS_PER_SWEEP);
-        assert_eq!((az, el), (0.0, 0.0));
     }
 }

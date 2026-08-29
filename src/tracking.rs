@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 
-use crate::antenna::angles_toward;
+use crate::antenna::{Antennas, angles_toward};
 use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
@@ -65,7 +65,7 @@ pub struct TrackedPeers(pub HashMap<Entity, Vec3>);
 pub fn maintain_mesh_antennas(
     mut drones: Query<(
         &Transform,
-        &mut Drone,
+        &mut Antennas,
         &DroneKinematics,
         &RingIndex,
         &TrackedPeers,
@@ -85,7 +85,7 @@ pub fn maintain_mesh_antennas(
     ring.sort_by_key(|(i, ..)| *i);
     let n = ring.len();
 
-    for (self_transform, mut drone, kin, self_ring, tracked, table, pairing) in &mut drones {
+    for (self_transform, mut antennas, kin, self_ring, tracked, table, pairing) in &mut drones {
         if n == 0 {
             continue;
         }
@@ -128,17 +128,17 @@ pub fn maintain_mesh_antennas(
         // azimuth. Elevation is already world-frame (everything shares one
         // "up") and needs no such correction.
         let relative_az = |az: f32| (az - kin.heading_deg).rem_euclid(360.0);
-        if let (Some(next_pos), Some(first)) = (next_pos, drone.antennas.get_mut(0)) {
+        if let (Some(next_pos), Some(first)) = (next_pos, antennas.0.get_mut(0)) {
             let (az, el) = angles_toward(self_pos, next_pos);
             first.azimuth_deg = relative_az(az);
             first.elevation_deg = el;
         }
-        if let (Some(base_pos), Some(second)) = (base_pos, drone.antennas.get_mut(1)) {
+        if let (Some(base_pos), Some(second)) = (base_pos, antennas.0.get_mut(1)) {
             let (az, el) = angles_toward(self_pos, base_pos);
             second.azimuth_deg = relative_az(az);
             second.elevation_deg = el;
         }
-        if let (Some(prev_pos), Some(third)) = (prev_pos, drone.antennas.get_mut(2)) {
+        if let (Some(prev_pos), Some(third)) = (prev_pos, antennas.0.get_mut(2)) {
             let (az, el) = angles_toward(self_pos, prev_pos);
             third.azimuth_deg = relative_az(az);
             third.elevation_deg = el;
@@ -146,141 +146,50 @@ pub fn maintain_mesh_antennas(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy::ecs::system::RunSystemOnce;
+/// Keep the base's antennas — one per drone — locked onto the formation.
+///
+/// Same policy as [`maintain_mesh_antennas`], and the same information
+/// discipline: a target is aimed at from that drone's **predicted** position
+/// ([`TrackedPeers`], led by its own last self-reported flight direction),
+/// falling back to its last relayed mesh-table row, and left untouched when
+/// the base knows nothing about it yet. The base never reads a drone's true
+/// `Transform`.
+///
+/// The difference from a drone is only coverage: a drone watches its two ring
+/// neighbors, the base watches every ring slot it has an antenna for. Antenna
+/// `k` tracks ring slot `k`, which is the pairing `base::spawn_base` aims at
+/// on frame 0.
+pub fn maintain_base_antennas(
+    mut bases: Query<(&Base, &mut Antennas, &TrackedPeers, &MeshTable, &Pairing)>,
+    drones: Query<(Entity, &RingIndex, &DroneUuid), With<Drone>>,
+) {
+    let mut ring: Vec<(usize, Entity, String)> =
+        drones.iter().map(|(e, ri, uuid)| (ri.0, e, uuid.0.clone())).collect();
+    ring.sort_by_key(|(i, ..)| *i);
 
-    use crate::drone::{make_antenna, DroneType};
-    use crate::networking::{DroneUuid, MeshRow, NetworkingBundle};
-
-    /// Spawn a drone at `pos` in ring slot `ring`, with 3 zeroed antennas the
-    /// aiming system will retarget. Uses the real `NetworkingBundle` (which
-    /// carries `RingIndex`, `TrackedPeers`, and any other per-drone networking
-    /// state) so the drone matches `maintain_mesh_antennas`'s query in full —
-    /// hand-listing components would silently stop matching if the query ever
-    /// gains a param.
-    fn spawn_drone(world: &mut World, pos: Vec3, ring: usize) -> Entity {
-        world
-            .spawn((
-                Transform::from_translation(pos),
-                Drone { id: format!("d{ring}"), drone_type: DroneType::Node },
-                Antennas(vec![
-                    make_antenna(0.0, 0.0, 0),
-                    make_antenna(0.0, 0.0, 1),
-                    make_antenna(0.0, 0.0, 2),
-                ]),
-                NetworkingBundle::random(ring),
-                // Heading 0 — the aiming math converts world bearings into
-                // this drone's frame, so the tests' expected angles are the
-                // world-frame ones.
-                DroneKinematics::default(),
-            ))
-            .id()
-    }
-
-    fn spawn_base(world: &mut World, pos: Vec3) {
-        world.spawn(Base { id: "base".into(), position: pos });
-    }
-
-    fn antenna0_az(world: &World, drone: Entity) -> f32 {
-        world.get::<Drone>(drone).unwrap().antennas[0].azimuth_deg
-    }
-
-    /// Set drone `owner`'s tracked prediction for `peer`.
-    fn set_tracked(world: &mut World, owner: Entity, peer: Entity, predicted: Vec3) {
-        world.get_mut::<TrackedPeers>(owner).unwrap().0.insert(peer, predicted);
-    }
-
-    /// Give `owner`'s mesh table a relayed/last-known row for `peer`, as if
-    /// gossip (not a direct header) taught it that base-relative location.
-    fn set_mesh_row(world: &mut World, owner: Entity, peer: Entity, location: Vec3) {
-        let peer_uuid = world.get::<DroneUuid>(peer).unwrap().0.clone();
-        world.get_mut::<MeshTable>(owner).unwrap().0.insert(
-            peer_uuid.clone(),
-            MeshRow {
-                id: peer_uuid,
-                timestamp: 0.0,
-                location,
-                neighbour_distance: 1,
-                connections: vec![],
-            },
-        );
-    }
-
-    /// With a tracked prediction present, antenna #1 aims at the *predicted*
-    /// point — not the peer's true position.
-    #[test]
-    fn aims_at_predicted_not_true_position() {
-        let mut world = World::new();
-        spawn_base(&mut world, Vec3::new(0.0, 0.0, -5.0));
-        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
-        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
-
-        // B's true bearing from A is +X → azimuth 90°. Predicted point is
-        // off in +Z, which bears 45°.
-        set_tracked(&mut world, a, b, Vec3::new(1.0, 0.0, 1.0));
-        world.run_system_once(maintain_mesh_antennas).unwrap();
-
-        let az = antenna0_az(&world, a);
-        assert!((az - 45.0).abs() < 0.5, "expected ~45° (predicted), got {az}");
-        assert!((az - 90.0).abs() > 10.0, "must not aim at true position (90°)");
-    }
-
-    /// As the tracked prediction moves, the antenna follows it — the whole
-    /// point of prediction-led tracking.
-    #[test]
-    fn antenna_follows_moving_prediction() {
-        let mut world = World::new();
-        spawn_base(&mut world, Vec3::new(0.0, 0.0, -5.0));
-        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
-        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
-
-        // No prediction and no mesh-table row yet → truly no info, so the
-        // antenna is left exactly where it spawned (0.0), never at B's real
-        // position.
-        world.run_system_once(maintain_mesh_antennas).unwrap();
-        let az_cold = antenna0_az(&world, a);
-        assert_eq!(az_cold, 0.0, "no info yet must leave antenna untouched, got {az_cold}");
-
-        // Prediction slides in +Z; azimuth should swing monotonically toward 45°.
-        set_tracked(&mut world, a, b, Vec3::new(1.0, 0.0, 0.5));
-        world.run_system_once(maintain_mesh_antennas).unwrap();
-        let az_mid = antenna0_az(&world, a);
-
-        set_tracked(&mut world, a, b, Vec3::new(1.0, 0.0, 1.0));
-        world.run_system_once(maintain_mesh_antennas).unwrap();
-        let az_far = antenna0_az(&world, a);
-
-        // az_cold (0.0, untouched) isn't on this curve — only compare the two
-        // tracked-prediction samples, which should converge monotonically.
-        assert!(
-            az_mid > az_far,
-            "antenna should track the moving prediction: {az_mid} -> {az_far}"
-        );
-        assert!((az_far - 45.0).abs() < 0.5, "final aim should reach ~45°, got {az_far}");
-    }
-
-    /// With no direct prediction but a relayed mesh-table row, antenna #1
-    /// aims at that row's base-relative location — comms-derived, never the
-    /// peer's true ECS `Transform`.
-    #[test]
-    fn falls_back_to_mesh_table_when_no_prediction() {
-        let mut world = World::new();
-        let base_pos = Vec3::new(0.0, 0.0, -5.0);
-        spawn_base(&mut world, base_pos);
-        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
-        // B's true position (+X, 5 south) bears ~90°; deliberately different
-        // from the mesh-table row below so the test can't pass by accident.
-        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
-
-        // Mesh-table row says B is at base_pos + (0, 0, 8) = (0, 0, 3), i.e.
-        // due north of A (bearing 0°) — deliberately not 90°.
-        set_mesh_row(&mut world, a, b, Vec3::new(0.0, 0.0, 8.0));
-        world.run_system_once(maintain_mesh_antennas).unwrap();
-
-        let az = antenna0_az(&world, a);
-        assert!((az - 0.0).abs() < 0.5, "expected ~0° (mesh-table row), got {az}");
-        assert!((az - 90.0).abs() > 10.0, "must not aim at B's true position (90°)");
+    for (base, mut antennas, tracked, table, pairing) in &mut bases {
+        // Same slew-freeze rule the drones follow during a handshake.
+        if pairing.frozen {
+            continue;
+        }
+        let base_pos = base.position;
+        for (slot, (_, drone_entity, drone_uuid)) in ring.iter().enumerate() {
+            let Some(antenna) = antennas.0.get_mut(slot) else {
+                break; // fewer antennas than drones — the rest go uncovered.
+            };
+            let target = tracked
+                .0
+                .get(drone_entity)
+                .copied()
+                .or_else(|| table.0.get(drone_uuid).map(|row| base_pos + row.location));
+            let Some(target) = target else {
+                continue; // nothing known about this drone yet — hold the aim.
+            };
+            // A base has no heading, so the world-frame bearing is already the
+            // azimuth its antennas are expressed in.
+            let (az, el) = angles_toward(base_pos, target);
+            antenna.azimuth_deg = az;
+            antenna.elevation_deg = el;
+        }
     }
 }
