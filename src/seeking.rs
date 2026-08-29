@@ -1,4 +1,4 @@
-#![allow(dead_code)] // Search is implemented and tested, but not yet enabled in the app schedule.
+#![allow(dead_code)] // Legacy ring-search helpers remain available beside relay search.
 
 //! Spiral search: reacquiring a peer whose direct link has dropped.
 //!
@@ -63,6 +63,8 @@
 //! non-repeatingly as possible, which keeps any two drones' scan rates from
 //! drifting into sync.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 
 use crate::antenna::{Antennas, angles_toward};
@@ -73,6 +75,7 @@ use crate::navigation::FlightLimits;
 use crate::networking::{
     DroneClock, DroneUuid, LinkSet, MeshTable, Pairing, PairingState, RingIndex,
 };
+use crate::world::{RelayLinkPhase, RelayTopology};
 
 /// Mechanical/electronic scan speed floor, rad/s (~4.8 rpm).
 pub const OMEGA_MIN_RAD_S: f32 = 0.5;
@@ -192,6 +195,114 @@ pub fn spiral_offset_deg(
 pub struct SeekState {
     pub next_elapsed_secs: f32,
     pub prev_elapsed_secs: f32,
+    pub relay_elapsed_secs: HashMap<Entity, f32>,
+}
+
+/// Spiral-search every required relay edge whose reusable lifecycle is either
+/// initially searching or reacquiring after a loss. The topology supplies the
+/// target and antenna slot; this module only supplies the existing search
+/// pattern around the last position learned through the mesh.
+#[allow(clippy::type_complexity)]
+pub fn seek_relay_links(
+    time: Res<Time>,
+    topology: Res<RelayTopology>,
+    mut drones: Query<(
+        Entity,
+        &Transform,
+        &mut Antennas,
+        &DroneUuid,
+        &LinkSet,
+        &MeshTable,
+        &DroneClock,
+        &mut SeekState,
+        &DroneKinematics,
+    ), With<Drone>>,
+    uuids: Query<&DroneUuid>,
+    bases: Query<(Entity, &Base)>,
+) {
+    let dt = time.delta_secs();
+    let Some((base_entity, base)) = bases.iter().next() else {
+        return;
+    };
+    let max_speed_mps = FlightLimits::default().max_speed_mps;
+
+    for (
+        entity,
+        transform,
+        mut antennas,
+        self_uuid,
+        links,
+        table,
+        clock,
+        mut seek,
+        kinematics,
+    ) in &mut drones
+    {
+        let omega = scan_angular_speed_rad_s(
+            uuid_to_u64(&self_uuid.0),
+            OMEGA_MIN_RAD_S,
+            OMEGA_MAX_RAD_S,
+        );
+        for (antenna_idx, target) in topology.antenna_targets(entity) {
+            if target == base_entity {
+                continue;
+            }
+            let Some(phase) = topology.search_phase(entity, target) else {
+                seek.relay_elapsed_secs.remove(&target);
+                continue;
+            };
+            let elapsed = seek.relay_elapsed_secs.entry(target).or_default();
+            if matches!(phase, RelayLinkPhase::Degraded { .. }) {
+                conical_scan_slot(&mut antennas, antenna_idx, elapsed, omega, dt);
+                continue;
+            }
+            if !matches!(phase, RelayLinkPhase::Searching | RelayLinkPhase::Reacquiring) {
+                seek.relay_elapsed_secs.remove(&target);
+                continue;
+            }
+            let Ok(target_uuid) = uuids.get(target) else {
+                continue;
+            };
+            seek_one_slot(SeekSlotArgs {
+                antennas: &mut antennas,
+                antenna_idx,
+                neighbor_entity: target,
+                neighbor_uuid: &target_uuid.0,
+                links,
+                table,
+                self_pos: transform.translation,
+                base_pos: base.position,
+                self_clock_now: clock.now,
+                max_speed_mps,
+                omega_rad_s: omega,
+                dt,
+                heading_deg: kinematics.heading_deg,
+                elapsed,
+            });
+        }
+    }
+}
+
+/// Sweep a small circle around the vector-tracker boresight while a link is
+/// briefly degraded. The next RF detection recenters tracking; sustained loss
+/// escalates to the wider expanding spiral.
+fn conical_scan_slot(
+    antennas: &mut Antennas,
+    antenna_idx: usize,
+    elapsed: &mut f32,
+    omega_rad_s: f32,
+    dt: f32,
+) {
+    let Some(antenna) = antennas.0.get_mut(antenna_idx) else {
+        return;
+    };
+    *elapsed += dt;
+    let angle = *elapsed * omega_rad_s;
+    let radius_deg = antenna.theta_3db_deg * 0.35;
+    antenna.azimuth_deg =
+        (antenna.azimuth_deg + radius_deg * angle.cos()).rem_euclid(360.0);
+    antenna.elevation_deg =
+        (antenna.elevation_deg + radius_deg * angle.sin()).clamp(-90.0, 90.0);
 }
 
 /// When a ring neighbor's direct link has dropped, spiral-search around its
@@ -403,5 +514,83 @@ fn seek_one_slot(args: SeekSlotArgs) {
     if let Some(antenna) = antennas.0.get_mut(antenna_idx) {
         antenna.azimuth_deg = (center_az - heading_deg + delta_az).rem_euclid(360.0);
         antenna.elevation_deg = (center_el + delta_el).clamp(-90.0, 90.0);
+    }
+}
+
+#[cfg(test)]
+mod relay_search_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::drone::make_antenna;
+    use crate::networking::MeshRow;
+
+    fn radio_drone(id: &str, position: Vec3, peer_id: &str, peer_position: Vec3) -> impl Bundle {
+        (
+            Drone { id: id.into() },
+            Transform::from_translation(position),
+            Antennas(vec![
+                make_antenna(0.0, 5.0, 1),
+                make_antenna(120.0, 5.0, 2),
+                make_antenna(240.0, 5.0, 3),
+            ]),
+            DroneUuid(id.into()),
+            LinkSet::default(),
+            MeshTable(HashMap::from([(
+                peer_id.into(),
+                MeshRow {
+                    id: peer_id.into(),
+                    timestamp: 0.0,
+                    location: peer_position,
+                    neighbour_distance: 0,
+                    connections: Vec::new(),
+                },
+            )])),
+            DroneClock { now: 1.0 },
+            SeekState::default(),
+            DroneKinematics::default(),
+        )
+    }
+
+    #[test]
+    fn degraded_link_uses_a_small_conical_dither() {
+        let mut antennas = Antennas(vec![make_antenna(90.0, 0.0, 1)]);
+        let mut elapsed = 0.0;
+        conical_scan_slot(&mut antennas, 0, &mut elapsed, 1.0, 0.25);
+
+        assert!(elapsed > 0.0);
+        assert_ne!(antennas.0[0].azimuth_deg, 90.0);
+        assert!(antennas.0[0].elevation_deg.abs() <= antennas.0[0].theta_3db_deg * 0.35);
+    }
+
+    #[test]
+    fn only_the_newer_endpoint_spiral_searches_a_pending_edge() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default());
+        let base = app
+            .world_mut()
+            .spawn(Base { id: "base".into(), position: Vec3::ZERO, antennas: Vec::new() })
+            .id();
+        let older = app
+            .world_mut()
+            .spawn(radio_drone("older", Vec3::X, "newer", Vec3::ZERO))
+            .id();
+        let newer = app
+            .world_mut()
+            .spawn(radio_drone("newer", Vec3::ZERO, "older", Vec3::X))
+            .id();
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![older]);
+        topology.register_wave(base, vec![newer]);
+        app.insert_resource(topology);
+        app.add_systems(Update, seek_relay_links);
+        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs(1));
+
+        app.update();
+
+        let older_seek = app.world().entity(older).get::<SeekState>().unwrap();
+        let newer_seek = app.world().entity(newer).get::<SeekState>().unwrap();
+        assert!(!older_seek.relay_elapsed_secs.contains_key(&newer));
+        assert!(newer_seek.relay_elapsed_secs.contains_key(&older));
     }
 }

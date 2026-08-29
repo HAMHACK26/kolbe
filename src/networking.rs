@@ -503,8 +503,10 @@ pub fn detect_links_and_send_headers(
                 let distance_km = (peer_pos - self_pos).length();
                 if let Some(topology) = relay_topology.as_deref() {
                     let protected = topology.requires_link(self_entity, peer_entity);
+                    let protected_base =
+                        protected && topology.involves_base(self_entity, peer_entity);
                     let launch_peer = topology.same_wave(self_entity, peer_entity);
-                    if protected || launch_peer {
+                    if protected_base || launch_peer {
                         return (distance_km <= MAX_RELAY_HOP_KM)
                             .then_some((peer_entity, 0));
                     }

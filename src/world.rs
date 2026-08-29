@@ -11,7 +11,7 @@ use crate::{
         DroneAi,
         movement::{DroneKinematics, HoverWind},
     },
-    networking::NetworkingBundle,
+    networking::{LinkSet, NetworkingBundle},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     recovery::{ContactMemory, RecoveryState},
     seeking::SeekState,
@@ -55,6 +55,8 @@ const LAUNCH_RING_RADIUS_KM: f32 = 0.10;
 pub const MAX_RELAY_HOP_KM: f32 = 3.0;
 /// Navigation and integration target, leaving margin below the hard limit.
 pub const RELAY_WORKING_HOP_KM: f32 = 2.75;
+const RELAY_ACQUIRE_FRAMES: u8 = 3;
+const RELAY_LOSS_GRACE_FRAMES: u8 = 3;
 
 /// The individual destination assigned to a drone during deployment.
 #[derive(Component)]
@@ -83,13 +85,31 @@ pub(crate) struct DeploymentQueue {
 
 /// Protected upstream links created by wave deployment.
 ///
-/// Every drone has exactly one parent closer to the base. Additional radio
-/// links may appear, but this tree is the path that movement must preserve.
+/// Every drone has exactly one active parent closer to the base. A new wave
+/// starts a pending handoff and the previous wave keeps its base parents until
+/// every replacement edge has been physically acquired and held stable.
 #[derive(Resource, Default)]
 pub(crate) struct RelayTopology {
     base: Option<Entity>,
     parents: HashMap<Entity, Entity>,
     waves: Vec<Vec<Entity>>,
+    links: HashMap<RelayEdge, RelayLinkPhase>,
+    pending_handoff: Option<Vec<RelayEdge>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RelayEdge {
+    child: Entity,
+    parent: Entity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RelayLinkPhase {
+    Searching,
+    Acquiring { consecutive_frames: u8 },
+    Tracking,
+    Degraded { missed_frames: u8 },
+    Reacquiring,
 }
 
 impl RelayTopology {
@@ -97,20 +117,30 @@ impl RelayTopology {
         if wave.is_empty() {
             return;
         }
+        assert!(self.pending_handoff.is_none(), "finish the current handoff first");
         self.base = Some(base);
 
-        // The new wave takes over as the rear relay before the previous wave
-        // loses its direct base parent. Updating one map makes the handoff
-        // atomic from every reader's perspective.
-        if let Some(previous) = self.waves.last() {
-            for (index, &drone) in previous.iter().enumerate() {
-                self.parents.insert(drone, wave[index % wave.len()]);
-            }
-        }
+        let previous = self.waves.last().cloned();
         for &drone in &wave {
             self.parents.insert(drone, base);
         }
         self.waves.push(wave);
+
+        if let Some(previous) = previous {
+            let newest = self.waves.last().expect("wave was just inserted");
+            let pending: Vec<RelayEdge> = previous
+                .into_iter()
+                .enumerate()
+                .map(|(index, child)| RelayEdge {
+                    child,
+                    parent: newest[index % newest.len()],
+                })
+                .collect();
+            for &edge in &pending {
+                self.links.insert(edge, RelayLinkPhase::Searching);
+            }
+            self.pending_handoff = Some(pending);
+        }
     }
 
     pub(crate) fn parent(&self, drone: Entity) -> Option<Entity> {
@@ -127,6 +157,119 @@ impl RelayTopology {
 
     pub(crate) fn involves_base(&self, a: Entity, b: Entity) -> bool {
         self.base.is_some_and(|base| a == base || b == base)
+    }
+
+    pub(crate) fn handoff_pending(&self) -> bool {
+        self.pending_handoff.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn link_phase(&self, a: Entity, b: Entity) -> Option<RelayLinkPhase> {
+        self.links
+            .iter()
+            .find_map(|(edge, phase)| edge.connects(a, b).then_some(*phase))
+    }
+
+    /// Search responsibility belongs to the newer, base-side endpoint while
+    /// the older endpoint holds vector aim. This prevents two narrow beams
+    /// from sweeping past one another indefinitely.
+    pub(crate) fn search_phase(
+        &self,
+        entity: Entity,
+        target: Entity,
+    ) -> Option<RelayLinkPhase> {
+        self.links.iter().find_map(|(edge, phase)| {
+            (edge.parent == entity && edge.child == target).then_some(*phase)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn should_spiral_search(&self, entity: Entity, target: Entity) -> bool {
+        matches!(
+            self.search_phase(entity, target),
+            Some(RelayLinkPhase::Searching | RelayLinkPhase::Reacquiring)
+        )
+    }
+
+    /// Stable antenna ownership for active and pending relay edges. Antenna 2
+    /// (index 1) is reserved for a direct base parent; the remaining slots are
+    /// assigned deterministically to drone peers.
+    pub(crate) fn antenna_targets(&self, entity: Entity) -> Vec<(usize, Entity)> {
+        let mut peers = Vec::new();
+        if let Some(parent) = self.parent(entity) {
+            peers.push(parent);
+        }
+        for (&child, &parent) in &self.parents {
+            if parent == entity {
+                peers.push(child);
+            }
+        }
+        if let Some(pending) = &self.pending_handoff {
+            for edge in pending {
+                if edge.child == entity {
+                    peers.push(edge.parent);
+                } else if edge.parent == entity {
+                    peers.push(edge.child);
+                }
+            }
+        }
+        peers.sort_by_key(|peer| peer.to_bits());
+        peers.dedup();
+
+        let base_peer = peers.iter().copied().find(|peer| Some(*peer) == self.base);
+        let mut targets = Vec::new();
+        if let Some(base) = base_peer {
+            targets.push((1, base));
+        }
+        let slots: &[usize] = if base_peer.is_some() { &[0, 2] } else { &[0, 2, 1] };
+        for (slot, peer) in slots.iter().copied().zip(
+            peers.into_iter().filter(|peer| Some(*peer) != self.base),
+        ) {
+            targets.push((slot, peer));
+        }
+        targets
+    }
+
+    fn observe_link(&mut self, edge: RelayEdge, detected: bool) {
+        let Some(phase) = self.links.get_mut(&edge) else {
+            return;
+        };
+        *phase = match (*phase, detected) {
+            (RelayLinkPhase::Searching | RelayLinkPhase::Reacquiring, true) => {
+                RelayLinkPhase::Acquiring { consecutive_frames: 1 }
+            }
+            (RelayLinkPhase::Acquiring { consecutive_frames }, true)
+                if consecutive_frames + 1 >= RELAY_ACQUIRE_FRAMES => RelayLinkPhase::Tracking,
+            (RelayLinkPhase::Acquiring { consecutive_frames }, true) => {
+                RelayLinkPhase::Acquiring { consecutive_frames: consecutive_frames + 1 }
+            }
+            (RelayLinkPhase::Tracking, false) => RelayLinkPhase::Degraded { missed_frames: 1 },
+            (RelayLinkPhase::Degraded { .. }, true) => RelayLinkPhase::Tracking,
+            (RelayLinkPhase::Degraded { missed_frames }, false)
+                if missed_frames + 1 >= RELAY_LOSS_GRACE_FRAMES => RelayLinkPhase::Reacquiring,
+            (RelayLinkPhase::Degraded { missed_frames }, false) => {
+                RelayLinkPhase::Degraded { missed_frames: missed_frames + 1 }
+            }
+            (RelayLinkPhase::Acquiring { .. }, false) => RelayLinkPhase::Searching,
+            (phase, _) => phase,
+        };
+    }
+
+    fn complete_handoff_if_ready(&mut self) -> bool {
+        let Some(pending) = self.pending_handoff.as_ref() else {
+            return false;
+        };
+        if !pending
+            .iter()
+            .all(|edge| self.links.get(edge) == Some(&RelayLinkPhase::Tracking))
+        {
+            return false;
+        }
+        let pending = self.pending_handoff.take().expect("pending was checked");
+        for edge in pending {
+            self.parents.insert(edge.child, edge.parent);
+        }
+        true
     }
 
     #[cfg(test)]
@@ -149,6 +292,34 @@ impl RelayTopology {
         })
     }
 }
+
+impl RelayEdge {
+    #[cfg(test)]
+    fn connects(self, a: Entity, b: Entity) -> bool {
+        (self.child == a && self.parent == b) || (self.child == b && self.parent == a)
+    }
+}
+
+/// Advance every required drone-to-drone edge through the same acquisition,
+/// tracking, degradation, and reacquisition lifecycle. A pending wave is
+/// promoted only after all of its candidate edges are stably tracking.
+pub fn update_relay_link_lifecycle(
+    mut topology: ResMut<RelayTopology>,
+    link_sets: Query<&LinkSet>,
+) {
+    let edges: Vec<RelayEdge> = topology.links.keys().copied().collect();
+    for edge in edges {
+        let detected = link_sets
+            .get(edge.child)
+            .is_ok_and(|links| links.connected.contains_key(&edge.parent))
+            && link_sets
+                .get(edge.parent)
+                .is_ok_and(|links| links.connected.contains_key(&edge.child));
+        topology.observe_link(edge, detected);
+    }
+    topology.complete_handoff_if_ready();
+}
+
 /// Radius each drone's coverage footprint must reach.
 pub const FORMATION_RADIUS_KM: f32 = 3.0;
 /// Fleet multiplier applied after computing the minimum gap-free coverage grid.
@@ -489,6 +660,7 @@ pub fn spawn_next_drone(
     wind: Res<WindSettings>,
 ) {
     if deployment.next_index >= deployment.total_count
+        || relay_topology.handoff_pending()
         || !deployment.timer.tick(time.delta()).just_finished()
     {
         return;
@@ -724,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn wave_handoff_keeps_every_drone_on_a_base_path() {
+    fn wave_handoff_waits_for_every_stable_replacement_link() {
         let entity = |id| Entity::from_raw_u32(id).expect("valid test entity");
         let base = entity(1);
         let first = vec![entity(10), entity(11), entity(12)];
@@ -732,16 +904,116 @@ mod tests {
         let mut topology = RelayTopology::default();
 
         topology.register_wave(base, first.clone());
-        assert!(first.iter().all(|&drone| topology.requires_link(drone, base)));
-        assert!(topology.same_wave(first[0], first[2]));
-
         topology.register_wave(base, second.clone());
+        let pending = topology.pending_handoff.clone().expect("handoff is pending");
+
+        assert!(topology.handoff_pending());
+        assert!(first.iter().all(|&drone| topology.requires_link(drone, base)));
+        assert!(second.iter().all(|&drone| topology.requires_link(drone, base)));
+        assert!(topology.should_spiral_search(second[0], first[0]));
+        assert!(!topology.should_spiral_search(first[0], second[0]));
+
+        for _ in 0..RELAY_ACQUIRE_FRAMES {
+            topology.observe_link(pending[0], true);
+        }
+        assert!(!topology.complete_handoff_if_ready());
+        assert!(first.iter().all(|&drone| topology.requires_link(drone, base)));
+
+        for &edge in pending.iter().skip(1) {
+            for _ in 0..RELAY_ACQUIRE_FRAMES {
+                topology.observe_link(edge, true);
+            }
+        }
+        assert!(topology.complete_handoff_if_ready());
         assert_eq!(topology.parent(first[0]), Some(second[0]));
         assert_eq!(topology.parent(first[1]), Some(second[1]));
         assert_eq!(topology.parent(first[2]), Some(second[0]));
-        assert!(second.iter().all(|&drone| topology.requires_link(drone, base)));
         assert!(first.iter().all(|&drone| !topology.requires_link(drone, base)));
         assert!(topology.all_paths_reach_base());
+    }
+
+    #[test]
+    fn lifecycle_system_requires_bidirectional_detection_before_handoff() {
+        let mut app = App::new();
+        let base = app.world_mut().spawn_empty().id();
+        let older = app.world_mut().spawn(LinkSet::default()).id();
+        let newer = app.world_mut().spawn(LinkSet::default()).id();
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![older]);
+        topology.register_wave(base, vec![newer]);
+        app.insert_resource(topology);
+        app.add_systems(Update, update_relay_link_lifecycle);
+
+        app.world_mut()
+            .entity_mut(older)
+            .get_mut::<LinkSet>()
+            .unwrap()
+            .connected
+            .insert(newer, 0.0);
+        for _ in 0..RELAY_ACQUIRE_FRAMES {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<RelayTopology>().parent(older), Some(base));
+
+        app.world_mut()
+            .entity_mut(newer)
+            .get_mut::<LinkSet>()
+            .unwrap()
+            .connected
+            .insert(older, 0.0);
+        for _ in 0..RELAY_ACQUIRE_FRAMES {
+            app.update();
+        }
+        let topology = app.world().resource::<RelayTopology>();
+        assert_eq!(topology.parent(older), Some(newer));
+        assert!(!topology.handoff_pending());
+    }
+
+    #[test]
+    fn established_relay_links_reenter_search_after_sustained_loss() {
+        let entity = |id| Entity::from_raw_u32(id).expect("valid test entity");
+        let base = entity(1);
+        let older = entity(10);
+        let newer = entity(20);
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![older]);
+        topology.register_wave(base, vec![newer]);
+        let edge = topology.pending_handoff.as_ref().unwrap()[0];
+
+        for _ in 0..RELAY_ACQUIRE_FRAMES {
+            topology.observe_link(edge, true);
+        }
+        topology.complete_handoff_if_ready();
+        assert_eq!(topology.link_phase(older, newer), Some(RelayLinkPhase::Tracking));
+
+        for _ in 0..RELAY_LOSS_GRACE_FRAMES {
+            topology.observe_link(edge, false);
+        }
+        assert_eq!(topology.link_phase(older, newer), Some(RelayLinkPhase::Reacquiring));
+        assert!(topology.should_spiral_search(newer, older));
+
+        for _ in 0..RELAY_ACQUIRE_FRAMES {
+            topology.observe_link(edge, true);
+        }
+        assert_eq!(topology.link_phase(older, newer), Some(RelayLinkPhase::Tracking));
+    }
+
+    #[test]
+    fn pending_partial_wave_uses_each_antenna_slot_at_most_once() {
+        let entity = |id| Entity::from_raw_u32(id).expect("valid test entity");
+        let base = entity(1);
+        let first = vec![entity(10), entity(11), entity(12)];
+        let second = vec![entity(20), entity(21)];
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, first);
+        topology.register_wave(base, second.clone());
+
+        let targets = topology.antenna_targets(second[0]);
+        let mut slots: Vec<usize> = targets.iter().map(|(slot, _)| *slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(slots, vec![0, 1, 2]);
     }
 
     #[test]
@@ -798,6 +1070,11 @@ mod tests {
         let mut topology = RelayTopology::default();
         topology.register_wave(base, vec![front]);
         topology.register_wave(base, vec![rear]);
+        let pending = topology.pending_handoff.clone().unwrap();
+        for _ in 0..RELAY_ACQUIRE_FRAMES {
+            topology.observe_link(pending[0], true);
+        }
+        assert!(topology.complete_handoff_if_ready());
         app.insert_resource(topology);
         app.add_systems(Update, enforce_relay_hops);
 

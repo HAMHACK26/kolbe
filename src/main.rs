@@ -225,8 +225,11 @@ fn main() {
                 networking::process_reconnect,
                 tracking::maintain_mesh_antennas,
                 tracking::maintain_base_antennas,
+                tracking::maintain_relay_antennas,
                 seeking::seek_lost_links,
+                seeking::seek_relay_links,
                 networking::detect_links_and_send_headers,
+                world::update_relay_link_lifecycle,
                 networking::route_packets,
                 // Last word on velocity: the proximity ring deflects whatever
                 // the navigators above just committed to, before

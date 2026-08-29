@@ -22,6 +22,7 @@ use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
 use crate::networking::{DroneUuid, MeshTable, Pairing, RingIndex};
+use crate::world::RelayTopology;
 
 /// Where this drone currently believes a tracked peer *will be*, based
 /// purely on the last header that peer sent — never on omniscient ECS
@@ -146,6 +147,52 @@ pub fn maintain_mesh_antennas(
     }
 }
 
+/// Aim the antenna slots reserved by the relay topology. This runs after the
+/// legacy ring tracker and therefore gives required active and pending relay
+/// edges priority without changing how optional mesh links are maintained.
+/// Peer positions come only from direct prediction or relayed mesh knowledge.
+#[allow(clippy::type_complexity)]
+pub fn maintain_relay_antennas(
+    topology: Res<RelayTopology>,
+    mut drones: Query<(
+        Entity,
+        &Transform,
+        &mut Antennas,
+        &DroneKinematics,
+        &TrackedPeers,
+        &MeshTable,
+    ), With<Drone>>,
+    uuids: Query<&DroneUuid>,
+    bases: Query<(Entity, &Base)>,
+) {
+    let base = bases.iter().next();
+
+    for (entity, transform, mut antennas, kinematics, tracked, table) in &mut drones {
+        let self_pos = transform.translation;
+        for (slot, target) in topology.antenna_targets(entity) {
+            let target_pos = if base.is_some_and(|(base_entity, _)| target == base_entity) {
+                base.map(|(_, base)| base.position)
+            } else {
+                let mesh_position = uuids
+                    .get(target)
+                    .ok()
+                    .and_then(|uuid| table.0.get(&uuid.0))
+                    .and_then(|row| base.map(|(_, base)| base.position + row.location));
+                tracked.0.get(&target).copied().or(mesh_position)
+            };
+            let Some(target_pos) = target_pos else {
+                continue;
+            };
+            let Some(antenna) = antennas.0.get_mut(slot) else {
+                continue;
+            };
+            let (azimuth, elevation) = angles_toward(self_pos, target_pos);
+            antenna.azimuth_deg = (azimuth - kinematics.heading_deg).rem_euclid(360.0);
+            antenna.elevation_deg = elevation;
+        }
+    }
+}
+
 /// Keep the base's antennas — one per drone — locked onto the formation.
 ///
 /// Same policy as [`maintain_mesh_antennas`], and the same information
@@ -191,5 +238,62 @@ pub fn maintain_base_antennas(
             antenna.azimuth_deg = az;
             antenna.elevation_deg = el;
         }
+    }
+}
+#[cfg(test)]
+mod relay_tracking_tests {
+    use super::*;
+    use crate::drone::make_antenna;
+    use crate::networking::MeshRow;
+
+    #[test]
+    fn pending_relay_target_overrides_its_reserved_antenna_with_vector_aim() {
+        let mut app = App::new();
+        let base = app
+            .world_mut()
+            .spawn(Base { id: "base".into(), position: Vec3::ZERO, antennas: Vec::new() })
+            .id();
+        let older = app.world_mut().spawn(DroneUuid("older".into())).id();
+        let newer = app
+            .world_mut()
+            .spawn((
+                Drone { id: "newer".into() },
+                DroneUuid("newer".into()),
+                Transform::from_translation(Vec3::ZERO),
+                Antennas(vec![
+                    make_antenna(0.0, 5.0, 1),
+                    make_antenna(120.0, 5.0, 2),
+                    make_antenna(240.0, 5.0, 3),
+                ]),
+                DroneKinematics::default(),
+                TrackedPeers::default(),
+                MeshTable(HashMap::from([(
+                    "older".into(),
+                    MeshRow {
+                        id: "older".into(),
+                        timestamp: 0.0,
+                        location: Vec3::X,
+                        neighbour_distance: 0,
+                        connections: Vec::new(),
+                    },
+                )])),
+            ))
+            .id();
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![older]);
+        topology.register_wave(base, vec![newer]);
+        let target_slot = topology
+            .antenna_targets(newer)
+            .into_iter()
+            .find_map(|(slot, target)| (target == older).then_some(slot))
+            .unwrap();
+        app.insert_resource(topology);
+        app.add_systems(Update, maintain_relay_antennas);
+
+        app.update();
+
+        let antennas = app.world().entity(newer).get::<Antennas>().unwrap();
+        assert!((antennas.0[target_slot].azimuth_deg - 90.0).abs() < 1e-6);
+        assert!(antennas.0[target_slot].elevation_deg.abs() < 1e-6);
     }
 }
