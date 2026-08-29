@@ -101,6 +101,7 @@ fn main() {
         .init_state::<AppState>()
         .init_resource::<area::ScenarioArea>()
         .init_resource::<terrain::VegetationSettings>()
+        .init_resource::<world::WindSettings>()
         .insert_resource(SelectedDrone(None))
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
@@ -129,7 +130,7 @@ fn main() {
                 area::redraw_table,
                 area::update_status_text,
                 area::trees_toggle_interactions,
-                area::refresh_vegetation_controls,
+                area::refresh_setup_controls,
                 area::generate_terrain,
             )
                 .chain()

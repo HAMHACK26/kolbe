@@ -26,8 +26,23 @@ pub const DRONE_COUNT: usize = 12;
 pub const DRONE_RADIUS: f32 = 0.18;
 /// Radius of the visible drone sphere, in world-space kilometres.
 pub const DRONE_VISUAL_RADIUS: f32 = 0.05;
-/// Global wind strength. 0.0 disables wind, 1.0 is baseline, 2.0 doubles it.
-pub const WIND_INTENSITY: f32 = 3.0;
+pub const MIN_WIND_INTENSITY: f32 = 0.0;
+pub const MAX_WIND_INTENSITY: f32 = 20.0;
+pub const WIND_INTENSITY_STEP: f32 = 1.0;
+pub const DEFAULT_WIND_INTENSITY: f32 = 3.0;
+
+/// Wind strength chosen on the setup screen. 0 disables wind, 1 is the
+/// baseline disturbance, and values up to 20 progressively amplify it.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct WindSettings {
+    pub intensity: f32,
+}
+
+impl Default for WindSettings {
+    fn default() -> Self {
+        Self { intensity: DEFAULT_WIND_INTENSITY }
+    }
+}
 
 pub fn setup(
     mut commands: Commands,
@@ -35,6 +50,7 @@ pub fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
     theme: Res<Theme>,
+    wind: Res<WindSettings>,
 ) {
     let pal = theme.palette();
     // `AmbientLight` is a per-camera override of `GlobalAmbientLight` and so
@@ -110,7 +126,7 @@ pub fn setup(
                 Transform::from_translation(drone_pos),
                 Drone { id: drone_id(i), drone_type, antennas: antennas.clone() },
                 DroneKinematics::default(),
-                HoverWind::new(i, WIND_INTENSITY),
+                HoverWind::new(i, wind.intensity),
                 DroneAi::default(),
                 CommandQueue::default(),
                 NetworkingBundle::random(i),
