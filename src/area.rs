@@ -97,11 +97,10 @@ pub(crate) struct SelectionLabel;
 pub fn setup(
     mut commands: Commands,
     area: Res<ScenarioArea>,
+    theme: Res<crate::theme::Theme>,
     load_error: Option<Res<crate::terrain::TerrainLoadError>>,
 ) {
-    let server_url =
-        std::env::var("HEIGHT_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_owned());
-
+    let p = theme.palette();
     commands
         .spawn((
             Node {
@@ -112,7 +111,7 @@ pub fn setup(
                 column_gap: Val::Px(48.0),
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.07, 0.09, 0.13)),
+            BackgroundColor(p.bg),
             AreaSelectionRoot,
         ))
         .with_children(|root| {
@@ -125,16 +124,16 @@ pub fn setup(
                     border_radius: BorderRadius::all(Val::Px(80.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgb(0.12, 0.28, 0.38)),
-                BorderColor::all(Color::srgb(0.35, 0.65, 0.75)),
+                BackgroundColor(p.surface),
+                BorderColor::all(p.accent),
             ))
             .with_children(|map| {
-                spawn_area_button(map, KIRUNA, 70.0, 28.0);
-                spawn_area_button(map, UMEA, 145.0, 190.0);
-                spawn_area_button(map, OSTERSUND, 35.0, 250.0);
-                spawn_area_button(map, STOCKHOLM, 160.0, 345.0);
-                spawn_area_button(map, GOTEBORG, 35.0, 405.0);
-                spawn_area_button(map, MALMO, 90.0, 495.0);
+                spawn_area_button(map, KIRUNA, 70.0, 28.0, p.bg, p.text);
+                spawn_area_button(map, UMEA, 145.0, 190.0, p.bg, p.text);
+                spawn_area_button(map, OSTERSUND, 35.0, 250.0, p.bg, p.text);
+                spawn_area_button(map, STOCKHOLM, 160.0, 345.0, p.bg, p.text);
+                spawn_area_button(map, GOTEBORG, 35.0, 405.0, p.bg, p.text);
+                spawn_area_button(map, MALMO, 90.0, 495.0, p.bg, p.text);
             });
 
             root.spawn(Node {
@@ -147,17 +146,17 @@ pub fn setup(
                 panel.spawn((
                     Text::new("Select a simulation area"),
                     TextFont { font_size: FontSize::Px(34.0), ..default() },
-                    TextColor(Color::WHITE),
+                    TextColor(p.text),
                 ));
                 panel.spawn((
                     Text::new("Choose a point in Sweden. A 20 x 20 km terrain will be generated around it."),
                     TextFont { font_size: FontSize::Px(17.0), ..default() },
-                    TextColor(Color::srgb(0.75, 0.8, 0.85)),
+                    TextColor(p.subtext),
                 ));
                 panel.spawn((
                     Text::new(selection_text(&area)),
                     TextFont { font_size: FontSize::Px(20.0), ..default() },
-                    TextColor(Color::srgb(0.45, 0.8, 1.0)),
+                    TextColor(p.accent),
                     SelectionLabel,
                 ));
                 panel
@@ -171,31 +170,38 @@ pub fn setup(
                             border_radius: BorderRadius::all(Val::Px(7.0)),
                             ..default()
                         },
-                        BackgroundColor(Color::srgb(0.12, 0.45, 0.75)),
+                        BackgroundColor(p.accent),
                         GenerateTerrain,
                     ))
                     .with_child((
                         Text::new("Generate terrain"),
                         TextFont { font_size: FontSize::Px(18.0), ..default() },
-                        TextColor(Color::WHITE),
+                        TextColor(p.bg),
                     ));
                 panel.spawn((
-                    Text::new(format!("Terrain source: {server_url}")),
+                    Text::new("Terrain source: Lantmateriet (local)"),
                     TextFont { font_size: FontSize::Px(14.0), ..default() },
-                    TextColor(Color::srgb(0.55, 0.6, 0.65)),
+                    TextColor(p.subtext),
                 ));
                 if let Some(error) = load_error.as_ref() {
                     panel.spawn((
                         Text::new(format!("Last attempt failed: {}", error.0)),
                         TextFont { font_size: FontSize::Px(14.0), ..default() },
-                        TextColor(Color::srgb(1.0, 0.45, 0.45)),
+                        TextColor(p.danger),
                     ));
                 }
             });
         });
 }
 
-fn spawn_area_button(parent: &mut ChildSpawnerCommands, preset: AreaPreset, left: f32, top: f32) {
+fn spawn_area_button(
+    parent: &mut ChildSpawnerCommands,
+    preset: AreaPreset,
+    left: f32,
+    top: f32,
+    fill: Color,
+    text: Color,
+) {
     parent
         .spawn((
             Button,
@@ -207,7 +213,7 @@ fn spawn_area_button(parent: &mut ChildSpawnerCommands, preset: AreaPreset, left
                 border_radius: BorderRadius::all(Val::Px(12.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.08, 0.12, 0.16)),
+            BackgroundColor(fill),
             AreaChoice(preset),
         ))
         .with_child((
@@ -216,7 +222,7 @@ fn spawn_area_button(parent: &mut ChildSpawnerCommands, preset: AreaPreset, left
                 font_size: FontSize::Px(14.0),
                 ..default()
             },
-            TextColor(Color::WHITE),
+            TextColor(text),
         ));
 }
 
