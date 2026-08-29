@@ -57,6 +57,7 @@ pub struct NetworkTablePanelOpen(pub bool);
 const COLS: usize = 3;
 const HEADER: [&str; COLS] = ["#", "Az", "El"];
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // Queries are distinct Bevy system inputs.
 pub fn update_popup_position(
     mut commands: Commands,
     selected: Res<SelectedDrone>,

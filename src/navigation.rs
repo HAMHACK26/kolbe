@@ -119,6 +119,7 @@ impl FlightLimits {
     /// something any code anywhere can do by poking a field directly.
     /// Negative input is clamped to 0 — a drone can always be told to
     /// (effectively) hold position, never to fly at a negative speed.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_max_speed(&mut self, max_speed_mps: f32) {
         self.max_speed_mps = max_speed_mps.max(0.0);
     }
