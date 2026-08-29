@@ -68,6 +68,7 @@ fn main() {
             OnEnter(AppState::Simulation),
             (
                 terrain::spawn_mesh,
+                terrain::spawn_trees,
                 world::setup,
                 base::spawn_base,
                 ui::make_camera_overlay,
@@ -79,6 +80,7 @@ fn main() {
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, terrain::draw_contours.run_if(in_state(AppState::Simulation)))
+        .add_systems(OnExit(AppState::Simulation), terrain::cleanup_trees)
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
         .add_systems(Update, factories::movement::apply_velocity.run_if(in_state(AppState::Simulation)))

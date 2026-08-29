@@ -17,6 +17,7 @@ use crate::{
 };
 
 mod source;
+mod vegetation;
 
 use source::{Progress, ProgressHandle};
 
@@ -66,8 +67,13 @@ impl TerrainHeightMap {
     }
 }
 
+struct TerrainData {
+    height_map: TerrainHeightMap,
+    vegetation: vegetation::VegetationMap,
+}
+
 #[derive(Resource)]
-pub struct HeightLoadTask(Task<Result<TerrainHeightMap, String>>);
+pub struct TerrainLoadTask(Task<Result<TerrainData, String>>);
 
 #[derive(Resource)]
 pub struct TerrainLoadError(pub String);
@@ -91,8 +97,8 @@ pub fn start_loading(
     let progress: ProgressHandle = Arc::new(Mutex::new(Progress::default()));
     let task_progress = progress.clone();
     let task = IoTaskPool::get()
-        .spawn(async move { fetch_height_map(&request_area, &task_progress) });
-    commands.insert_resource(HeightLoadTask(task));
+        .spawn(async move { fetch_terrain_data(&request_area, &task_progress) });
+    commands.insert_resource(TerrainLoadTask(task));
     commands.insert_resource(TerrainProgress(progress));
 
     commands
@@ -187,7 +193,7 @@ pub fn update_progress(
 
 pub fn poll_loading(
     mut commands: Commands,
-    mut task: ResMut<HeightLoadTask>,
+    mut task: ResMut<TerrainLoadTask>,
     mut status: Query<&mut Text, With<LoadingStatus>>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
@@ -195,9 +201,10 @@ pub fn poll_loading(
         return;
     };
     match result {
-        Ok(height_map) => {
-            commands.remove_resource::<HeightLoadTask>();
-            commands.insert_resource(height_map);
+        Ok(data) => {
+            commands.remove_resource::<TerrainLoadTask>();
+            commands.insert_resource(data.height_map);
+            commands.insert_resource(data.vegetation);
             next_state.set(AppState::Simulation);
         }
         Err(message) => {
@@ -206,7 +213,7 @@ pub fn poll_loading(
                     "Could not load terrain:\n{message}\n\nCheck your .env credentials and network, then restart Kolbe."
                 );
             }
-            commands.remove_resource::<HeightLoadTask>();
+            commands.remove_resource::<TerrainLoadTask>();
             commands.insert_resource(TerrainLoadError(message));
             next_state.set(AppState::AreaSelection);
         }
@@ -247,6 +254,9 @@ pub fn spawn_mesh(
             },
         );
 }
+
+pub use vegetation::spawn_trees;
+pub use vegetation::cleanup_trees;
 
 /// Draw 20 m contour lines from the local height grid. Heights in the grid are
 /// relative to the lowest point in the selected area, which is sufficient for
@@ -354,6 +364,27 @@ fn fetch_height_map(
             std::env::var("TERRAIN_VERTICAL_EXAGGERATION").ok().as_deref(),
         ),
     })
+}
+
+fn fetch_terrain_data(area: &ScenarioArea, progress: &ProgressHandle) -> Result<TerrainData, String> {
+    let height_map = fetch_height_map(area, progress)?;
+    if let Ok(mut snapshot) = progress.lock() {
+        snapshot.phase = "Processing vegetation".into();
+        snapshot.done = 0;
+        snapshot.total = 1;
+        snapshot.current.clear();
+    }
+    // Vegetation is optional: terrain remains usable when its source is absent
+    // or malformed, while the warning is still visible in logs.
+    let vegetation = vegetation::load_configured(area).unwrap_or_else(|error| {
+        warn!("vegetation unavailable: {error}");
+        vegetation::VegetationMap::default()
+    });
+    if let Ok(mut snapshot) = progress.lock() {
+        snapshot.phase = "Terrain and vegetation ready".into();
+        snapshot.done = 1;
+    }
+    Ok(TerrainData { height_map, vegetation })
 }
 
 fn mesh_from_height_map(map: &TerrainHeightMap) -> Mesh {
