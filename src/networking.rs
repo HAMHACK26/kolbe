@@ -188,7 +188,7 @@ pub struct MeshTable(pub HashMap<String, MeshRow>);
 /// This drone's fixed position in the ring formation (0..N). Used only to
 /// pick its two direct mesh neighbors — see `crate::tracking::maintain_mesh_antennas`.
 #[derive(Component)]
-pub struct RingIndex(pub usize);
+pub struct RingIndex(#[allow(dead_code)] pub usize);
 
 /// Where this drone currently is in (at most) one in-flight reconnection
 /// handshake. See the module docs, "Reconnection handshake (priority)".
@@ -404,6 +404,7 @@ pub fn advance_clocks(time: Res<Time>, mut clocks: Query<&mut DroneClock>) {
 /// For every ordered (self, peer) pair, take the best RSSI across self's
 /// antennas. `rssi >= sensitivity` means self's antenna is receiving peer —
 /// only possible when the antennas face each other.
+#[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
 pub fn detect_links_and_send_headers(
     mut mailbox: ResMut<Mailbox>,
     mut drones: Query<(

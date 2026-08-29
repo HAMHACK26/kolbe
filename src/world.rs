@@ -60,8 +60,7 @@ pub fn setup(
     });
 
     let half = WORLD_SIZE / 2.0;
-    for i in 0..DRONE_COUNT {
-        let (km_x, km_z) = positions[i];
+    for (i, &(km_x, km_z)) in positions.iter().enumerate().take(DRONE_COUNT) {
         let x = km_x - half;
         let z = km_z - half;
         let drone_pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);

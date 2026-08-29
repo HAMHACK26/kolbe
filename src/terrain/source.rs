@@ -488,10 +488,10 @@ fn apply_predictor(raw: &mut [u8], width: usize, bits: u16, predictor: u16, le: 
 /// Convert raw sample bytes to f32 given the TIFF sample type.
 fn raw_to_f32(raw: &[u8], bits: u16, sample_format: u16, le: bool) -> Vec<f32> {
     match (bits, sample_format) {
-        (32, 3) => raw.chunks_exact(4).map(|c| rd_f32(c, 0, le)).collect(),
-        (32, _) => raw.chunks_exact(4).map(|c| rd_u32(c, 0, le) as f32).collect(),
-        (16, 2) => raw.chunks_exact(2).map(|c| rd_u16(c, 0, le) as i16 as f32).collect(),
-        (16, _) => raw.chunks_exact(2).map(|c| rd_u16(c, 0, le) as f32).collect(),
+        (32, 3) => raw.as_chunks::<4>().0.iter().map(|c| rd_f32(c, 0, le)).collect(),
+        (32, _) => raw.as_chunks::<4>().0.iter().map(|c| rd_u32(c, 0, le) as f32).collect(),
+        (16, 2) => raw.as_chunks::<2>().0.iter().map(|c| rd_u16(c, 0, le) as i16 as f32).collect(),
+        (16, _) => raw.as_chunks::<2>().0.iter().map(|c| rd_u16(c, 0, le) as f32).collect(),
         (8, _) => raw.iter().map(|&b| b as f32).collect(),
         _ => vec![],
     }

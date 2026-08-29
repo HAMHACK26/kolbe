@@ -20,6 +20,7 @@ impl Default for ScenarioArea {
 
 impl ScenarioArea {
     /// STAC searches use WGS84 longitude/latitude bounds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn wgs84_bbox(&self) -> [f64; 4] {
         let half_km = self.size_km as f64 * 0.5;
         let lat_delta = half_km / 110.574;
