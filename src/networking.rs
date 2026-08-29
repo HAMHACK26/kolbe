@@ -420,11 +420,19 @@ pub fn detect_links_and_send_headers(
     )>,
     positions: Query<(Entity, &GlobalTransform), With<Drone>>,
     uuids: Query<&DroneUuid>,
-    bases: Query<&Base>,
+    bases: Query<(Entity, &Base)>,
 ) {
     // `connected_antenna` is this drone's position vector relative to base —
     // not the antenna's own pointing direction.
-    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+    let base_pos = bases.iter().next().map(|(_, b)| b.position).unwrap_or(Vec3::ZERO);
+
+    // The ground station is a peer like any other: every drone's antenna #2 is
+    // aimed at it by `tracking::maintain_mesh_antennas`, and it carries a
+    // `DroneUuid` so it can be named in mesh rows. Including it here is what
+    // actually attaches it to the mesh — without it the base is drawn, aimed
+    // at, and completely unreachable.
+    let base_peers: Vec<(Entity, Vec3)> =
+        bases.iter().map(|(entity, base)| (entity, base.position)).collect();
 
     for (self_entity, self_gt, drone, kin, clock, uuid, mut links, mut sent, table) in &mut drones
     {

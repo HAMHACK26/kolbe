@@ -42,7 +42,7 @@ use bevy::prelude::*;
 
 use crate::base::Base;
 use crate::factories::movement::DroneKinematics;
-use crate::navigation::{navigate, DroneState, FlightLimits};
+use crate::navigation::{navigate, DroneState, MovementSpeed};
 use crate::networking::{DroneUuid, LinkSet, MeshTable};
 
 /// Close enough to the recovery waypoint to consider "I'm back where I was",
@@ -87,19 +87,6 @@ pub fn peer_is_orphaned(table: &MeshTable, peer_uuid: &str, self_uuid: &str) -> 
         }
     }
     true
-}
-
-/// Convert real-world flight limits (m/s, m/s²) to the km-scaled units the
-/// simulation world uses, so `navigate` integrates consistently with
-/// km-space positions.
-fn limits_km(limits: &FlightLimits) -> FlightLimits {
-    FlightLimits {
-        max_speed_mps: limits.max_speed_mps / 1000.0,
-        max_accel_mps2: limits.max_accel_mps2 / 1000.0,
-        max_climb_mps: limits.max_climb_mps / 1000.0,
-        max_descend_mps: limits.max_descend_mps / 1000.0,
-        max_yaw_rate_deg_s: limits.max_yaw_rate_deg_s,
-    }
 }
 
 /// Update contact memory and, when a sole-link peer drops, enter recovery.
@@ -163,9 +150,12 @@ pub fn run_recovery(
     )>,
     uuids: Query<&DroneUuid>,
     _bases: Query<&Base>,
+    speed: Res<MovementSpeed>,
 ) {
     let dt = time.delta_secs();
-    let limits = limits_km(&FlightLimits::default());
+    // Same envelope the drift flight uses, so a drone doesn't change pace the
+    // moment it enters recovery.
+    let limits = speed.limits_km();
 
     for (transform, _self_uuid, links, mut kin, mut recovery) in &mut drones {
         let RecoveryState::Recovering { lost_peer, return_to } = &*recovery else {

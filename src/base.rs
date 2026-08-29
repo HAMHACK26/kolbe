@@ -73,6 +73,19 @@ pub struct CommandQueue {
 
 // ─── Spawning ─────────────────────────────────────────────────────────────────
 
+/// Where the ground station sits — fixed, and derived only from constants and
+/// the terrain.
+///
+/// Exposed separately from [`spawn_base`] because every mesh-table location is
+/// base-relative, and `world::setup` needs that frame to seed the drones'
+/// initial tables *before* `spawn_base` has run (the two are chained in that
+/// order). Computing it rather than querying the entity keeps the two in sync
+/// by construction.
+pub fn base_position(terrain: &crate::terrain::TerrainHeightMap) -> Vec3 {
+    let z = -WORLD_SIZE / 2.0 + 1.0; // south edge
+    Vec3::new(0.0, terrain.height_at(0.0, z) + DRONE_RADIUS, z)
+}
+
 /// Spawn the base at a fixed position with a visual marker.
 /// Call from `world::setup` or as a separate `Startup` system.
 pub fn spawn_base(
@@ -85,8 +98,7 @@ pub fn spawn_base(
     // Initial colors from the palette; `apply_theme` re-syncs on toggle
     // (these entities carry ThemeRole markers).
     let pal = theme.palette();
-    let z = -WORLD_SIZE / 2.0 + 1.0;
-    let pos = Vec3::new(0.0, terrain.height_at(0.0, z) + DRONE_RADIUS, z); // south edge
+    let pos = base_position(&terrain);
 
     // 5 connections — same hardware as the drones, one antenna per 72° sector.
     let antennas: Vec<Antenna> =

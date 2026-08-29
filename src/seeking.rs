@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Search is implemented and tested, but not yet enabled in the app schedule.
-
 //! Spiral search: reacquiring a peer whose direct link has dropped.
 //!
 //! [`crate::tracking`] keeps a *live* link aimed correctly by leading the
@@ -63,13 +61,19 @@
 //! non-repeatingly as possible, which keeps any two drones' scan rates from
 //! drifting into sync.
 
+use std::collections::HashSet;
+
 use bevy::prelude::*;
 
 use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
+use crate::factories::movement::DroneKinematics;
 use crate::navigation::FlightLimits;
-use crate::networking::{DroneClock, DroneUuid, LinkSet, MeshTable, Pairing, RingIndex};
+use crate::networking::{
+    DroneClock, DroneUuid, LinkSet, MeshRow, MeshTable, Pairing, PairingState, ReconnectRequests,
+    RingIndex,
+};
 
 /// Mechanical/electronic scan speed floor, rad/s (~4.8 rpm).
 pub const OMEGA_MIN_RAD_S: f32 = 0.5;
@@ -212,6 +216,7 @@ pub fn seek_lost_links(
         &LinkSet,
         &MeshTable,
         &DroneClock,
+        &DroneKinematics,
         &mut SeekState,
         &Pairing,
     )>,
@@ -232,8 +237,18 @@ pub fn seek_lost_links(
     ring.sort_by_key(|(i, ..)| *i);
     let n = ring.len();
 
-    for (self_transform, mut drone, self_ring, self_uuid, links, table, clock, mut seek, pairing) in
-        &mut drones
+    for (
+        self_transform,
+        mut drone,
+        self_ring,
+        self_uuid,
+        links,
+        table,
+        clock,
+        kin,
+        mut seek,
+        pairing,
+    ) in &mut drones
     {
         if n == 0 {
             continue;
@@ -264,6 +279,7 @@ pub fn seek_lost_links(
             table,
             self_pos,
             base_pos,
+            self_heading_deg: kin.heading_deg,
             self_clock_now: clock.now,
             max_speed_mps,
             omega_rad_s: omega,
@@ -279,6 +295,7 @@ pub fn seek_lost_links(
             table,
             self_pos,
             base_pos,
+            self_heading_deg: kin.heading_deg,
             self_clock_now: clock.now,
             max_speed_mps,
             omega_rad_s: omega,
@@ -297,6 +314,9 @@ struct SeekSlotArgs<'a> {
     table: &'a MeshTable,
     self_pos: Vec3,
     base_pos: Vec3,
+    /// This drone's own yaw. `Antenna::azimuth_deg` is drone-relative, so the
+    /// world-frame bearing computed here has to be brought into that frame.
+    self_heading_deg: f32,
     self_clock_now: f64,
     max_speed_mps: f32,
     omega_rad_s: f32,
@@ -314,6 +334,7 @@ fn seek_one_slot(args: SeekSlotArgs) {
         table,
         self_pos,
         base_pos,
+        self_heading_deg,
         self_clock_now,
         max_speed_mps,
         omega_rad_s,
@@ -353,13 +374,131 @@ fn seek_one_slot(args: SeekSlotArgs) {
     let (delta_az, delta_el) =
         spiral_offset_deg(*elapsed, omega_rad_s, half_cone_deg, SPIRAL_TURNS_PER_SWEEP);
 
-    // TODO(future PR, re-enabling live aiming): `angles_toward` is a world-frame
-    // bearing, but `Antenna::azimuth_deg` is now drone-relative (heading-relative).
-    // Subtract the drone's own heading, e.g. `center_az - kin.heading_deg`.
+    // `angles_toward` is a world-frame bearing but `Antenna::azimuth_deg` is
+    // drone-relative, so the drone's own yaw comes back out of it. Elevation
+    // needs no such correction — the airframe stays level.
     let (center_az, center_el) = angles_toward(self_pos, target_pos);
     if let Some(antenna) = drone.antennas.get_mut(antenna_idx) {
-        antenna.azimuth_deg = (center_az + delta_az).rem_euclid(360.0);
+        antenna.azimuth_deg = (center_az - self_heading_deg + delta_az).rem_euclid(360.0);
         antenna.elevation_deg = (center_el + delta_el).clamp(-90.0, 90.0);
+    }
+}
+
+// ─── Reconnecting to the closest drone ────────────────────────────────────────
+
+/// A peer with this many direct connections or fewer is treated as fragile and
+/// will not be dropped to free an antenna.
+///
+/// The reasoning is about what the mesh loses, not what this drone gains. A
+/// peer with three or more links has redundancy — cut one and it is still
+/// reachable another way. A peer down to two or fewer is at or near the point
+/// where *this* link is what keeps it attached, so trading it for a marginally
+/// closer neighbour risks partitioning the drone off the mesh entirely. The
+/// closer link is not worth that.
+pub const FRAGILE_PEER_CONNECTIONS: usize = 2;
+
+/// How much closer a candidate must be before it is worth displacing an
+/// existing link, as a fraction of the current link's range.
+///
+/// Without this a pair of peers at nearly equal range would swap back and
+/// forth every frame, each swap making the other look marginally better.
+pub const RECONNECT_IMPROVEMENT: f32 = 0.9;
+
+/// Reconnect each drone to the closest drone it knows about — unless doing so
+/// would mean dropping a peer that can't spare the link.
+///
+/// Everything here is read out of the mesh lookup table
+/// ([`crate::networking::MeshTable`]), never from a peer's live `Transform`.
+/// Both facts this needs — where a peer is (`row.location`, base-relative) and
+/// how many links it has (`row.connections`) — are things the drone was
+/// *told*, directly or by relay. A drone has no other way to know them.
+///
+/// Per drone, per frame:
+///
+/// 1. Find the nearest known peer that isn't already linked.
+/// 2. If an antenna is free, just take it — nothing has to be given up.
+/// 3. Otherwise the nearest *existing* link has to be displaced, so pick the
+///    farthest one as the candidate to drop, and only proceed if the new peer
+///    is meaningfully closer ([`RECONNECT_IMPROVEMENT`]).
+/// 4. Refuse the trade if that drop candidate has
+///    [`FRAGILE_PEER_CONNECTIONS`] connections or fewer.
+///
+/// The actual link change is not made here — this only queues the attempt on
+/// [`ReconnectRequests`], which `networking::process_reconnect` turns into the
+/// priority handshake flood.
+#[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
+pub fn reconnect_to_closest(
+    mut requests: ResMut<ReconnectRequests>,
+    drones: Query<
+        (Entity, &Transform, &Drone, &DroneUuid, &LinkSet, &MeshTable, &Pairing),
+        With<Drone>,
+    >,
+    uuids: Query<&DroneUuid>,
+    bases: Query<&Base>,
+) {
+    let Some(base_pos) = bases.iter().next().map(|b| b.position) else {
+        // Every mesh-table location is base-relative, so without a base there
+        // is no frame to resolve them in.
+        return;
+    };
+
+    for (self_entity, transform, drone, self_uuid, links, table, pairing) in &drones {
+        // One handshake at a time — don't pile a second request on a drone
+        // that is already mid-flood or stopped for a lock.
+        if pairing.state != PairingState::Idle || pairing.frozen {
+            continue;
+        }
+        if requests.0.iter().any(|(entity, _)| *entity == self_entity) {
+            continue;
+        }
+
+        let self_pos = transform.translation;
+        let linked_uuids: HashSet<String> = links
+            .connected
+            .keys()
+            .filter_map(|entity| uuids.get(*entity).ok().map(|u| u.0.clone()))
+            .collect();
+
+        // Range to a peer, as the lookup table describes it.
+        let range_to = |row: &MeshRow| (base_pos + row.location - self_pos).length();
+
+        // 1. Nearest known peer we are not already talking to.
+        let closest = table
+            .0
+            .values()
+            .filter(|row| row.id != self_uuid.0 && !linked_uuids.contains(&row.id))
+            .min_by(|a, b| range_to(a).total_cmp(&range_to(b)));
+        let Some(closest) = closest else {
+            continue;
+        };
+
+        // 2. A free antenna means nothing has to be given up.
+        if links.connected.len() < drone.antennas.len() {
+            requests.0.push((self_entity, closest.id.clone()));
+            continue;
+        }
+
+        // 3. Otherwise the farthest current link is what would be displaced.
+        let drop_candidate = table
+            .0
+            .values()
+            .filter(|row| linked_uuids.contains(&row.id))
+            .max_by(|a, b| range_to(a).total_cmp(&range_to(b)));
+        let Some(drop_candidate) = drop_candidate else {
+            // Linked to peers we have no table rows for — nothing to reason
+            // about, so don't trade blind.
+            continue;
+        };
+        if range_to(closest) >= range_to(drop_candidate) * RECONNECT_IMPROVEMENT {
+            continue;
+        }
+
+        // 4. Never strand a peer that is down to its last links.
+        if drop_candidate.connections.len() <= FRAGILE_PEER_CONNECTIONS {
+            continue;
+        }
+
+        requests.0.push((self_entity, closest.id.clone()));
     }
 }
 

@@ -43,3 +43,13 @@ pub fn make_antenna(azimuth_deg: f32, elevation_deg: f32, _seed: usize) -> Anten
         sensitivity_dbm: -80.0,
     }
 }
+
+/// Furthest a link can close on perfect boresight with the hardware above:
+/// 3.52 km, where the 111 dB budget (`p_tx` + `g_peak` − `sensitivity`) is
+/// exactly eaten by path loss.
+///
+/// The formation geometry is sized from this — see
+/// [`crate::navigation::MAX_LINK_SPACING_KM`]. Change any of the antenna
+/// parameters above and this must be recomputed, or the mesh silently stops
+/// forming.
+pub const ANTENNA_RANGE_KM: f32 = 3.52;

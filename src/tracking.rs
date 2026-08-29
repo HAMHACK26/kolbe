@@ -20,6 +20,7 @@ use bevy::prelude::*;
 use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
+use crate::factories::movement::DroneKinematics;
 use crate::networking::{DroneUuid, MeshTable, Pairing, RingIndex};
 
 /// Where this drone currently believes a tracked peer *will be*, based
@@ -61,9 +62,17 @@ pub struct TrackedPeers(pub HashMap<Entity, Vec3>);
 ///
 /// This overrides the fixed 120°-apart layout `world::setup` used to compute
 /// the initial angles; those were only ever a starting point.
-#[allow(dead_code)] // Implemented and tested, but live aiming is not yet enabled in main.
+#[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
 pub fn maintain_mesh_antennas(
-    mut drones: Query<(&Transform, &mut Drone, &RingIndex, &TrackedPeers, &MeshTable, &Pairing)>,
+    mut drones: Query<(
+        &Transform,
+        &mut Drone,
+        &RingIndex,
+        &TrackedPeers,
+        &MeshTable,
+        &DroneKinematics,
+        &Pairing,
+    )>,
     positions: Query<(Entity, &RingIndex, &DroneUuid), With<Drone>>,
     bases: Query<&Base>,
 ) {
@@ -77,7 +86,7 @@ pub fn maintain_mesh_antennas(
     ring.sort_by_key(|(i, ..)| *i);
     let n = ring.len();
 
-    for (self_transform, mut drone, self_ring, tracked, table, pairing) in &mut drones {
+    for (self_transform, mut drone, self_ring, tracked, table, kin, pairing) in &mut drones {
         if n == 0 {
             continue;
         }
@@ -114,23 +123,26 @@ pub fn maintain_mesh_antennas(
         // feedback using `Antenna::rssi_dbm`/`off_boresight_deg` sampled at
         // a few points around the current boresight each tick.
 
-        // TODO(future PR, re-enabling live aiming): `angles_toward` returns a
-        // world-frame bearing, but `Antenna::azimuth_deg` is now drone-relative
-        // (heading-relative). Subtract the drone's own heading before assigning,
-        // e.g. `az - kin.heading_deg` — elevation needs no such adjustment.
+        // `angles_toward` returns a world-frame bearing, but
+        // `Antenna::azimuth_deg` is drone-relative, so the drone's own yaw has
+        // to come back out of it before the angle is stored. Elevation needs no
+        // such adjustment — the airframe stays level, so its pitch frame and the
+        // world's agree.
+        let relative_az = |az: f32| (az - kin.heading_deg).rem_euclid(360.0);
+
         if let (Some(next_pos), Some(first)) = (next_pos, drone.antennas.get_mut(0)) {
             let (az, el) = angles_toward(self_pos, next_pos);
-            first.azimuth_deg = az;
+            first.azimuth_deg = relative_az(az);
             first.elevation_deg = el;
         }
         if let (Some(base_pos), Some(second)) = (base_pos, drone.antennas.get_mut(1)) {
             let (az, el) = angles_toward(self_pos, base_pos);
-            second.azimuth_deg = az;
+            second.azimuth_deg = relative_az(az);
             second.elevation_deg = el;
         }
         if let (Some(prev_pos), Some(third)) = (prev_pos, drone.antennas.get_mut(2)) {
             let (az, el) = angles_toward(self_pos, prev_pos);
-            third.azimuth_deg = az;
+            third.azimuth_deg = relative_az(az);
             third.elevation_deg = el;
         }
     }
@@ -164,6 +176,9 @@ mod tests {
                     ],
                 },
                 NetworkingBundle::random(ring),
+                // Heading 0 keeps drone-relative and world azimuth identical,
+                // so these expectations stay readable as plain bearings.
+                DroneKinematics::default(),
             ))
             .id()
     }
