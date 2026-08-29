@@ -29,7 +29,7 @@ pub fn make_camera_overlay(mut cameras: Query<&mut Camera, With<UiCamera>>) {
 #[derive(Component)]
 pub struct ResetButton;
 
-/// Cycles the simulation clock through 1×, 2×, 4×, and 8× speed.
+/// Cycles the simulation clock through 1×, 2×, 4×, 8×, and 16× speed.
 #[derive(Component)]
 pub struct SpeedButton;
 
@@ -156,6 +156,7 @@ pub fn speed_button_interactions(
         speed if speed < 1.5 => 2.0,
         speed if speed < 3.0 => 4.0,
         speed if speed < 6.0 => 8.0,
+        speed if speed < 12.0 => 16.0,
         _ => 1.0,
     };
     virtual_time.set_relative_speed(next_speed);

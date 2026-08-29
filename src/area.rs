@@ -160,8 +160,8 @@ impl NetworkArea {
         // `project` a reference point with lon/lat swapped, which for a
         // point ~63°N ~17°E silently computed a "distance" around 7,000 km
         // instead of the real few-km distance — this is what made "click to
-        // place the base" always land outside `MAX_BASE_DISTANCE_KM` and
-        // appear to do nothing.
+        // place the base" always land outside the visible square and appear
+        // to do nothing.
         let (clon, clat) = self.center;
         let local = polygon::project(clon, clat, lon, lat);
         let (s, c) = self.rotation_deg.to_radians().sin_cos();
@@ -1211,11 +1211,9 @@ pub fn add_point_on_click(
     }
 }
 
-/// Base placements farther than this from the network-area square are rejected.
-const MAX_BASE_DISTANCE_KM: f64 = 3.0;
-
-/// Place (or cancel placing) the base while in `PlacingBase` mode. Must land
-/// within `MAX_BASE_DISTANCE_KM` of the network-area square.
+/// Place (or cancel placing) the base while in `PlacingBase` mode. It must
+/// land inside the visible orange operational square, which is also the
+/// fetched terrain footprint.
 pub fn place_base_on_click(
     map_q: Query<(&Interaction, &RelativeCursorPosition), (With<MapViewport>, Changed<Interaction>)>,
     mut mode: ResMut<PickMode>,
@@ -1238,9 +1236,9 @@ pub fn place_base_on_click(
         let (lon, lat) = cursor_to_lonlat(normalized, &view);
         let distance = net.distance_to_square_km(lat, lon);
         info!(
-            "[base] click at normalized {normalized:?} -> lon={lon:.5} lat={lat:.5}, {distance:.3} km from area (limit {MAX_BASE_DISTANCE_KM})"
+            "[base] click at normalized {normalized:?} -> lon={lon:.5} lat={lat:.5}, {distance:.3} km from area"
         );
-        if distance <= MAX_BASE_DISTANCE_KM {
+        if distance <= f64::EPSILON {
             base.0 = Some((lat, lon));
             *mode = PickMode::Reviewing;
         }
@@ -1930,7 +1928,7 @@ pub fn update_status_text(
                         net.side_km
                     ),
                     MissionState::PlacingStation => format!(
-                        "Click within {MAX_BASE_DISTANCE_KM:.0} km of the area to place the ground station."
+                        "Click inside the orange area to place the ground station."
                     ),
                     MissionState::NeedStation => {
                         "Ground station required before terrain can be fetched.".into()
@@ -1965,13 +1963,13 @@ pub fn update_status_text(
 }
 
 /// How many airframes the current selection would need, or `None` if there is
-/// no valid area yet. Mirrors `world::setup`: the patrol volume is the area
-/// inset by the boundary margin, and the count falls out of the radio pitch.
+/// no valid area yet. Mirrors `world::setup`'s 3 km coverage intervals plus
+/// its 50% reserve.
 fn airframes_for(net: &NetworkArea) -> Option<usize> {
     if !net.valid || net.over_limit {
         return None;
     }
-    Some(crate::world::DRONE_COUNT)
+    Some(crate::world::target_area_drone_count(net))
 }
 
 /// Live centre/zoom readout under the map. Separate from the rail's status
@@ -2015,9 +2013,8 @@ pub fn generate_terrain(
     // `net.center` is `(lon, lat)` — see the comment on `distance_to_square_km`.
     area.latitude = net.center.1;
     area.longitude = net.center.0;
-    // A base may sit just outside the selected mission shape. Fetch enough
-    // terrain for that launch point as well, while keeping the mission center
-    // (and therefore the drone target coordinates) unchanged.
+    // The base is constrained to the selected square, keeping the mission
+    // center and terrain footprint aligned with the visible target.
     let (base_lat, base_lon) = base.0.expect("validated above");
     let target_half = net.fetch_size_km as f64 * 0.5;
     let base_x = (base_lon - net.center.0).abs()
@@ -2160,7 +2157,7 @@ mod tests {
     /// started working). Tolerance is ~11 m (1e-4°) at Sweden's latitude —
     /// not exact, since the round trip goes through `Vec2` (f32) pixel
     /// coordinates like the real UI does, but well inside what matters for
-    /// clicking a point on a map (`MAX_BASE_DISTANCE_KM` is 3 km).
+    /// clicking a point on a map.
     #[test]
     fn screen_lonlat_roundtrip_is_close_at_any_zoom() {
         let cases = [(17.65, 62.15, 5u8), (18.0686, 59.3293, 12), (11.0, 68.0, 9)];
@@ -2267,9 +2264,9 @@ mod tests {
     /// `recompute_area_on_change` does, then click the square's own center
     /// at a deeply-zoomed-in view (placing the base usually happens zoomed
     /// in for precision, per `point_table_and_buttons`'s comment) — the
-    /// resulting `distance_to_square_km` must clear
-    /// `MAX_BASE_DISTANCE_KM`, or `place_base_on_click` would reject a click
-    /// that's visually dead-center on the area.
+    /// resulting `distance_to_square_km` must be zero, or
+    /// `place_base_on_click` would reject a click that's visually dead-center
+    /// on the area.
     #[test]
     fn clicking_the_network_areas_own_center_places_the_base() {
         let points = [(59.0, 18.0), (59.05, 18.05), (58.98, 18.06)];
@@ -2294,7 +2291,7 @@ mod tests {
             let (lon, lat) = cursor_to_lonlat(Vec2::ZERO, &view); // dead center of the viewport
             let distance = net.distance_to_square_km(lat, lon);
             assert!(
-                distance <= MAX_BASE_DISTANCE_KM,
+                distance <= f64::EPSILON,
                 "clicking the area's own center at zoom {zoom} landed {distance:.4} km away — should be ~0"
             );
         }

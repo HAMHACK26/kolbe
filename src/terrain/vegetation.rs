@@ -26,7 +26,7 @@ const DEFAULT_TREE_HEIGHT_M: f32 = 50.0;
 const JITTER_FRACTION: f32 = 0.45;
 /// Crown radius as a fraction of total height. At the default spacing this puts
 /// neighbouring crowns just about in contact, so the canopy reads as closed.
-const CROWN_RADIUS_FRACTION: f32 = 0.28;
+const CROWN_RADIUS_FRACTION: f32 = 0.21;
 const TRUNK_HEIGHT_FRACTION: f32 = 0.34;
 const TRUNK_RADIUS_FRACTION: f32 = 0.030;
 const CROWN_SIDES: usize = 5;

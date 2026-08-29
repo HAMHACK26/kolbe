@@ -166,12 +166,12 @@ pub fn apply_velocity(
         // avoidance deflections and recovery. The radius converts the 50 m
         // hull clearance into the sphere center's required altitude.
         let ground = terrain.height_at(transform.translation.x, transform.translation.z);
-        // This follows the terrain in both directions. Foliage is a separate
-        // obstacle/radio layer, so clearing trees at the base never changes
-        // the ground reference or the 50 m AGL flight level.
-        transform.translation.y = ground
-            + crate::world::DRONE_GROUND_CLEARANCE_KM
-            + crate::world::DRONE_RADIUS;
+        // Terrain is a floor, not a hard flight level: canopy avoidance may
+        // have climbed above it and must keep that clearance until the forest
+        // is behind the drone.
+        transform.translation.y = transform.translation.y.max(
+            ground + crate::world::DRONE_GROUND_CLEARANCE_KM + crate::world::DRONE_RADIUS,
+        );
 
         // Update heading from velocity XZ projection
         if kin.velocity.xz().length_squared() > 1e-6 {

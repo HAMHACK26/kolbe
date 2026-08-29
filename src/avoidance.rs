@@ -101,6 +101,12 @@ pub const SENSOR_RANGE_M: f32 = 3.0;
 /// [`SENSOR_RANGE_M`] in the kilometer units the simulation world uses.
 pub const SENSOR_RANGE_KM: f32 = SENSOR_RANGE_M / 1000.0;
 
+/// Start climbing well before a canopy. At the default 15 m/s cruise and
+/// 5 m/s climb rate, 200 m gives a drone time to rise above a 50 m tree.
+const TREE_CLIMB_LOOKAHEAD_KM: f32 = 0.20;
+/// Extra vertical gap between the drone hull and a canopy top.
+const TREE_TOP_CLEARANCE_KM: f32 = 0.01;
+
 /// Horizontal bounding radius of the ground station, km.
 ///
 /// The base is drawn as a [`BASE_BOX_SIZE_KM`] cube; the circle that encloses
@@ -282,9 +288,9 @@ pub fn avoidance_velocity(
 /// (currently [`crate::recovery::run_recovery`]) and before
 /// [`crate::factories::movement::apply_velocity`] integrates it.
 ///
-/// What the ring can see: other drones, the ground station, and anything
-/// carrying an [`Obstacle`] component. Terrain is not included — that is a
-/// vertical concern, and `apply_velocity` already floors altitude.
+/// The horizontal ring sees other drones, the ground station, and explicit
+/// [`Obstacle`] components. Tree canopies are handled separately: the drone
+/// climbs above them instead of treating a forest as a sideways wall.
 pub fn avoid_collisions(
     time: Res<Time>,
     mut drones: Query<(Entity, &Transform, &mut DroneKinematics), With<Drone>>,
@@ -318,20 +324,13 @@ pub fn avoid_collisions(
                 radius_km: *radius_km,
             })
             .collect();
-        let mut detections = detections;
+        let mut canopy_ceiling = None;
         if let Some(canopies) = &canopies {
-            // Include the drone hull and canopy radius in the broad-phase
-            // lookup so trees are visible before their surfaces meet.
-            let search_radius = DRONE_RADIUS + SENSOR_RANGE_KM;
-            detections.extend(
-                canopies
-                    .nearby_canopies(self_pos, search_radius)
-                    .into_iter()
-                    .map(|canopy| Detection {
-                        offset: canopy.position - self_pos,
-                        radius_km: canopy.radius_km,
-                    }),
-            );
+            canopy_ceiling = canopies
+                .nearby_canopies(self_pos, TREE_CLIMB_LOOKAHEAD_KM)
+                .into_iter()
+                .map(|canopy| canopy.position.y + DRONE_RADIUS + TREE_TOP_CLEARANCE_KM)
+                .max_by(f32::total_cmp);
         }
 
         kinematics.velocity = avoidance_velocity(
@@ -343,5 +342,15 @@ pub fn avoid_collisions(
             &limits,
             dt,
         );
+        if let Some(clearance_altitude) = canopy_ceiling {
+            // Canopies are flown over, never pushed through sideways. Hold
+            // altitude while one remains ahead; the normal navigator resumes
+            // descent once clear of the forest.
+            kinematics.velocity.y = if self_pos.y < clearance_altitude {
+                limits.max_climb_mps
+            } else {
+                kinematics.velocity.y.max(0.0)
+            };
+        }
     }
 }

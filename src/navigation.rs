@@ -260,23 +260,28 @@ pub fn navigate(state: &mut DroneState, target: Vec3, limits: &FlightLimits, dt:
     }
 }
 
-/// Fly drones to the selected area's center, then to their fixed 3 km survey
-/// slots. This mission mode deliberately ignores all communication state;
-/// collision avoidance remains the layer that can deflect the course.
+/// Fly drones toward the selected area, then send each to its fixed 3 km
+/// survey slot as soon as it crosses the operational rectangle. This mission
+/// mode deliberately ignores all communication state; collision avoidance
+/// remains the layer that can deflect the course.
 pub fn go_to_network_area(
     time: Res<Time>,
+    network_area: Res<crate::area::NetworkArea>,
+    scenario: Res<crate::area::ScenarioArea>,
     mut drones: Query<(&Transform, &mut DeploymentTarget, &mut DroneKinematics), With<Drone>>,
 ) {
     let dt = time.delta_secs();
     let limits = FlightLimits::default().in_km();
 
     for (transform, mut target, mut kin) in &mut drones {
-        if !target.spreading
-            && transform.translation.xz().distance(target.ingress.xz()) <= INGRESS_ARRIVE_KM
-        {
+        if !target.spreading && inside_operational_area(transform.translation, &network_area, &scenario) {
             target.spreading = true;
         }
-        let waypoint = if target.spreading { target.slot } else { target.ingress };
+        let waypoint = if target.spreading {
+            repel_from_target_boundary(transform.translation, target.slot, &network_area, &scenario)
+        } else {
+            target.ingress
+        };
         let mut state = DroneState {
             position: transform.translation,
             velocity: kin.velocity,
@@ -288,4 +293,60 @@ pub fn go_to_network_area(
     }
 }
 
-const INGRESS_ARRIVE_KM: f32 = 0.05;
+fn inside_operational_area(
+    position: Vec3,
+    area: &crate::area::NetworkArea,
+    scenario: &crate::area::ScenarioArea,
+) -> bool {
+    if !area.valid {
+        return false;
+    }
+    let (lon, lat) = area.center;
+    let center_x =
+        ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
+    let center_z = ((lat - scenario.latitude) * 110.574) as f32;
+    let half_side = area.side_km as f32 * 0.5;
+    (position.x - center_x).abs() <= half_side && (position.z - center_z).abs() <= half_side
+}
+
+/// Distance over which the target boundary begins steering an in-area drone
+/// back toward the survey region.
+const BOUNDARY_REPULSION_KM: f32 = 3.0;
+
+fn repel_from_target_boundary(
+    position: Vec3,
+    slot: Vec3,
+    area: &crate::area::NetworkArea,
+    scenario: &crate::area::ScenarioArea,
+) -> Vec3 {
+    if !inside_operational_area(position, area, scenario) {
+        return slot;
+    }
+    let (lon, lat) = area.center;
+    let center_x =
+        ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
+    let center_z = ((lat - scenario.latitude) * 110.574) as f32;
+    let half_side = area.side_km as f32 * 0.5;
+    let local = Vec2::new(position.x - center_x, position.z - center_z);
+    let distances = [
+        (half_side - local.x, -Vec2::X),
+        (half_side + local.x, Vec2::X),
+        (half_side - local.y, -Vec2::Y),
+        (half_side + local.y, Vec2::Y),
+    ];
+    let mut push = Vec2::ZERO;
+    let mut urgency = 0.0_f32;
+    for (distance, inward) in distances {
+        if distance < BOUNDARY_REPULSION_KM {
+            let weight = ((BOUNDARY_REPULSION_KM - distance) / BOUNDARY_REPULSION_KM)
+                .clamp(0.0, 1.0);
+            push += inward * weight;
+            urgency = urgency.max(weight);
+        }
+    }
+    if push.length_squared() <= f32::EPSILON {
+        return slot;
+    }
+    let escape = position + Vec3::new(push.x, 0.0, push.y).normalize() * BOUNDARY_REPULSION_KM;
+    slot.lerp(escape, urgency)
+}

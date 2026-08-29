@@ -18,7 +18,6 @@ use crate::{
 };
 
 pub const WORLD_SIZE: f32 = 20.0;
-pub const DRONE_COUNT: usize = 5;
 pub const DRONE_RADIUS: f32 = 0.0225;
 /// Clearance from the terrain to the underside of each drone, in km (50 m).
 pub const DRONE_GROUND_CLEARANCE_KM: f32 = 0.05;
@@ -52,13 +51,31 @@ pub(crate) struct DeploymentQueue {
 
 /// Radius of the initial survey ring around the selected area's center.
 pub const FORMATION_RADIUS_KM: f32 = 3.0;
+/// Fleet multiplier applied after dividing the target span into 3 km coverage
+/// intervals.
+const COVERAGE_RESERVE: f32 = 1.50;
 
-fn launch_position(base_pos: Vec3, index: usize) -> Vec3 {
-    let angle = index as f32 / DRONE_COUNT as f32 * std::f32::consts::TAU;
+/// Number of drones for the operational target: its side length in km,
+/// divided into 3 km coverage intervals, with 50% reserve rounded up.
+pub fn target_area_drone_count(area: &crate::area::NetworkArea) -> usize {
+    ((area.side_km as f32 / FORMATION_RADIUS_KM) * COVERAGE_RESERVE)
+        .ceil()
+        .max(1.0) as usize
+}
+
+fn launch_position(base_pos: Vec3, index: usize, count: usize) -> Vec3 {
+    let count = count.max(1);
+    let angle = index as f32 / count as f32 * std::f32::consts::TAU;
+    // Expand the launch ring for larger calculated fleets so adjacent pads
+    // still begin outside one another's collision hulls.
+    let required_separation = DRONE_RADIUS * 2.0 + crate::avoidance::SENSOR_RANGE_KM + 0.001;
+    let minimum_radius = required_separation
+        / (2.0 * (std::f32::consts::PI / count as f32).sin()).max(f32::EPSILON);
+    let radius = LAUNCH_RING_RADIUS_KM.max(minimum_radius);
     base_pos + Vec3::new(
-        LAUNCH_RING_RADIUS_KM * angle.sin(),
+        radius * angle.sin(),
         0.0,
-        LAUNCH_RING_RADIUS_KM * angle.cos(),
+        radius * angle.cos(),
     )
 }
 
@@ -73,12 +90,12 @@ pub fn target_area_formation(
     let (lon, lat) = area.center;
     let center_x = ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
     let center_z = ((lat - scenario.latitude) * 110.574) as f32;
-    let radius = FORMATION_RADIUS_KM;
-    (0..DRONE_COUNT)
+    let drone_count = target_area_drone_count(area);
+    (0..drone_count)
         .map(|i| {
-            let angle = i as f32 / DRONE_COUNT as f32 * std::f32::consts::TAU;
-            let x = center_x + radius * angle.sin();
-            let z = center_z + radius * angle.cos();
+            let angle = i as f32 / drone_count as f32 * std::f32::consts::TAU;
+            let x = center_x + FORMATION_RADIUS_KM * angle.sin();
+            let z = center_z + FORMATION_RADIUS_KM * angle.cos();
             Vec3::new(
                 x,
                 terrain.height_at(x, z) + DRONE_GROUND_CLEARANCE_KM + DRONE_RADIUS,
@@ -185,7 +202,7 @@ pub fn setup(
         &drone_mesh,
         &drone_mat,
         &cone_mat,
-        launch_position(base_pos, 0),
+        launch_position(base_pos, 0, target_slots.len()),
         base_pos,
         ingress,
         &target_slots,
@@ -323,7 +340,7 @@ pub fn spawn_next_drone(
         &deployment.drone_mesh.clone(),
         &deployment.drone_mat.clone(),
         &deployment.cone_mat.clone(),
-        launch_position(deployment.base_pos, index),
+        launch_position(deployment.base_pos, index, deployment.target_slots.len()),
         deployment.base_pos,
         deployment.ingress,
         &deployment.target_slots,
@@ -427,16 +444,31 @@ mod tests {
     #[test]
     fn launch_pads_clear_each_other_and_the_base() {
         let base = Vec3::ZERO;
-        let pads: Vec<Vec3> = (0..DRONE_COUNT)
-            .map(|index| launch_position(base, index))
+        let count = 17;
+        let pads: Vec<Vec3> = (0..count)
+            .map(|index| launch_position(base, index, count))
             .collect();
         for pad in &pads {
-            assert!((pad.xz().length() - LAUNCH_RING_RADIUS_KM).abs() < 1e-6);
+            assert!(pad.xz().length() >= LAUNCH_RING_RADIUS_KM);
         }
         for (index, pad) in pads.iter().enumerate() {
             for other in pads.iter().skip(index + 1) {
-                assert!(pad.xz().distance(other.xz()) > DRONE_RADIUS * 2.0);
+                assert!(
+                    pad.xz().distance(other.xz())
+                        >= DRONE_RADIUS * 2.0 + crate::avoidance::SENSOR_RANGE_KM
+                );
             }
         }
+    }
+
+    #[test]
+    fn coverage_count_adds_fifty_percent_reserve() {
+        let area = crate::area::NetworkArea {
+            side_km: 6.0,
+            valid: true,
+            ..default()
+        };
+        // 6 km / 3 km × 1.5 reserve = 3 drones.
+        assert_eq!(target_area_drone_count(&area), 3);
     }
 }
