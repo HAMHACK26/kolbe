@@ -11,7 +11,9 @@ use crate::{
     polygon, sweden_geo,
     terrain::{DENSITY_STEP, MAX_DENSITY, MIN_DENSITY, VegetationSettings},
     theme::{Palette, Slot, Theme, UiFill, UiInk, UiStroke},
-    tiles, AppState,
+    tiles,
+    world::{MAX_WIND_INTENSITY, MIN_WIND_INTENSITY, WIND_INTENSITY_STEP, WindSettings},
+    AppState,
 };
 
 /// Kept for existing callers (terrain fetch math) — the network-area picker
@@ -430,6 +432,13 @@ pub(crate) struct DensityLabel;
 #[derive(Component)]
 pub(crate) struct DensityFill;
 
+#[derive(Component)]
+pub(crate) struct WindLabel;
+
+/// Filled portion of the wind-intensity slider track.
+#[derive(Component)]
+pub(crate) struct WindFill;
+
 // ─── Type ──────────────────────────────────────────────────────────────────
 
 /// Widen a short label by inserting thin spaces between its characters.
@@ -647,6 +656,7 @@ fn spawn_zoom_button(
 pub fn setup(
     mut commands: Commands,
     vegetation: Res<VegetationSettings>,
+    wind: Res<WindSettings>,
     load_error: Option<Res<crate::terrain::TerrainLoadError>>,
     theme: Res<Theme>,
     fonts: Res<crate::UiFonts>,
@@ -685,7 +695,7 @@ pub fn setup(
             })
             .with_children(|body| {
                 spawn_map(body, &fonts, &p);
-                spawn_rail(body, &vegetation, load_error.as_deref(), &fonts, &p);
+                spawn_rail(body, &vegetation, &wind, load_error.as_deref(), &fonts, &p);
             });
         });
 }
@@ -913,6 +923,7 @@ fn spawn_map(body: &mut ChildSpawnerCommands, fonts: &crate::UiFonts, p: &Palett
 fn spawn_rail(
     body: &mut ChildSpawnerCommands,
     vegetation: &VegetationSettings,
+    wind: &WindSettings,
     load_error: Option<&crate::terrain::TerrainLoadError>,
     fonts: &crate::UiFonts,
     p: &Palette,
@@ -1015,8 +1026,9 @@ fn spawn_rail(
             spawn_readout(col, "POSITION", "NOT SET", RailField::Station, fonts, p);
             spawn_button(col, "SET LOCATION", ButtonKind::Ghost, SetBaseButton, RailField::SetBaseLabel, true, p);
 
-            spawn_section(col, "TERRAIN", p);
+            spawn_section(col, "ENVIRONMENT", p);
             spawn_vegetation_controls(col, vegetation, fonts, p);
+            spawn_wind_controls(col, wind, fonts, p);
             col.spawn((
                 Text::new("Elevation source: Lantmateriet DTM"),
                 sans(10.0),
@@ -1176,7 +1188,87 @@ fn spawn_vegetation_controls(
         });
 }
 
+fn spawn_wind_controls(
+    panel: &mut ChildSpawnerCommands,
+    wind: &WindSettings,
+    fonts: &crate::UiFonts,
+    p: &Palette,
+) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(8.0),
+            margin: UiRect::top(Val::Px(2.0)),
+            ..default()
+        })
+        .with_children(|group| {
+            group
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new("WIND INTENSITY"),
+                        sans(10.0),
+                        TextColor(p.subtext),
+                        UiInk::new(Slot::Subtext),
+                    ));
+                    row.spawn((
+                        Text::new(wind_text(wind)),
+                        mono(fonts, 12.0),
+                        TextColor(p.text),
+                        UiInk::new(Slot::Text),
+                        WindLabel,
+                    ));
+                });
+
+            group
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(8.0),
+                        border: UiRect::all(Val::Px(HAIRLINE)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::NONE),
+                    BorderColor::all(p.line),
+                    UiStroke::new(Slot::Line),
+                    Slider { track_click: TrackClick::Snap, ..default() },
+                    SliderValue(wind.intensity),
+                    SliderRange::new(MIN_WIND_INTENSITY, MAX_WIND_INTENSITY),
+                    SliderStep(WIND_INTENSITY_STEP),
+                    SliderPrecision(0),
+                ))
+                .observe(
+                    |change: On<ValueChange<f32>>,
+                     mut commands: Commands,
+                     mut wind: ResMut<WindSettings>| {
+                        let value =
+                            change.value.clamp(MIN_WIND_INTENSITY, MAX_WIND_INTENSITY);
+                        commands.entity(change.source).insert(SliderValue(value));
+                        wind.intensity = value;
+                    },
+                )
+                .with_child((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::ZERO,
+                        top: Val::ZERO,
+                        width: Val::Percent(wind_fraction(wind.intensity) * 100.0),
+                        height: Val::Percent(100.0),
+                        ..default()
+                    },
+                    BackgroundColor(p.signal),
+                    Pickable::IGNORE,
+                    WindFill,
+                ));
+        });
+}
 /// Turns the trees toggle on/off in response to a button press. Split out of
+
 /// (what was, on `main`) a combined `interactions` system, since this branch's
 /// picker flow already owns click handling for everything else on this screen.
 pub fn trees_toggle_interactions(
@@ -2059,17 +2151,34 @@ pub fn generate_terrain(
     next_state.set(AppState::LoadingTerrain);
 }
 
-/// Redraw the vegetation controls whenever the settings change, whichever
-/// widget did the changing.
-pub fn refresh_vegetation_controls(
+/// Redraw setup controls whenever their resources or the theme change.
+pub fn refresh_setup_controls(
     vegetation: Res<VegetationSettings>,
+    wind: Res<WindSettings>,
     theme: Res<Theme>,
-    mut toggle_labels: Query<(&mut Text, &mut TextColor), With<TreesToggleLabel>>,
-    mut density_labels: Query<&mut Text, (With<DensityLabel>, Without<TreesToggleLabel>)>,
+    mut toggle_labels: Query<
+        (&mut Text, &mut TextColor),
+        (With<TreesToggleLabel>, Without<DensityLabel>, Without<WindLabel>),
+    >,
+    mut density_labels: Query<
+        &mut Text,
+        (With<DensityLabel>, Without<TreesToggleLabel>, Without<WindLabel>),
+    >,
+    mut wind_labels: Query<
+        &mut Text,
+        (With<WindLabel>, Without<TreesToggleLabel>, Without<DensityLabel>),
+    >,
     mut toggles: Query<&mut BorderColor, With<TreesToggle>>,
-    mut fills: Query<(&mut Node, &mut BackgroundColor), With<DensityFill>>,
+    mut density_fills: Query<
+        (&mut Node, &mut BackgroundColor),
+        (With<DensityFill>, Without<WindFill>),
+    >,
+    mut wind_fills: Query<
+        (&mut Node, &mut BackgroundColor),
+        (With<WindFill>, Without<DensityFill>),
+    >,
 ) {
-    if !vegetation.is_changed() && !theme.is_changed() {
+    if !vegetation.is_changed() && !wind.is_changed() && !theme.is_changed() {
         return;
     }
     let p = theme.palette();
@@ -2081,18 +2190,24 @@ pub fn refresh_vegetation_controls(
     for mut label in &mut density_labels {
         **label = density_text(&vegetation);
     }
+    for mut label in &mut wind_labels {
+        **label = wind_text(&wind);
+    }
     // The toggle is an outline, not a fill: an amber border says "on" without
     // adding a second filled control to a screen that has exactly one.
     for mut border in &mut toggles {
         border.set_all(if vegetation.enabled { p.signal } else { p.line });
     }
-    for (mut node, mut color) in &mut fills {
+    for (mut node, mut color) in &mut density_fills {
         node.width = Val::Percent(density_fraction(vegetation.density) * 100.0);
         // Dim the fill when the slider drives nothing.
         color.0 = if vegetation.enabled { p.signal } else { p.signal.with_alpha(0.22) };
     }
+    for (mut node, mut color) in &mut wind_fills {
+        node.width = Val::Percent(wind_fraction(wind.intensity) * 100.0);
+        color.0 = p.signal;
+    }
 }
-
 pub fn cleanup(mut commands: Commands, roots: Query<Entity, With<AreaSelectionRoot>>) {
     for entity in &roots {
         commands.entity(entity).despawn();
@@ -2117,6 +2232,15 @@ fn density_fraction(density: f32) -> f32 {
     ((density - MIN_DENSITY) / (MAX_DENSITY - MIN_DENSITY)).clamp(0.0, 1.0)
 }
 
+fn wind_text(wind: &WindSettings) -> String {
+    format!("{:.0} / {:.0}", wind.intensity, MAX_WIND_INTENSITY)
+}
+
+fn wind_fraction(intensity: f32) -> f32 {
+    ((intensity - MIN_WIND_INTENSITY) / (MAX_WIND_INTENSITY - MIN_WIND_INTENSITY))
+        .clamp(0.0, 1.0)
+}
+
 fn toggle_ink(enabled: bool, p: &Palette) -> Color {
     if enabled { p.signal } else { p.subtext }
 }
@@ -2124,6 +2248,15 @@ fn toggle_ink(enabled: bool, p: &Palette) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wind_slider_fraction_spans_zero_to_twenty() {
+        assert_eq!(wind_fraction(MIN_WIND_INTENSITY), 0.0);
+        assert_eq!(wind_fraction(MAX_WIND_INTENSITY), 1.0);
+        assert_eq!(wind_fraction(10.0), 0.5);
+        assert_eq!(wind_fraction(-1.0), 0.0);
+        assert_eq!(wind_fraction(21.0), 1.0);
+    }
 
     #[test]
     fn bbox_contains_selected_center() {

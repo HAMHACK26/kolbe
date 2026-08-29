@@ -25,8 +25,23 @@ pub const DRONE_RADIUS: f32 = 0.0225;
 /// Radius of the visible drone sphere. Kept separate from collision geometry
 /// so the marker can be tuned without changing flight behavior.
 pub const DRONE_VISUAL_RADIUS: f32 = DRONE_RADIUS;
-/// Global wind strength. 0.0 disables wind, 1.0 is baseline, 2.0 doubles it.
-pub const WIND_INTENSITY: f32 = 3.0;
+pub const MIN_WIND_INTENSITY: f32 = 0.0;
+pub const MAX_WIND_INTENSITY: f32 = 20.0;
+pub const WIND_INTENSITY_STEP: f32 = 1.0;
+pub const DEFAULT_WIND_INTENSITY: f32 = 3.0;
+
+/// Wind strength chosen on the setup screen. 0 disables wind, 1 is the
+/// baseline disturbance, and values up to 20 progressively amplify it.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct WindSettings {
+    pub intensity: f32,
+}
+
+impl Default for WindSettings {
+    fn default() -> Self {
+        Self { intensity: DEFAULT_WIND_INTENSITY }
+    }
+}
 /// Clearance from the terrain to the underside of each drone, in km (50 m).
 pub const DRONE_GROUND_CLEARANCE_KM: f32 = 0.05;
 const DEPLOYMENT_INTERVAL_SECS: f32 = 10.0;
@@ -199,6 +214,7 @@ pub fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
     theme: Res<Theme>,
+    wind: Res<WindSettings>,
     bases: Query<&Base>,
     network_area: Res<crate::area::NetworkArea>,
     scenario: Res<crate::area::ScenarioArea>,
@@ -255,6 +271,7 @@ pub fn setup(
             ingress,
             &target_slots,
             index,
+            wind.intensity,
         );
     }
     commands.insert_resource(DeploymentQueue {
@@ -374,6 +391,7 @@ pub fn spawn_next_drone(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut deployment: ResMut<DeploymentQueue>,
+    wind: Res<WindSettings>,
 ) {
     if deployment.next_index >= deployment.target_slots.len()
         || !deployment.timer.tick(time.delta()).just_finished()
@@ -394,6 +412,7 @@ pub fn spawn_next_drone(
             deployment.ingress,
             &deployment.target_slots,
             index,
+            wind.intensity,
         );
     }
     deployment.next_index = end;
@@ -410,6 +429,7 @@ fn spawn_deployment_drone(
     ingress: Vec3,
     target_slots: &[Vec3],
     index: usize,
+    wind_intensity: f32,
 ) {
     let antennas = formation_antennas(target_slots, index, base_pos);
     let drone_entity = commands
@@ -434,7 +454,7 @@ fn spawn_deployment_drone(
             ThemeRole::Drone,
             crate::SimulationEntity,
         ))
-        .insert(HoverWind::new(index, WIND_INTENSITY))
+        .insert(HoverWind::new(index, wind_intensity))
         .observe(
             |mut t: On<Pointer<Click>>, orbit: Res<OrbitCamera>, mut sel: ResMut<SelectedDrone>| {
                 t.propagate(false);

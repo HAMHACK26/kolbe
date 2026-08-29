@@ -15,9 +15,9 @@
 //!
 //! ## Why this doesn't reuse `avoidance::avoid_collisions`
 //!
-//! That system hardcodes `world::DRONE_RADIUS`, which models a 180 m collision
-//! body independently of the smaller visual marker. A 3 m sensor ring around
-//! a 180 m body is invisible at any camera distance the real app allows.
+//! That system hardcodes `world::DRONE_RADIUS`, which models a 22.5 m collision
+//! body — still far larger than a real airframe. A 3 m sensor ring around that
+//! body is difficult to see at the camera distances the real app uses.
 //!
 //! So this demo drops the render fiction and runs at *true* scale: 0.5 m
 //! airframes, a real 3 m ring, 2 m/s cruise, camera 35 m back. Nothing here is
@@ -44,7 +44,7 @@ use bevy::prelude::*;
 use crate::avoidance::{avoidance_velocity, Detection, SENSOR_RANGE_M};
 use crate::navigation::{navigate, DroneState, FlightLimits};
 
-/// A realistic small quad, not the main app's 180 m collision body. Metres.
+/// A realistic small quad, not the main app's 22.5 m collision body. Metres.
 const BODY_RADIUS: f32 = 0.5;
 /// Cruise speed, m/s. Well under the ~6.9 m/s closing rate the ring can arrest.
 const CRUISE_MPS: f32 = 2.0;
