@@ -46,11 +46,13 @@ pub struct Palette {
     pub ground: Color,   // green
     pub surface: Color,  // popup background (surface0)
     pub text: Color,     // text
-    pub accent: Color,   // blue — table header
+    pub subtext: Color,  // dimmed body text (subtext0)
+    pub accent: Color,   // blue — table header / highlights
     pub drone: Color,    // red
     pub drone_cone: Color, // sapphire
     pub base: Color,     // yellow
     pub grid: Color,     // overlay0
+    pub danger: Color,   // red — errors
     pub moon: Color,     // yellow
 }
 
@@ -62,11 +64,13 @@ impl Theme {
                 ground: Color::srgb_u8(0x45, 0x47, 0x5a), // surface1 — gray
                 surface: Color::srgb_u8(0x58, 0x5b, 0x70), // surface2 — popup, distinct
                 text: Color::srgb_u8(0xcd, 0xd6, 0xf4),
+                subtext: Color::srgb_u8(0xa6, 0xad, 0xc8),
                 accent: Color::srgb_u8(0x89, 0xb4, 0xfa),
                 drone: Color::srgb_u8(0xf3, 0x8b, 0xa8),
                 drone_cone: Color::srgb_u8(0x74, 0xc7, 0xec),
                 base: Color::srgb_u8(0xf9, 0xe2, 0xaf),
                 grid: Color::srgb_u8(0x6c, 0x70, 0x86),
+                danger: Color::srgb_u8(0xf3, 0x8b, 0xa8),
                 moon: Color::srgb_u8(0xf9, 0xe2, 0xaf),
             }
         } else {
@@ -75,11 +79,13 @@ impl Theme {
                 ground: Color::srgb_u8(0xbc, 0xc0, 0xcc), // surface1 — gray
                 surface: Color::srgb_u8(0xac, 0xb0, 0xbe), // surface2 — popup, distinct
                 text: Color::srgb_u8(0x4c, 0x4f, 0x69),
+                subtext: Color::srgb_u8(0x6c, 0x6f, 0x85),
                 accent: Color::srgb_u8(0x1e, 0x66, 0xf5),
                 drone: Color::srgb_u8(0xd2, 0x0f, 0x39),
                 drone_cone: Color::srgb_u8(0x20, 0x9f, 0xb5),
                 base: Color::srgb_u8(0xdf, 0x8e, 0x1d),
                 grid: Color::srgb_u8(0x9c, 0xa0, 0xb0),
+                danger: Color::srgb_u8(0xd2, 0x0f, 0x39),
                 moon: Color::srgb_u8(0xdf, 0x8e, 0x1d),
             }
         }
@@ -176,18 +182,34 @@ pub fn setup_moon(mut commands: Commands, theme: Res<Theme>) {
     spawn_moon(&mut commands, &theme);
 }
 
-/// Spawn the round moon button (top-right) with a crescent cut-out.
+/// Spawn the round day/night toggle (top-right): a small disc that reads as a
+/// crescent moon in dark mode and a rayed sun in light mode.
 pub fn spawn_moon(commands: &mut Commands, theme: &Theme) {
     let p = theme.palette();
+
+    // Compact geometry. The disc is the sun/moon body; a slightly offset disc of
+    // the background color carves the crescent; thin rays ring it for the sun.
+    const EDGE: f32 = 14.0; // margin from the top-right corner
+    const DISC: f32 = 18.0; // sun/moon body diameter
+    const CRESCENT: f32 = 15.0; // carving disc (dark mode)
+    const RAY_LEN: f32 = 4.0; // sun ray length
+    const RAY_W: f32 = 2.0; // sun ray thickness
+    const RAY_GAP: f32 = 2.5; // gap between disc edge and ray
+
+    // Rays live in a box centered on the disc; sized to fit disc + rays + gap.
+    let box_size = DISC + 2.0 * (RAY_GAP + RAY_LEN);
+    let disc_center_from_edge = EDGE + DISC / 2.0;
+    let box_offset = disc_center_from_edge - box_size / 2.0;
+
     commands
         .spawn((
             Button,
             Node {
                 position_type: PositionType::Absolute,
-                right: Val::Px(16.0),
-                top: Val::Px(16.0),
-                width: Val::Px(34.0),
-                height: Val::Px(34.0),
+                right: Val::Px(EDGE),
+                top: Val::Px(EDGE),
+                width: Val::Px(DISC),
+                height: Val::Px(DISC),
                 border_radius: BorderRadius::all(Val::Percent(50.0)),
                 overflow: Overflow::clip(),
                 ..default()
@@ -196,14 +218,14 @@ pub fn spawn_moon(commands: &mut Commands, theme: &Theme) {
             MoonButton,
         ))
         .with_children(|b| {
-            // Offset circle carves the crescent (matches bg in dark, moon in light).
+            // Offset disc carves the crescent (bg color in dark, hidden in light).
             b.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    right: Val::Px(-8.0),
-                    top: Val::Px(-4.0),
-                    width: Val::Px(30.0),
-                    height: Val::Px(30.0),
+                    right: Val::Px(-4.0),
+                    top: Val::Px(-2.5),
+                    width: Val::Px(CRESCENT),
+                    height: Val::Px(CRESCENT),
                     border_radius: BorderRadius::all(Val::Percent(50.0)),
                     ..default()
                 },
@@ -213,18 +235,18 @@ pub fn spawn_moon(commands: &mut Commands, theme: &Theme) {
             ));
         });
 
-    // Sun rays — a ring of dots around the disc, sibling so they aren't clipped.
-    // Button center sits 33px from the top/right edges; container is centered on it.
-    let ray = 25.0_f32;
-    let dot = 6.0_f32;
+    // Sun rays — short capsules around the disc, as a sibling so they aren't
+    // clipped by the disc's `overflow: clip`.
+    let center = box_size / 2.0;
+    let radius = DISC / 2.0 + RAY_GAP + RAY_LEN / 2.0;
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                right: Val::Px(3.0),
-                top: Val::Px(3.0),
-                width: Val::Px(60.0),
-                height: Val::Px(60.0),
+                right: Val::Px(box_offset),
+                top: Val::Px(box_offset),
+                width: Val::Px(box_size),
+                height: Val::Px(box_size),
                 ..default()
             },
             Pickable::IGNORE,
@@ -234,15 +256,15 @@ pub fn spawn_moon(commands: &mut Commands, theme: &Theme) {
         .with_children(|r| {
             for k in 0..8 {
                 let a = k as f32 * std::f32::consts::TAU / 8.0;
-                let cx = 30.0 + ray * a.cos() - dot / 2.0;
-                let cy = 30.0 + ray * a.sin() - dot / 2.0;
+                let cx = center + radius * a.cos();
+                let cy = center + radius * a.sin();
                 r.spawn((
                     Node {
                         position_type: PositionType::Absolute,
-                        left: Val::Px(cx),
-                        top: Val::Px(cy),
-                        width: Val::Px(dot),
-                        height: Val::Px(dot),
+                        left: Val::Px(cx - RAY_W / 2.0),
+                        top: Val::Px(cy - RAY_LEN / 2.0),
+                        width: Val::Px(RAY_W),
+                        height: Val::Px(RAY_LEN),
                         border_radius: BorderRadius::all(Val::Percent(50.0)),
                         ..default()
                     },

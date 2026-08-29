@@ -20,7 +20,7 @@ use bevy::prelude::*;
 use crate::antenna::angles_toward;
 use crate::base::Base;
 use crate::drone::Drone;
-use crate::networking::{Pairing, RingIndex};
+use crate::networking::{DroneUuid, MeshTable, Pairing, RingIndex};
 
 /// Where this drone currently believes a tracked peer *will be*, based
 /// purely on the last header that peer sent — never on omniscient ECS
@@ -47,15 +47,23 @@ pub struct TrackedPeers(pub HashMap<Entity, Vec3>);
 /// rather than this drone's live, omniscient ECS view of them — a real
 /// tracking antenna only knows where its target *reported* it would be, not
 /// where it actually is between updates. Before any header has ever arrived
-/// from a given neighbor (cold start), there's nothing to predict from, so
-/// aiming falls back to their actual position just to bootstrap the very
-/// first lock.
+/// directly from a given neighbor, fall back to that neighbor's last mesh
+/// table row (`base_pos + row.location`) — a relayed, comms-derived estimate,
+/// the same base-relative pattern `seeking::seek_one_slot` uses. Only if
+/// there is truly *no* information about them yet (never predicted, never
+/// relayed) is the antenna left at whatever angle it already had — a drone
+/// never reads a neighbor's true position directly.
+///
+/// The base itself is different: it's a fixed, known anchor every drone's own
+/// position is already expressed relative to (`self_pos - base_pos`), not
+/// something sensed from a peer, so aiming antenna #2 at `base_pos` directly
+/// is not an omniscience violation.
 ///
 /// This overrides the fixed 120°-apart layout `world::setup` used to compute
 /// the initial angles; those were only ever a starting point.
 pub fn maintain_mesh_antennas(
-    mut drones: Query<(&Transform, &mut Drone, &RingIndex, &TrackedPeers, &Pairing)>,
-    positions: Query<(Entity, &Transform, &RingIndex), With<Drone>>,
+    mut drones: Query<(&Transform, &mut Drone, &RingIndex, &TrackedPeers, &MeshTable, &Pairing)>,
+    positions: Query<(Entity, &RingIndex, &DroneUuid), With<Drone>>,
     bases: Query<&Base>,
 ) {
     let base_pos = bases.iter().next().map(|b| b.position);
@@ -63,12 +71,12 @@ pub fn maintain_mesh_antennas(
     // Ring neighbors, not "the other drone" — with N > 2 most pairs are
     // never mutually visible on purpose, so relayed (multi-hop) rows in the
     // mesh table actually get exercised.
-    let mut ring: Vec<(usize, Entity, Vec3)> =
-        positions.iter().map(|(e, t, ri)| (ri.0, e, t.translation)).collect();
+    let mut ring: Vec<(usize, Entity, String)> =
+        positions.iter().map(|(e, ri, uuid)| (ri.0, e, uuid.0.clone())).collect();
     ring.sort_by_key(|(i, ..)| *i);
     let n = ring.len();
 
-    for (self_transform, mut drone, self_ring, tracked, pairing) in &mut drones {
+    for (self_transform, mut drone, self_ring, tracked, table, pairing) in &mut drones {
         if n == 0 {
             continue;
         }
@@ -78,12 +86,15 @@ pub fn maintain_mesh_antennas(
             continue;
         }
         let self_pos = self_transform.translation;
-        let (_, next_entity, next_true_pos) = ring[(self_ring.0 + 1) % n];
-        let (_, prev_entity, prev_true_pos) = ring[(self_ring.0 + n - 1) % n];
-        // Lead the target using its self-reported prediction when we have
-        // one; otherwise fall back to ground truth to bootstrap the lock.
-        let next_pos = tracked.0.get(&next_entity).copied().unwrap_or(next_true_pos);
-        let prev_pos = tracked.0.get(&prev_entity).copied().unwrap_or(prev_true_pos);
+        let (_, next_entity, next_uuid) = &ring[(self_ring.0 + 1) % n];
+        let (_, prev_entity, prev_uuid) = &ring[(self_ring.0 + n - 1) % n];
+        // Predicted (from the peer's own last header) beats relayed mesh-table
+        // last-known-position, which beats "no info, don't move".
+        let mesh_pos = |uuid: &str| {
+            base_pos.zip(table.0.get(uuid)).map(|(base, row)| base + row.location)
+        };
+        let next_pos = tracked.0.get(next_entity).copied().or_else(|| mesh_pos(next_uuid));
+        let prev_pos = tracked.0.get(prev_entity).copied().or_else(|| mesh_pos(prev_uuid));
 
         // TODO: error correction via conical scan.
         //
@@ -102,7 +113,11 @@ pub fn maintain_mesh_antennas(
         // feedback using `Antenna::rssi_dbm`/`off_boresight_deg` sampled at
         // a few points around the current boresight each tick.
 
-        if let Some(first) = drone.antennas.get_mut(0) {
+        // TODO(future PR, re-enabling live aiming): `angles_toward` returns a
+        // world-frame bearing, but `Antenna::azimuth_deg` is now drone-relative
+        // (heading-relative). Subtract the drone's own heading before assigning,
+        // e.g. `az - kin.heading_deg` — elevation needs no such adjustment.
+        if let (Some(next_pos), Some(first)) = (next_pos, drone.antennas.get_mut(0)) {
             let (az, el) = angles_toward(self_pos, next_pos);
             first.azimuth_deg = az;
             first.elevation_deg = el;
@@ -112,7 +127,7 @@ pub fn maintain_mesh_antennas(
             second.azimuth_deg = az;
             second.elevation_deg = el;
         }
-        if let Some(third) = drone.antennas.get_mut(2) {
+        if let (Some(prev_pos), Some(third)) = (prev_pos, drone.antennas.get_mut(2)) {
             let (az, el) = angles_toward(self_pos, prev_pos);
             third.azimuth_deg = az;
             third.elevation_deg = el;
@@ -126,7 +141,7 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
 
     use crate::drone::{make_antenna, DroneType};
-    use crate::networking::NetworkingBundle;
+    use crate::networking::{DroneUuid, MeshRow, NetworkingBundle};
 
     /// Spawn a drone at `pos` in ring slot `ring`, with 3 zeroed antennas the
     /// aiming system will retarget. Uses the real `NetworkingBundle` (which
@@ -165,6 +180,22 @@ mod tests {
         world.get_mut::<TrackedPeers>(owner).unwrap().0.insert(peer, predicted);
     }
 
+    /// Give `owner`'s mesh table a relayed/last-known row for `peer`, as if
+    /// gossip (not a direct header) taught it that base-relative location.
+    fn set_mesh_row(world: &mut World, owner: Entity, peer: Entity, location: Vec3) {
+        let peer_uuid = world.get::<DroneUuid>(peer).unwrap().0.clone();
+        world.get_mut::<MeshTable>(owner).unwrap().0.insert(
+            peer_uuid.clone(),
+            MeshRow {
+                id: peer_uuid,
+                timestamp: 0.0,
+                location,
+                neighbour_distance: 1,
+                connections: vec![],
+            },
+        );
+    }
+
     /// With a tracked prediction present, antenna #1 aims at the *predicted*
     /// point — not the peer's true position.
     #[test]
@@ -193,10 +224,12 @@ mod tests {
         let a = spawn_drone(&mut world, Vec3::ZERO, 0);
         let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
 
-        // No prediction yet → aims at true B (+X, 90°).
+        // No prediction and no mesh-table row yet → truly no info, so the
+        // antenna is left exactly where it spawned (0.0), never at B's real
+        // position.
         world.run_system_once(maintain_mesh_antennas).unwrap();
-        let az_true = antenna0_az(&world, a);
-        assert!((az_true - 90.0).abs() < 0.5, "cold start aims at true pos, got {az_true}");
+        let az_cold = antenna0_az(&world, a);
+        assert_eq!(az_cold, 0.0, "no info yet must leave antenna untouched, got {az_cold}");
 
         // Prediction slides in +Z; azimuth should swing monotonically toward 45°.
         set_tracked(&mut world, a, b, Vec3::new(1.0, 0.0, 0.5));
@@ -207,10 +240,35 @@ mod tests {
         world.run_system_once(maintain_mesh_antennas).unwrap();
         let az_far = antenna0_az(&world, a);
 
+        // az_cold (0.0, untouched) isn't on this curve — only compare the two
+        // tracked-prediction samples, which should converge monotonically.
         assert!(
-            az_true > az_mid && az_mid > az_far,
-            "antenna should track the moving prediction: {az_true} > {az_mid} > {az_far}"
+            az_mid > az_far,
+            "antenna should track the moving prediction: {az_mid} -> {az_far}"
         );
         assert!((az_far - 45.0).abs() < 0.5, "final aim should reach ~45°, got {az_far}");
+    }
+
+    /// With no direct prediction but a relayed mesh-table row, antenna #1
+    /// aims at that row's base-relative location — comms-derived, never the
+    /// peer's true ECS `Transform`.
+    #[test]
+    fn falls_back_to_mesh_table_when_no_prediction() {
+        let mut world = World::new();
+        let base_pos = Vec3::new(0.0, 0.0, -5.0);
+        spawn_base(&mut world, base_pos);
+        let a = spawn_drone(&mut world, Vec3::ZERO, 0);
+        // B's true position (+X, 5 south) bears ~90°; deliberately different
+        // from the mesh-table row below so the test can't pass by accident.
+        let b = spawn_drone(&mut world, Vec3::new(1.0, 0.0, 0.0), 1);
+
+        // Mesh-table row says B is at base_pos + (0, 0, 8) = (0, 0, 3), i.e.
+        // due north of A (bearing 0°) — deliberately not 90°.
+        set_mesh_row(&mut world, a, b, Vec3::new(0.0, 0.0, 8.0));
+        world.run_system_once(maintain_mesh_antennas).unwrap();
+
+        let az = antenna0_az(&world, a);
+        assert!((az - 0.0).abs() < 0.5, "expected ~0° (mesh-table row), got {az}");
+        assert!((az - 90.0).abs() > 10.0, "must not aim at B's true position (90°)");
     }
 }

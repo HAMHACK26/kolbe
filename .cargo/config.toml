@@ -1,0 +1,11 @@
+# Faster link step on Apple Silicon: use the LLVM linker (brew install lld).
+# Linking dominates incremental rebuild time; lld is much faster than the
+# default ld64.
+[target.aarch64-apple-darwin]
+# `-A linker_messages` silences ld64.lld's benign "object version newer than
+# target minimum" warnings for prebuilt asm in ring/blake3. The default Apple
+# linker doesn't emit them; lld does. Binary links and runs correctly either way.
+rustflags = [
+    "-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld",
+    "-A", "linker_messages",
+]

@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 
-use bevy::{color::palettes::css, prelude::*};
+use bevy::prelude::*;
 
 use crate::{
     antenna::Antenna,
@@ -84,7 +84,11 @@ pub fn spawn_base(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
+    theme: Res<crate::theme::Theme>,
 ) {
+    // Initial colors from the palette; `apply_theme` re-syncs on toggle
+    // (these entities carry ThemeRole markers).
+    let pal = theme.palette();
     let z = -WORLD_SIZE / 2.0 + 1.0;
     let pos = Vec3::new(0.0, terrain.height_at(0.0, z) + DRONE_RADIUS, z); // south edge
 
@@ -97,7 +101,7 @@ pub fn spawn_base(
         // Visual: yellow box
         Mesh3d(meshes.add(Cuboid::new(0.3, 0.3, 0.3))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::from(css::YELLOW),
+            base_color: pal.base,
             emissive: LinearRgba::new(1.5, 1.5, 0.0, 1.0),
             ..default()
         })),
@@ -122,7 +126,7 @@ pub fn spawn_base(
 
     // Radar cones — hidden until the base is selected (keyed by base entity).
     let cone_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 0.9, 0.0, 0.20),
+        base_color: pal.base.with_alpha(0.20),
         emissive: LinearRgba::new(0.6, 0.5, 0.0, 0.0),
         alpha_mode: AlphaMode::Blend,
         double_sided: true,
@@ -133,7 +137,8 @@ pub fn spawn_base(
         commands.spawn((
             Mesh3d(cone_mesh_for(antenna, &mut meshes)),
             MeshMaterial3d(cone_mat.clone()),
-            cone_transform_for(antenna, pos),
+            // Bases have no heading — 0.0 leaves azimuth effectively world-frame.
+            cone_transform_for(antenna, 0.0, pos),
             Visibility::Hidden,
             RadarCone { drone_entity: base_entity },
             ThemeRole::BaseCone,
@@ -145,16 +150,17 @@ pub fn spawn_base(
 
 /// Compute RSSI from base to every drone; populate `BaseNetworkState::reachable_drones`.
 ///
-/// Use `Antenna::off_boresight_deg(base_pos, drone_pos)` for θ_tx,
-/// then `antenna.rssi_dbm(θ_tx, 0.0, d)` (θ_rx = 0 until drones expose
-/// their own antenna direction to the base).
+/// Use `Antenna::off_boresight_deg(0.0, base_pos, drone_pos)` for θ_tx — 0.0
+/// because a base has no heading, so its antennas' azimuth is already
+/// world-frame — then `antenna.rssi_dbm(θ_tx, 0.0, d)` (θ_rx = 0 until drones
+/// expose their own antenna direction to the base).
 pub fn update_base_comms(
     mut bases: Query<(&Base, &mut BaseNetworkState)>,
     drones: Query<(Entity, &GlobalTransform), With<Drone>>,
 ) {
     todo!(
         "For each (base, antenna) × drone: \
-         θ = antenna.off_boresight_deg(base.position, drone_pos), \
+         θ = antenna.off_boresight_deg(0.0, base.position, drone_pos), \
          d = (drone_pos - base.position).length(), \
          rssi = antenna.rssi_dbm(θ, 0.0, d); \
          collect entities where rssi >= antenna.sensitivity_dbm \

@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology},
@@ -14,7 +16,11 @@ use crate::{
     theme::ThemeRole,
 };
 
-const DEFAULT_VERTICAL_EXAGGERATION: f32 = 5.0;
+mod source;
+
+use source::{Progress, ProgressHandle};
+
+const DEFAULT_VERTICAL_EXAGGERATION: f32 = 1.0;
 const CONTOUR_INTERVAL_KM: f32 = 0.020;
 const CONTOUR_SURFACE_OFFSET: f32 = 0.008;
 
@@ -26,60 +32,10 @@ fn parse_vertical_exaggeration(value: Option<&str>) -> f32 {
         .clamp(1.0, 20.0)
 }
 
-#[derive(Resource)]
-pub struct LocalHeightServer(std::process::Child);
-
-impl Drop for LocalHeightServer {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Start the bundled Python service. Set `HEIGHT_SERVER_URL` to use an
-/// externally managed service instead, or `KOLBE_PYTHON` to select Python.
-pub fn start_local_server(mut commands: Commands) {
-    if std::env::var_os("HEIGHT_SERVER_URL").is_some() {
-        return;
-    }
-
-    let server_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("height_server");
-    let mut candidates = Vec::new();
-    if let Some(python) = std::env::var_os("KOLBE_PYTHON") {
-        candidates.push(std::path::PathBuf::from(python));
-    }
-    #[cfg(windows)]
-    candidates.push(server_dir.join(".venv").join("Scripts").join("python.exe"));
-    #[cfg(not(windows))]
-    candidates.push(server_dir.join(".venv").join("bin").join("python"));
-    candidates.push(std::path::PathBuf::from("python3"));
-    candidates.push(std::path::PathBuf::from("python"));
-
-    for python in candidates {
-        match std::process::Command::new(&python)
-            .arg("height.py")
-            .current_dir(&server_dir)
-            .env("RADIUS_KM", "10")
-            .env("OUTPUT_SIZE", "129")
-            .spawn()
-        {
-            Ok(child) => {
-                info!("Started height server with {}", python.display());
-                commands.insert_resource(LocalHeightServer(child));
-                return;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                warn!(
-                    "Could not start height server with {}: {error}",
-                    python.display()
-                );
-            }
-        }
-    }
-
-    error!("No Python executable found. Create height_server/.venv or set KOLBE_PYTHON.");
-}
+/// Shared, live progress for the in-process terrain fetch. The fetch task
+/// updates it; [`update_progress`] reads it to drive the loading bar.
+#[derive(Resource, Clone)]
+pub struct TerrainProgress(ProgressHandle);
 
 #[derive(Resource)]
 pub struct TerrainHeightMap {
@@ -114,9 +70,6 @@ impl TerrainHeightMap {
 pub struct HeightLoadTask(Task<Result<TerrainHeightMap, String>>);
 
 #[derive(Resource)]
-pub struct ProgressPollTask(Task<Option<String>>);
-
-#[derive(Resource)]
 pub struct TerrainLoadError(pub String);
 
 #[derive(Component)]
@@ -128,12 +81,19 @@ pub(crate) struct LoadingStatus;
 #[derive(Component)]
 pub(crate) struct LoadingBarFill;
 
-pub fn start_loading(mut commands: Commands, area: Res<ScenarioArea>) {
+pub fn start_loading(
+    mut commands: Commands,
+    area: Res<ScenarioArea>,
+    theme: Res<crate::theme::Theme>,
+) {
+    let p = theme.palette();
     let request_area = area.clone();
-    let server =
-        std::env::var("HEIGHT_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_owned());
-    let task = IoTaskPool::get().spawn(async move { fetch_height_map(&server, &request_area) });
+    let progress: ProgressHandle = Arc::new(Mutex::new(Progress::default()));
+    let task_progress = progress.clone();
+    let task = IoTaskPool::get()
+        .spawn(async move { fetch_height_map(&request_area, &task_progress) });
     commands.insert_resource(HeightLoadTask(task));
+    commands.insert_resource(TerrainProgress(progress));
 
     commands
         .spawn((
@@ -146,7 +106,7 @@ pub fn start_loading(mut commands: Commands, area: Res<ScenarioArea>) {
                 row_gap: Val::Px(16.0),
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.07, 0.09, 0.13)),
+            BackgroundColor(p.bg),
             LoadingRoot,
         ))
         .with_children(|root| {
@@ -156,7 +116,7 @@ pub fn start_loading(mut commands: Commands, area: Res<ScenarioArea>) {
                     font_size: FontSize::Px(30.0),
                     ..default()
                 },
-                TextColor(Color::WHITE),
+                TextColor(p.text),
             ));
             root.spawn((
                 Text::new("Querying Lantmateriet and building the height map..."),
@@ -164,7 +124,7 @@ pub fn start_loading(mut commands: Commands, area: Res<ScenarioArea>) {
                     font_size: FontSize::Px(17.0),
                     ..default()
                 },
-                TextColor(Color::srgb(0.55, 0.75, 0.9)),
+                TextColor(p.subtext),
                 LoadingStatus,
             ));
             root.spawn((
@@ -175,7 +135,7 @@ pub fn start_loading(mut commands: Commands, area: Res<ScenarioArea>) {
                     padding: UiRect::all(Val::Px(2.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgb(0.15, 0.18, 0.23)),
+                BackgroundColor(p.surface),
             ))
             .with_child((
                 Node {
@@ -184,90 +144,44 @@ pub fn start_loading(mut commands: Commands, area: Res<ScenarioArea>) {
                     border_radius: BorderRadius::all(Val::Px(7.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgb(0.2, 0.65, 0.95)),
+                BackgroundColor(p.accent),
                 LoadingBarFill,
             ));
         });
 }
 
 pub fn update_progress(
-    mut commands: Commands,
-    time: Res<Time>,
-    mut elapsed: Local<f32>,
-    poll_task: Option<ResMut<ProgressPollTask>>,
+    progress: Option<Res<TerrainProgress>>,
     mut status: Query<&mut Text, With<LoadingStatus>>,
     mut bars: Query<&mut Node, With<LoadingBarFill>>,
 ) {
-    if let Some(mut poll_task) = poll_task {
-        let Some(body) = future::block_on(future::poll_once(&mut poll_task.0)) else {
-            return;
-        };
-        commands.remove_resource::<ProgressPollTask>();
-        if let Some(body) = body {
-            apply_progress(&body, &mut status, &mut bars);
-        }
+    let Some(progress) = progress else {
         return;
-    }
-
-    *elapsed += time.delta_secs();
-    if *elapsed < 0.25 {
-        return;
-    }
-    *elapsed = 0.0;
-
-    let server =
-        std::env::var("HEIGHT_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_owned());
-    let task = IoTaskPool::get().spawn(async move {
-        reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_millis(500))
-            .build()
-            .and_then(|client| {
-                client
-                    .get(format!("{}/progress", server.trim_end_matches('/')))
-                    .send()
-            })
-            .and_then(|response| response.error_for_status())
-            .and_then(|response| response.text())
-            .ok()
-    });
-    commands.insert_resource(ProgressPollTask(task));
-}
-
-fn apply_progress(
-    body: &str,
-    status: &mut Query<&mut Text, With<LoadingStatus>>,
-    bars: &mut Query<&mut Node, With<LoadingBarFill>>,
-) {
-    let value = |key: &str| {
-        body.lines()
-            .find_map(|line| line.strip_prefix(&format!("{key}=")))
-            .unwrap_or("")
     };
-    let phase = value("phase");
-    let done = value("done").parse::<usize>().unwrap_or(0);
-    let total = value("total").parse::<usize>().unwrap_or(0);
-    let current = value("current");
-    let percent = if total > 0 {
-        done as f32 / total as f32 * 100.0
+    let Some(snapshot) = progress.0.lock().ok().map(|p| p.clone()) else {
+        return;
+    };
+
+    let percent = if snapshot.total > 0 {
+        snapshot.done as f32 / snapshot.total as f32 * 100.0
     } else {
         2.0
     };
-
     if let Ok(mut bar) = bars.single_mut() {
         bar.width = Val::Percent(percent.clamp(2.0, 100.0));
     }
     if let Ok(mut text) = status.single_mut() {
-        let count = if total > 0 {
-            format!(" ({done}/{total})")
+        let count = if snapshot.total > 0 {
+            format!(" ({}/{})", snapshot.done, snapshot.total)
         } else {
             String::new()
         };
-        let file = if current.is_empty() {
+        let file = if snapshot.current.is_empty() {
             String::new()
         } else {
-            format!("\n{current}")
+            format!("\n{}", snapshot.current)
         };
-        **text = format!("{phase}{count}{file}");
+        **text = format!("{}{count}{file}", snapshot.phase);
     }
 }
 
@@ -289,7 +203,7 @@ pub fn poll_loading(
         Err(message) => {
             if let Ok(mut text) = status.single_mut() {
                 **text = format!(
-                    "Could not load terrain:\n{message}\n\nStart height_server/height.py and restart Kolbe to try again."
+                    "Could not load terrain:\n{message}\n\nCheck your .env credentials and network, then restart Kolbe."
                 );
             }
             commands.remove_resource::<HeightLoadTask>();
@@ -300,7 +214,7 @@ pub fn poll_loading(
 }
 
 pub fn cleanup_loading(mut commands: Commands, roots: Query<Entity, With<LoadingRoot>>) {
-    commands.remove_resource::<ProgressPollTask>();
+    commands.remove_resource::<TerrainProgress>();
     for entity in &roots {
         commands.entity(entity).despawn();
     }
@@ -309,14 +223,16 @@ pub fn cleanup_loading(mut commands: Commands, roots: Query<Entity, With<Loading
 pub fn spawn_mesh(
     mut commands: Commands,
     height_map: Res<TerrainHeightMap>,
+    theme: Res<crate::theme::Theme>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    // Placeholder color from the palette; `apply_theme` re-syncs via ThemeRole.
     commands
         .spawn((
             Mesh3d(meshes.add(mesh_from_height_map(&height_map))),
             MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.18, 0.38, 0.20),
+                base_color: theme.palette().ground,
                 perceptual_roughness: 1.0,
                 ..default()
             })),
@@ -408,103 +324,36 @@ fn contour_crossings(
     crossings
 }
 
-fn fetch_height_map(server: &str, area: &ScenarioArea) -> Result<TerrainHeightMap, String> {
-    let url = format!(
-        "{}/fetch?lat={}&lon={}",
-        server.trim_end_matches('/'),
-        area.latitude,
-        area.longitude
-    );
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let mut attempts = 0;
-    let response = loop {
-        match client.get(&url).send() {
-            Ok(response) => break response,
-            Err(error) => {
-                attempts += 1;
-                if error.is_connect() && attempts < 40 {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                } else {
-                    return Err(format!("Height server is unavailable: {error}"));
-                }
-            }
-        }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        let message = response.text().unwrap_or_default();
-        return Err(format!("Height server returned {status}: {message}"));
+/// Fetch terrain in-process and adapt it to the mesh/sampling grid. Runs on a
+/// background task; reports live status through `progress`.
+fn fetch_height_map(
+    area: &ScenarioArea,
+    progress: &ProgressHandle,
+) -> Result<TerrainHeightMap, String> {
+    let grid = source::fetch_terrain(area.latitude, area.longitude, progress)?;
+    let size = grid.size;
+    if size < 2 {
+        return Err(format!("terrain grid too small: {size}x{size}"));
     }
-    let width = header_usize(&response, "X-Width")?;
-    let height = header_usize(&response, "X-Height")?;
-    if width != height || width < 2 {
-        return Err(format!(
-            "Expected a square height grid, received {width}x{height}"
-        ));
-    }
-    let bytes = response.bytes().map_err(|error| error.to_string())?;
-    if bytes.len() != width * height * 2 {
-        return Err(format!(
-            "Expected {} height bytes, received {}",
-            width * height * 2,
-            bytes.len()
-        ));
-    }
-    let mut heights_km = Vec::with_capacity(width * height);
-    // Raster row zero is north. Flip rows so positive Bevy Z points north.
-    for z in 0..height {
-        let source_row = height - 1 - z;
-        for x in 0..width {
-            let index = (source_row * width + x) * 2;
-            let bits = u16::from_le_bytes([bytes[index], bytes[index + 1]]);
-            heights_km.push(f16_to_f32(bits) / 1000.0);
+
+    // The engine grid has row 0 at the north edge. Flip rows so positive Bevy Z
+    // points north, and convert metres to kilometres.
+    let mut heights_km = Vec::with_capacity(size * size);
+    for z in 0..size {
+        let source_row = size - 1 - z;
+        for x in 0..size {
+            heights_km.push(grid.heights_m[source_row * size + x] / 1000.0);
         }
     }
+
     Ok(TerrainHeightMap {
         heights_km,
-        resolution: width,
+        resolution: size,
         size_km: area.size_km,
         vertical_exaggeration: parse_vertical_exaggeration(
-            std::env::var("TERRAIN_VERTICAL_EXAGGERATION")
-                .ok()
-                .as_deref(),
+            std::env::var("TERRAIN_VERTICAL_EXAGGERATION").ok().as_deref(),
         ),
     })
-}
-
-fn header_usize(response: &reqwest::blocking::Response, name: &str) -> Result<usize, String> {
-    response
-        .headers()
-        .get(name)
-        .ok_or_else(|| format!("Height server omitted {name}"))?
-        .to_str()
-        .map_err(|_| format!("Height server returned invalid {name}"))?
-        .parse()
-        .map_err(|_| format!("Height server returned invalid {name}"))
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exponent = (bits >> 10) & 0x1f;
-    let fraction = bits & 0x03ff;
-    let value = match exponent {
-        0 if fraction == 0 => sign,
-        0 => {
-            let mut fraction = fraction as u32;
-            let mut shift = 0u32;
-            while fraction & 0x0400 == 0 {
-                fraction <<= 1;
-                shift += 1;
-            }
-            sign | ((113 - shift) << 23) | ((fraction & 0x03ff) << 13)
-        }
-        31 => sign | 0x7f80_0000 | ((fraction as u32) << 13),
-        _ => sign | (((exponent as u32) + 112) << 23) | ((fraction as u32) << 13),
-    };
-    f32::from_bits(value)
 }
 
 fn mesh_from_height_map(map: &TerrainHeightMap) -> Mesh {
@@ -557,13 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn decodes_common_float16_values() {
-        assert_eq!(f16_to_f32(0x0000), 0.0);
-        assert_eq!(f16_to_f32(0x3c00), 1.0);
-        assert_eq!(f16_to_f32(0xc000), -2.0);
-    }
-
-    #[test]
     fn samples_height_map_corners_with_vertical_exaggeration() {
         let map = TerrainHeightMap {
             heights_km: vec![0.01, 0.02, 0.03, 0.04],
@@ -605,11 +447,11 @@ mod tests {
 
     #[test]
     fn validates_vertical_exaggeration_setting() {
-        assert_eq!(parse_vertical_exaggeration(None), 5.0);
+        assert_eq!(parse_vertical_exaggeration(None), 1.0);
         assert_eq!(parse_vertical_exaggeration(Some("8")), 8.0);
         assert_eq!(parse_vertical_exaggeration(Some("0")), 1.0);
         assert_eq!(parse_vertical_exaggeration(Some("50")), 20.0);
-        assert_eq!(parse_vertical_exaggeration(Some("invalid")), 5.0);
+        assert_eq!(parse_vertical_exaggeration(Some("invalid")), 1.0);
     }
 
     #[test]

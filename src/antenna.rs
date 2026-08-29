@@ -6,7 +6,12 @@ use bevy::prelude::*;
 /// callers can compose them independently. Never pre-fuse angle and range.
 #[derive(Clone)]
 pub struct Antenna {
+    /// Yaw relative to the owning drone's own heading (0 = drone's forward,
+    /// clockwise) — a drone's antennas turn with it. Bases have no heading, so
+    /// their antennas' azimuth is effectively already world-frame.
     pub azimuth_deg: f32,
+    /// Pitch above the horizon, world-frame. Every antenna shares the same
+    /// "up" (gravity), so unlike azimuth this needs no drone-relative frame.
     pub elevation_deg: f32,
 
     // Gain pattern — 3GPP TR 38.901 parabolic-in-dB
@@ -68,10 +73,18 @@ impl Antenna {
         (lo + hi) / 2.0
     }
 
+    /// World-frame azimuth: `azimuth_deg` (drone-relative) plus the owning
+    /// drone's heading. Pass `0.0` for a base, which has no heading.
+    pub fn world_azimuth_deg(&self, heading_deg: f32) -> f32 {
+        (self.azimuth_deg + heading_deg).rem_euclid(360.0)
+    }
+
     /// θ = acos(boresight · normalize(peer − self)).
+    /// `heading_deg` is the owning drone's heading (0.0 for a base), needed to
+    /// turn this antenna's drone-relative azimuth into a world direction.
     /// One dot-product, one acos.
-    pub fn off_boresight_deg(&self, self_pos: Vec3, peer_pos: Vec3) -> f32 {
-        let boresight = radar_direction(self.azimuth_deg, self.elevation_deg);
+    pub fn off_boresight_deg(&self, heading_deg: f32, self_pos: Vec3, peer_pos: Vec3) -> f32 {
+        let boresight = radar_direction(self.world_azimuth_deg(heading_deg), self.elevation_deg);
         let to_peer = (peer_pos - self_pos).normalize_or_zero();
         boresight.dot(to_peer).clamp(-1.0, 1.0).acos().to_degrees()
     }
@@ -122,8 +135,8 @@ mod tests {
     #[test]
     fn off_boresight_zero_when_aimed_at_target() {
         let a = make_antenna(90.0, 0.0, 0); // points +X
-        assert!(a.off_boresight_deg(Vec3::ZERO, Vec3::new(5.0, 0.0, 0.0)) < 0.01);
-        assert!((a.off_boresight_deg(Vec3::ZERO, Vec3::new(-5.0, 0.0, 0.0)) - 180.0).abs() < 0.01);
+        assert!(a.off_boresight_deg(0.0, Vec3::ZERO, Vec3::new(5.0, 0.0, 0.0)) < 0.01);
+        assert!((a.off_boresight_deg(0.0, Vec3::ZERO, Vec3::new(-5.0, 0.0, 0.0)) - 180.0).abs() < 0.01);
     }
 
     /// `max_range_km` is exactly where a boresight link's RSSI meets

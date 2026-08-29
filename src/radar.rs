@@ -28,9 +28,11 @@ pub fn cone_mesh_for(antenna: &Antenna, meshes: &mut Assets<Mesh>) -> Handle<Mes
 }
 
 /// Place cone tip at drone_pos, base extending along the antenna boresight.
+/// `heading_deg` is the owner's heading (0.0 for a base) — antenna.azimuth_deg
+/// is drone-relative, so it must be turned into a world direction here.
 /// ConeAnchor::Tip puts origin at tip; -Y extends to base, so rotate -Y → dir.
-pub fn cone_transform_for(antenna: &Antenna, drone_pos: Vec3) -> Transform {
-    let dir = radar_direction(antenna.azimuth_deg, antenna.elevation_deg);
+pub fn cone_transform_for(antenna: &Antenna, heading_deg: f32, drone_pos: Vec3) -> Transform {
+    let dir = radar_direction(antenna.world_azimuth_deg(heading_deg), antenna.elevation_deg);
     Transform {
         translation: drone_pos,
         rotation: Quat::from_rotation_arc(Vec3::NEG_Y, dir),

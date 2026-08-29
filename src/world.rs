@@ -1,4 +1,4 @@
-use bevy::{color::palettes::css, picking::prelude::*, prelude::*};
+use bevy::{picking::prelude::*, prelude::*};
 
 use crate::{
     base::CommandQueue,
@@ -25,7 +25,9 @@ pub fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
+    theme: Res<Theme>,
 ) {
+    let pal = theme.palette();
     commands.spawn((Camera3d::default(), Transform::default()));
 
     commands.spawn(AmbientLight { brightness: 300.0, ..default() });
@@ -41,13 +43,15 @@ pub fn setup(
     ];
 
     let drone_mesh = meshes.add(Sphere::new(DRONE_RADIUS));
+    // Initial colors come from the palette; `apply_theme` keeps them in sync on
+    // theme toggles (these entities carry ThemeRole markers).
     let drone_mat = materials.add(StandardMaterial {
-        base_color: Color::from(css::RED),
+        base_color: pal.drone,
         emissive: LinearRgba::new(2.0, 0.0, 0.0, 1.0),
         ..default()
     });
     let cone_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.0, 0.9, 1.0, 0.30),
+        base_color: pal.drone_cone.with_alpha(0.30),
         emissive: LinearRgba::new(0.0, 0.4, 0.8, 0.0),
         alpha_mode: AlphaMode::Blend,
         double_sided: true,
@@ -106,7 +110,10 @@ pub fn setup(
             commands.spawn((
                 Mesh3d(cone_mesh_for(antenna, &mut meshes)),
                 MeshMaterial3d(cone_mat.clone()),
-                cone_transform_for(antenna, drone_pos),
+                // heading 0.0 matches the DroneKinematics::default() this
+                // drone spawns with; apply_velocity updates heading as it
+                // moves, but nothing currently re-syncs the cone transform.
+                cone_transform_for(antenna, 0.0, drone_pos),
                 Visibility::Hidden,
                 RadarCone { drone_entity },
                 ThemeRole::DroneCone,
@@ -127,7 +134,7 @@ pub fn setup(
                 row_gap: Val::Px(2.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.05, 0.05, 0.05, 0.88)),
+            BackgroundColor(pal.surface.with_alpha(0.88)),
             Visibility::Hidden,
             InfoPopup,
         ))
@@ -135,7 +142,7 @@ pub fn setup(
             p.spawn((
                 Text::new(""),
                 TextFont { font_size: FontSize::Px(13.0), ..default() },
-                TextColor(Color::WHITE),
+                TextColor(pal.text),
                 InfoPopupTitle,
             ));
             p.spawn((
@@ -158,7 +165,7 @@ pub fn setup(
                     align_self: AlignSelf::FlexStart,
                     ..default()
                 },
-                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.12)),
+                BackgroundColor(pal.text.with_alpha(0.12)),
                 NetworkTableButton,
             ))
             .observe(
@@ -171,7 +178,7 @@ pub fn setup(
                 b.spawn((
                     Text::new("View Network Table"),
                     TextFont { font_size: FontSize::Px(11.0), ..default() },
-                    TextColor(Color::WHITE),
+                    TextColor(pal.text),
                 ));
             });
         });
@@ -192,7 +199,7 @@ pub fn setup(
                 max_width: Val::Px(280.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.05, 0.05, 0.05, 0.88)),
+            BackgroundColor(pal.surface.with_alpha(0.88)),
             Visibility::Hidden,
             NetworkTablePopup,
         ))
@@ -200,12 +207,12 @@ pub fn setup(
             p.spawn((
                 Text::new("Network Table"),
                 TextFont { font_size: FontSize::Px(13.0), ..default() },
-                TextColor(Color::WHITE),
+                TextColor(pal.text),
             ));
             p.spawn((
                 Text::new(""),
                 TextFont { font_size: FontSize::Px(11.0), ..default() },
-                TextColor(Color::srgb(0.7, 0.9, 1.0)),
+                TextColor(pal.subtext),
                 NetworkTablePanelText,
             ));
         });

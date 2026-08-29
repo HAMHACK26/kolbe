@@ -350,6 +350,9 @@ fn seek_one_slot(args: SeekSlotArgs) {
     let (delta_az, delta_el) =
         spiral_offset_deg(*elapsed, omega_rad_s, half_cone_deg, SPIRAL_TURNS_PER_SWEEP);
 
+    // TODO(future PR, re-enabling live aiming): `angles_toward` is a world-frame
+    // bearing, but `Antenna::azimuth_deg` is now drone-relative (heading-relative).
+    // Subtract the drone's own heading, e.g. `center_az - kin.heading_deg`.
     let (center_az, center_el) = angles_toward(self_pos, target_pos);
     if let Some(antenna) = drone.antennas.get_mut(antenna_idx) {
         antenna.azimuth_deg = (center_az + delta_az).rem_euclid(360.0);

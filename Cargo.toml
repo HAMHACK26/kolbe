@@ -5,15 +5,30 @@ edition = "2024"
 
 [dependencies]
 bevy = "0.19.0"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 pyo3 = { version = "0.22", optional = true, features = ["auto-initialize"] }
+serde_json = "1.0.151"
+flate2 = "1.1.10"
+proj4rs = "0.1.10"
+dotenvy = "0.15.7"
 
 [features]
 # Enable to implement drone logic in Python:
 #   cargo run --features python
 python = ["dep:pyo3"]
 
+# Faster iterative dev builds: links Bevy as a shared library so each rebuild
+# skips relinking the engine. Dev only — never enable for release/distribution.
+#   cargo run --features fast-dev
+fast-dev = ["bevy/dynamic_linking"]
+
 # Thin debuginfo: faster compile + link while keeping backtraces with line
 # numbers. Full DWARF debuginfo isn't worth its build/link cost here.
 [profile.dev]
 debug = "line-tables-only"
+
+# Compile dependencies (Bevy et al.) with optimizations — built once, then
+# cached — while your own crate stays at opt-level 0 for fast rebuilds. Big win
+# for runtime startup and physics/render throughput in dev.
+[profile.dev.package."*"]
+opt-level = 3

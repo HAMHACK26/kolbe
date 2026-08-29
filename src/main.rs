@@ -46,12 +46,14 @@ fn main() {
         .insert_resource(SelectedDrone(None))
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
-        .insert_resource(ClearColor(Color::BLACK))
+        // Seed the clear color from the palette so frame 0 matches; apply_theme
+        // keeps it in sync afterwards.
+        .insert_resource(ClearColor(Theme::default().palette().bg))
         .init_resource::<networking::Mailbox>()
         .init_resource::<networking::ReconnectBus>()
         .init_resource::<networking::ReconnectRequests>()
         .init_resource::<ui::NetworkTablePanelOpen>()
-        .add_systems(Startup, (terrain::start_local_server, ui::setup_camera, theme::setup_moon))
+        .add_systems(Startup, (ui::setup_camera, theme::setup_moon))
         .add_systems(OnEnter(AppState::AreaSelection), area::setup)
         .add_systems(Update, area::interactions.run_if(in_state(AppState::AreaSelection)))
         .add_systems(OnExit(AppState::AreaSelection), area::cleanup)
@@ -90,8 +92,10 @@ fn main() {
                 // Priority reconnection flood first, so a fresh slew-freeze is
                 // visible to the aiming systems this same frame.
                 networking::process_reconnect,
-                tracking::maintain_mesh_antennas,
-                seeking::seek_lost_links,
+                // Antenna aiming (tracking::maintain_mesh_antennas,
+                // seeking::seek_lost_links) is disabled for now — antennas and
+                // radar cones stay at their spawn angles. Wiring live aiming
+                // back in is a future PR.
                 networking::detect_links_and_send_headers,
                 networking::route_packets,
                 // Partition detection + recovery run last — they need the
