@@ -113,15 +113,17 @@ impl FetchConfig {
             output_size: std::env::var("OUTPUT_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
+                .filter(|&size: &usize| (2..=1025).contains(&size))
                 .unwrap_or(129),
             timeout_secs: std::env::var("DEFAULT_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
+                .filter(|&seconds: &u64| (10..=300).contains(&seconds))
                 .unwrap_or(120),
             download_workers: std::env::var("DOWNLOAD_WORKERS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .filter(|&w| w >= 1)
+                .filter(|&w| (1..=16).contains(&w))
                 .unwrap_or(8),
         })
     }
@@ -248,7 +250,15 @@ fn http_range(
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err("server ignored Range request".to_string());
     }
-    Ok(response.bytes().map_err(|e| e.to_string())?.to_vec())
+    let bytes = response.bytes().map_err(|e| e.to_string())?.to_vec();
+    let requested = end
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| "invalid byte range".to_string())?;
+    if bytes.len() as u64 != requested {
+        return Err(format!("short range response: expected {requested} bytes, got {}", bytes.len()));
+    }
+    Ok(bytes)
 }
 
 // ─── Raw TIFF reader ────────────────────────────────────────────────────────
@@ -722,9 +732,16 @@ fn fetch_cog(
     let gt = [gt0[0], gt0[1] * ratio_x, 0.0, gt0[3], 0.0, gt0[5] * ratio_y];
 
     let (w, h, tw, th) = (ifd.width, ifd.height, ifd.tile_w, ifd.tile_h);
+    // Metadata is supplied by the remote server. Reject unreasonable values
+    // before they can overflow or allocate a giant pixel buffer.
+    const MAX_COG_PIXELS: usize = 64 * 1024 * 1024;
+    let pixel_count = w
+        .checked_mul(h)
+        .filter(|&count| count <= MAX_COG_PIXELS)
+        .ok_or_else(|| "COG dimensions are unreasonable".to_string())?;
     let n_tiles_x = w.div_ceil(tw);
     let n_tiles_y = h.div_ceil(th);
-    let mut pixels = vec![0.0f32; w * h];
+    let mut pixels = vec![0.0f32; pixel_count];
     for ty in 0..n_tiles_y {
         for tx in 0..n_tiles_x {
             let idx = ty * n_tiles_x + tx;
@@ -736,8 +753,11 @@ fn fetch_cog(
             if byte_count == 0 {
                 continue;
             }
-            let compressed =
-                http_range(client, token, url, offset as u64, offset as u64 + byte_count as u64 - 1)?;
+            let end = (offset as u64)
+                .checked_add(byte_count as u64)
+                .and_then(|end| end.checked_sub(1))
+                .ok_or_else(|| "invalid COG tile range".to_string())?;
+            let compressed = http_range(client, token, url, offset as u64, end)?;
             let mut raw = decompress(&compressed, ifd.compression)?;
             apply_predictor(&mut raw, tw, ifd.bits, ifd.predictor, le);
             let tile_px = raw_to_f32(&raw, ifd.bits, ifd.sample_format, le);

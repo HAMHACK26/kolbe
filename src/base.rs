@@ -183,17 +183,34 @@ pub fn spawn_base(
 /// world-frame — then `antenna.rssi_dbm(θ_tx, 0.0, d)` (θ_rx = 0 until drones
 /// expose their own antenna direction to the base).
 pub fn update_base_comms(
-    _bases: Query<(&Base, &mut BaseNetworkState)>,
-    _drones: Query<(Entity, &GlobalTransform), With<Drone>>,
+    mut bases: Query<(&Base, &mut BaseNetworkState)>,
+    drones: Query<(Entity, &GlobalTransform, &Drone)>,
 ) {
-    todo!(
-        "For each (base, antenna) × drone: \
-         θ = antenna.off_boresight_deg(0.0, base.position, drone_pos), \
-         d = (drone_pos - base.position).length(), \
-         rssi = antenna.rssi_dbm(θ, 0.0, d); \
-         collect entities where rssi >= antenna.sensitivity_dbm \
-         into BaseNetworkState::reachable_drones"
-    );
+    for (base, mut state) in &mut bases {
+        let mut reachable = Vec::new();
+        let mut best_rssi = f32::NEG_INFINITY;
+        for (entity, transform, drone) in &drones {
+            let drone_pos = transform.translation();
+            let distance_km = (drone_pos - base.position).length();
+            // A drone reserves antenna #2 for the known ground station.  The
+            // station is a multi-sector receiver, so it can listen to any
+            // correctly aimed in-range drone; this makes the south row a real
+            // gateway into the mesh rather than a decorative base marker.
+            let rssi = drone.antennas.get(1).map_or(f32::NEG_INFINITY, |antenna| {
+                antenna.rssi_dbm(
+                    antenna.off_boresight_deg(0.0, drone_pos, base.position),
+                    0.0,
+                    distance_km,
+                )
+            });
+            if rssi >= drone.antennas.get(1).map_or(f32::INFINITY, |a| a.sensitivity_dbm) {
+                reachable.push(entity);
+                best_rssi = best_rssi.max(rssi);
+            }
+        }
+        state.reachable_drones = reachable;
+        state.best_rssi_dbm = best_rssi;
+    }
 }
 
 /// Push commands onto the `CommandQueue` of every reachable drone.

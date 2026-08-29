@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -109,8 +110,13 @@ pub fn start_loading(
     let request_area = area.clone();
     let progress: ProgressHandle = Arc::new(Mutex::new(Progress::default()));
     let task_progress = progress.clone();
-    let task = IoTaskPool::get()
-        .spawn(async move { fetch_terrain_data(&request_area, &task_progress) });
+    // Elevation tiles are remote, binary input.  Keep a malformed response
+    // from taking the render process down with the loader task: the normal UI
+    // error path below gives the operator a retryable failure instead.
+    let task = IoTaskPool::get().spawn(async move {
+        catch_unwind(AssertUnwindSafe(|| fetch_terrain_data(&request_area, &task_progress)))
+            .unwrap_or_else(|_| Err("terrain loader stopped while reading map data; please retry".into()))
+    });
     commands.insert_resource(TerrainLoadTask(task));
     commands.insert_resource(TerrainProgress(progress));
 
