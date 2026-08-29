@@ -35,11 +35,13 @@ pub fn setup(
         Camera3d::default(),
         Transform::default(),
         AmbientLight { brightness: 300.0, ..default() },
+        crate::SimulationEntity,
     ));
 
     commands.spawn((
         DirectionalLight { illuminance: 8000.0, shadow_maps_enabled: false, ..default() },
         Transform::from_xyz(8.0, 16.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        crate::SimulationEntity,
     ));
 
     let positions: [(f32, f32); 12] = [
@@ -65,10 +67,18 @@ pub fn setup(
         ..default()
     });
 
-    let half = WORLD_SIZE / 2.0;
-    for (i, &(km_x, km_z)) in positions.iter().enumerate().take(DRONE_COUNT) {
-        let x = km_x - half;
-        let z = km_z - half;
+    // `positions` are hand-placed for a `WORLD_SIZE` (20km) world — scale
+    // proportionally so the ring spans the *actual* fetched terrain, which
+    // can be smaller or much larger (a network area can run up to
+    // `area::MAX_SIDE_KM` per side) depending on what was picked on the
+    // map. Without this, drones stayed clustered in a fixed center 20km
+    // regardless of the real terrain extent.
+    let half = terrain.size_km() * 0.5;
+    let scale = terrain.size_km() / WORLD_SIZE;
+    for i in 0..DRONE_COUNT {
+        let (km_x, km_z) = positions[i];
+        let x = km_x * scale - half;
+        let z = km_z * scale - half;
         let drone_pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
         let drone_type = if i % 3 == 0 { DroneType::Attack } else { DroneType::Node };
 
@@ -98,6 +108,7 @@ pub fn setup(
                 RecoveryState::default(),
                 ContactMemory::default(),
                 ThemeRole::Drone,
+                crate::SimulationEntity,
             ))
             .observe(
                 |mut t: On<Pointer<Click>>,
@@ -122,6 +133,7 @@ pub fn setup(
                 Visibility::Hidden,
                 RadarCone { drone_entity },
                 ThemeRole::DroneCone,
+                crate::SimulationEntity,
             ));
         }
     }
@@ -142,6 +154,7 @@ pub fn setup(
             BackgroundColor(pal.surface.with_alpha(0.88)),
             Visibility::Hidden,
             InfoPopup,
+            crate::SimulationEntity,
         ))
         .with_children(|p| {
             p.spawn((
@@ -207,6 +220,7 @@ pub fn setup(
             BackgroundColor(pal.surface.with_alpha(0.88)),
             Visibility::Hidden,
             NetworkTablePopup,
+            crate::SimulationEntity,
         ))
         .with_children(|p| {
             p.spawn((
@@ -228,14 +242,18 @@ pub fn draw_grid(
     theme: Res<Theme>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
 ) {
-    let half = WORLD_SIZE / 2.0;
+    // Scaled to the *actual* fetched terrain, not the fixed `WORLD_SIZE` the
+    // hand-placed drone ring is designed for — a hardcoded 5km step only
+    // covered a 20km world; anything bigger left the outer terrain grid-less.
+    let half = terrain.size_km() * 0.5;
+    let step = terrain.size_km() / 4.0; // 5 lines (0..=4) spanning the full terrain
     let color = theme.palette().grid.with_alpha(0.25);
     const SEGMENTS: usize = 64;
     for i in 0..=4 {
-        let offset = -half + i as f32 * 5.0;
+        let offset = -half + i as f32 * step;
         for segment in 0..SEGMENTS {
-            let a = -half + WORLD_SIZE * segment as f32 / SEGMENTS as f32;
-            let b = -half + WORLD_SIZE * (segment + 1) as f32 / SEGMENTS as f32;
+            let a = -half + terrain.size_km() * segment as f32 / SEGMENTS as f32;
+            let b = -half + terrain.size_km() * (segment + 1) as f32 / SEGMENTS as f32;
             gizmos.line(
                 Vec3::new(a, terrain.height_at(a, offset) + 0.01, offset),
                 Vec3::new(b, terrain.height_at(b, offset) + 0.01, offset),
