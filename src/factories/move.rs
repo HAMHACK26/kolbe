@@ -3,13 +3,13 @@
 //!
 //! Two layers:
 //!   1. `apply_velocity`      — real integration loop; runs every frame, moves drones.
-//!   2. `MovementLogic::update` — per-drone velocity planner (stub/Python); combines
+//!   2. `MovementLogic::update` — per-drone velocity planner (Rust/Python); combines
 //!      seek direction with avoidance forces before handing the final velocity to
 //!      the integrator.
 //!
 //! Typical pipeline per frame (all per-drone, no shared state):
 //!   SeekLogic  → desired_direction
-//!   Avoidance  → repulsion_vector
+//!   Avoidance  → repulsion_vector    (see `crate::avoidance`)
 //!   MovementLogic::update(self, vel, desired, obstacles) → final_velocity
 //!   apply_velocity writes final_velocity into DroneKinematics + Transform
 
@@ -51,7 +51,7 @@ pub trait MovementLogic: Send + Sync {
         &mut self,
         self_pos: Vec3,
         self_velocity: Vec3,
-        _desired_velocity: Vec3,
+        desired_velocity: Vec3,
         obstacles: &[ObstacleInfo],
     ) -> Vec3;
 }
@@ -62,7 +62,23 @@ pub trait MovementLogic: Send + Sync {
 /// Written by `apply_velocity`; read by seek, track, network.
 #[derive(Component, Default)]
 pub struct DroneKinematics {
+    /// This frame's commanded velocity. Navigators overwrite it outright, so
+    /// mid-frame it is an *intent*, not necessarily what the airframe is
+    /// doing — see `flown_velocity`.
     pub velocity: Vec3,
+    /// The velocity the drone was actually flying as of the last integration,
+    /// recorded by `apply_velocity` just before it steps the transform.
+    ///
+    /// This exists because `velocity` is clobbered by whichever navigator runs
+    /// first each frame, which destroys the only record of what the airframe
+    /// was really doing. `crate::avoidance` needs that record: an avoidance
+    /// maneuver is bound by the airframe's acceleration limit measured from
+    /// the drone's *real* motion, not from a command the flight controller has
+    /// not had a single tick to act on yet. Anchoring on `velocity` instead
+    /// would let a navigator spend the whole tilt budget flying inbound and
+    /// leave avoidance only enough to cancel it — the drone would coast
+    /// straight through an obstacle at constant speed, unable to brake.
+    pub flown_velocity: Vec3,
     /// Yaw in degrees, 0 = +Z, clockwise.
     pub heading_deg: f32,
 }
@@ -90,21 +106,39 @@ pub struct WaypointQueue {
 pub struct RustMove;
 
 impl MovementLogic for RustMove {
+    /// Delegates to [`crate::avoidance`], which is the single authority on how
+    /// the proximity ring deflects a planned velocity — a Python
+    /// [`PythonMove`] swapped in here is overriding *that* behavior, so the
+    /// Rust default has to be the same behavior the running simulation flies.
+    ///
+    /// The trait passes no timestep, so this reports the velocity avoidance
+    /// would settle on given unlimited time to tilt into it (`dt` large enough
+    /// that the acceleration limit never binds). The real per-frame,
+    /// rate-limited version is `avoidance::avoid_collisions`.
     fn update(
         &mut self,
-        _self_pos: Vec3,
-        _self_velocity: Vec3,
-        _desired_velocity: Vec3,
-        _obstacles: &[ObstacleInfo],
+        self_pos: Vec3,
+        self_velocity: Vec3,
+        desired_velocity: Vec3,
+        obstacles: &[ObstacleInfo],
     ) -> Vec3 {
-        todo!(
-            "Compute repulsion vectors from each ObstacleInfo \
-             (potential field: repulsion ∝ 1/dist²), \
-             blend with desired_velocity, clamp magnitude to max_speed_km_s"
-        );
-        // Placeholder so the compiler knows the return type:
-        #[allow(unreachable_code)]
-        _desired_velocity
+        use crate::avoidance::{avoidance_velocity, Detection, SENSOR_RANGE_KM};
+        use crate::navigation::FlightLimits;
+
+        let detections: Vec<Detection> = obstacles
+            .iter()
+            .map(|o| Detection { offset: o.position - self_pos, radius_km: o.radius_km })
+            .collect();
+
+        avoidance_velocity(
+            self_velocity,
+            desired_velocity,
+            crate::world::DRONE_RADIUS,
+            &detections,
+            SENSOR_RANGE_KM,
+            &FlightLimits::default().in_km(),
+            f32::MAX,
+        )
     }
 }
 
@@ -121,6 +155,10 @@ pub fn apply_velocity(
 ) {
     let dt = time.delta_secs();
     for (mut transform, mut kin) in &mut drones {
+        // Everything that gets a say in this frame's velocity has now had it,
+        // so this is what the airframe actually flies — record it before
+        // integrating, for next frame's avoidance to measure against.
+        kin.flown_velocity = kin.velocity;
         transform.translation += kin.velocity * dt;
 
         // Keep above ground
@@ -134,24 +172,12 @@ pub fn apply_velocity(
     }
 }
 
-// ─── Avoidance system (stub) ──────────────────────────────────────────────────
-
-/// Gather nearby obstacles and push updated velocity into `DroneKinematics`.
-/// Runs before `apply_velocity`.
-pub fn run_avoidance(
-    _time: Res<Time>,
-    _drones: Query<
-        (Entity, &GlobalTransform, &mut DroneKinematics, &mut crate::factories::DroneAi),
-        Without<Obstacle>,
-    >,
-    _obstacles: Query<(&GlobalTransform, &Obstacle)>,
-) {
-    todo!(
-        "For each drone: collect ObstacleInfo for all obstacles within sensor range, \
-         call drone_ai.movement.update(self_pos, vel, desired_vel, &obstacles), \
-         write result into DroneKinematics::velocity"
-    );
-}
+// ─── Avoidance ────────────────────────────────────────────────────────────────
+//
+// The live avoidance system is `crate::avoidance::avoid_collisions` — it
+// gathers detections from the world and deflects `DroneKinematics::velocity`
+// in place, running after the navigators and before `apply_velocity` above.
+// The sensor model and the deflection math live in `crate::avoidance`.
 
 // ─── Python bridge ────────────────────────────────────────────────────────────
 

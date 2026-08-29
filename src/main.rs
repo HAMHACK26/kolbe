@@ -1,7 +1,9 @@
 mod antenna;
 mod area;
+mod avoidance;
 mod base;
 mod camera;
+mod demo;
 mod drone;
 mod factories;
 mod navigation;
@@ -74,6 +76,18 @@ fn teardown_simulation(
 }
 
 fn main() {
+    // Opt-in only: `KOLBE_DEMO=1 cargo run` launches the collision-avoidance
+    // demo (see src/demo.rs) instead of the simulator. A plain `cargo run`
+    // always takes the normal path below.
+    //
+    // Checked for a truthy *value*, not mere presence — `std::env::var(..)
+    // .is_ok()` would also fire on an empty `KOLBE_DEMO=`, which is how a
+    // stray line in a .env or CI config silently hijacks the real app.
+    if demo::requested() {
+        demo::run();
+        return;
+    }
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -162,7 +176,16 @@ fn main() {
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
         .add_systems(Update, theme::apply_loading_theme)
-        .add_systems(Update, factories::movement::apply_velocity.run_if(in_state(AppState::Simulation)))
+        // Integration runs last in the movement chain: every system that wants
+        // a say in this frame's velocity — navigators first, then the
+        // proximity ring's veto — has already written it by the time this
+        // steps the transforms.
+        .add_systems(
+            Update,
+            factories::movement::apply_velocity
+                .after(avoidance::avoid_collisions)
+                .run_if(in_state(AppState::Simulation)),
+        )
         .add_systems(
             Update,
             networking::advance_clocks.run_if(in_state(AppState::Simulation)),
@@ -183,6 +206,10 @@ fn main() {
                 // freshly (re)detected links and updated mesh table.
                 recovery::detect_partitions,
                 recovery::run_recovery,
+                // Last word on velocity: the proximity ring deflects whatever
+                // the navigators above just committed to, before
+                // `apply_velocity` integrates it.
+                avoidance::avoid_collisions,
             )
                 .chain()
                 .run_if(in_state(AppState::Simulation)),
