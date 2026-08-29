@@ -18,6 +18,13 @@ Terrain is displayed with 5x vertical exaggeration so Swedish lowland relief is
 visible at the 20 km map scale. Set `TERRAIN_VERTICAL_EXAGGERATION` before
 `cargo run` to choose a value from 1 (true scale) through 20.
 
+`OUTPUT_SIZE` (default `513`, range `2..1025`) is the height grid's sample count
+per side. It is a fixed count, so ground spacing follows the chosen area: 513
+samples over the 30 km maximum side is 58 m per sample. Drones take their ground
+clearance from this grid while flying 53 m above ground, so lowering it hides
+real relief from the flight code. Raise it for finer terrain at the cost of a
+longer background load.
+
 ## Trees
 
 Tree heights are requested during the terrain background load from

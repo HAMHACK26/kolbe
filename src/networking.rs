@@ -159,6 +159,11 @@ pub struct LinkSet {
     pub connected: std::collections::HashMap<Entity, f64>,
 }
 
+/// Marks a freshly spawned base that needs its initial reciprocal radio links
+/// seeded before the first scheduled header exchange.
+#[derive(Component)]
+pub struct BootstrapBaseLinks;
+
 /// Distance/direction to each peer, recovered by ranging.
 #[derive(Component, Default)]
 pub struct RangingResults(pub Vec<(Entity, SphericalVec)>);
@@ -420,11 +425,11 @@ pub fn detect_links_and_send_headers(
     )>,
     positions: Query<(Entity, &GlobalTransform), With<Drone>>,
     uuids: Query<&DroneUuid>,
-    bases: Query<(Entity, &Base)>,
+    bases: Query<(Entity, &Base, &DroneUuid)>,
 ) {
     // `connected_antenna` is this drone's position vector relative to base —
     // not the antenna's own pointing direction.
-    let base_pos = bases.iter().next().map(|(_, b)| b.position).unwrap_or(Vec3::ZERO);
+    let base_pos = bases.iter().next().map(|(_, b, _)| b.position).unwrap_or(Vec3::ZERO);
 
     // The ground station is a peer like any other: every drone's antenna #2 is
     // aimed at it by `tracking::maintain_mesh_antennas`, and it carries a
@@ -432,7 +437,7 @@ pub fn detect_links_and_send_headers(
     // actually attaches it to the mesh — without it the base is drawn, aimed
     // at, and completely unreachable.
     let base_peers: Vec<(Entity, Vec3)> =
-        bases.iter().map(|(entity, base)| (entity, base.position)).collect();
+        bases.iter().map(|(entity, base, _)| (entity, base.position)).collect();
 
     for (self_entity, self_gt, drone, kin, clock, uuid, mut links, mut sent, table) in &mut drones
     {
@@ -441,7 +446,7 @@ pub fn detect_links_and_send_headers(
 
         // All peers currently detected (regardless of resend cadence) — this
         // is what `connections` means for our own upserted row on the peer.
-        let detected: Vec<Entity> = positions
+        let mut detected: Vec<Entity> = positions
             .iter()
             .filter(|(peer_entity, peer_gt)| {
                 *peer_entity != self_entity && {
@@ -455,6 +460,16 @@ pub fn detect_links_and_send_headers(
             })
             .map(|(peer_entity, _)| peer_entity)
             .collect();
+        // Antenna slot #2 is reserved for the base. A base is a real peer,
+        // not a UI-only reachability marker, so its UUID enters LinkSet and
+        // participates in normal header/table routing.
+        detected.extend(base_peers.iter().filter_map(|(entity, peer_pos)| {
+            let distance_km = (*peer_pos - self_pos).length();
+            drone.antennas.iter().any(|antenna| {
+                let theta = antenna.off_boresight_deg(kin.heading_deg, self_pos, *peer_pos);
+                antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm
+            }).then_some(*entity)
+        }));
         let origin_connections: Vec<String> =
             detected.iter().filter_map(|e| uuids.get(*e).ok().map(|u| u.0.clone())).collect();
         let body: Vec<MeshRow> = table.0.values().cloned().collect();
@@ -501,6 +516,108 @@ pub fn detect_links_and_send_headers(
 
         // Drop links no longer detected so they re-fire on reconnect.
         links.connected = detected_now;
+    }
+}
+
+/// The fixed base runs the same link/header protocol as a drone, with five
+/// independently aimed sectors. It is intentionally separate from the drone
+/// detector because it has no `Drone` component and must never enter flight.
+pub fn detect_base_links_and_send_headers(
+    mut mailbox: ResMut<Mailbox>,
+    mut bases: Query<(
+        Entity, &mut Base, &DroneClock, &DroneUuid, &mut LinkSet, &mut SentHeaders, &MeshTable,
+    )>,
+    drones: Query<(Entity, &GlobalTransform, &DroneUuid), With<Drone>>,
+) {
+    for (base_entity, mut base, clock, uuid, mut links, mut sent, table) in &mut bases {
+        let base_pos = base.position;
+        let mut peers: Vec<(Entity, Vec3, String)> = drones
+            .iter()
+            .map(|(entity, transform, peer_uuid)| (entity, transform.translation(), peer_uuid.0.clone()))
+            .collect();
+        peers.sort_by(|a, b| (a.1 - base_pos).length().total_cmp(&(b.1 - base_pos).length()));
+        peers.truncate(base.antennas.len());
+
+        // Each connector points at one closest candidate; the link budget is
+        // then evaluated from that connector's actual boresight.
+        for (antenna, (_, peer_pos, _)) in base.antennas.iter_mut().zip(&peers) {
+            let (azimuth_deg, elevation_deg) = crate::antenna::angles_toward(base_pos, *peer_pos);
+            antenna.azimuth_deg = azimuth_deg;
+            antenna.elevation_deg = elevation_deg;
+        }
+
+        let mut detected_now = HashMap::new();
+        for ((peer_entity, peer_pos, _peer_uuid), antenna) in peers.iter().zip(&base.antennas) {
+            let distance_km = (*peer_pos - base_pos).length();
+            let theta = antenna.off_boresight_deg(0.0, base_pos, *peer_pos);
+            if antenna.rssi_dbm(theta, 0.0, distance_km) < antenna.sensitivity_dbm {
+                continue;
+            }
+            let last_sent = links.connected.get(peer_entity).copied();
+            let due = last_sent.is_none_or(|t| clock.now - t >= HEADER_INTERVAL_SECS);
+            detected_now.insert(*peer_entity, last_sent.unwrap_or(clock.now));
+            if !due { continue; }
+            detected_now.insert(*peer_entity, clock.now);
+            let header = NetworkHeader {
+                id: uuid.0.clone(),
+                connected_antenna: Vec3::ZERO,
+                flight_direction: Vec3::ZERO,
+                time_received: clock.now,
+            };
+            mailbox.0.push((*peer_entity, Packet {
+                kind: PacketKind::Header,
+                origin: base_entity,
+                responder: *peer_entity,
+                origin_pos: base_pos,
+                header: header.clone(),
+                body: table.0.values().cloned().collect(),
+                origin_connections: peers.iter().map(|(_, _, id)| id.clone()).collect(),
+                responder_pos: Vec3::ZERO,
+                responder_delay: 0.0,
+                arrival_time: 0.0,
+            }));
+            sent.0.push(header);
+        }
+        links.connected = detected_now;
+    }
+}
+
+/// Give the base and its first five launch drones reciprocal live links before
+/// their first flight tick. The normal antenna detector takes ownership on the
+/// next frame; this only removes the cold-start gap in header/table exchange.
+pub fn bootstrap_base_links(
+    mut commands: Commands,
+    mut bases: Query<
+        (Entity, &DroneUuid, &mut LinkSet, &mut MeshTable, &Base),
+        (With<BootstrapBaseLinks>, Without<Drone>),
+    >,
+    mut drones: Query<
+        (Entity, &DroneUuid, &mut LinkSet, &mut MeshTable),
+        (With<Drone>, Without<BootstrapBaseLinks>),
+    >,
+) {
+    for (base_entity, base_uuid, mut base_links, mut base_table, base) in &mut bases {
+        for (drone_entity, drone_uuid, mut drone_links, mut drone_table) in
+            (&mut drones).into_iter().take(base.antennas.len())
+        {
+            base_links.connected.insert(drone_entity, 0.0);
+            drone_links.connected.insert(base_entity, 0.0);
+            base_table.0.insert(drone_uuid.0.clone(), MeshRow {
+                id: drone_uuid.0.clone(),
+                timestamp: 0.0,
+                location: Vec3::ZERO,
+                neighbour_distance: 0,
+                connections: vec![base_uuid.0.clone()],
+            });
+            drone_table.0.insert(base_uuid.0.clone(), MeshRow {
+                id: base_uuid.0.clone(),
+                timestamp: 0.0,
+                location: Vec3::ZERO,
+                neighbour_distance: 0,
+                connections: vec![drone_uuid.0.clone()],
+            });
+        }
+        commands.entity(base_entity).remove::<BootstrapBaseLinks>();
     }
 }
 
@@ -1063,3 +1180,11 @@ mod tests {
         );
     }
 }
+    #[test]
+    fn base_bootstrap_queries_are_disjoint() {
+        // `App::update` validates system parameter access even without any
+        // entities. This prevents a B0001 startup panic from regressing.
+        let mut app = App::new();
+        app.add_systems(Update, bootstrap_base_links);
+        app.update();
+    }

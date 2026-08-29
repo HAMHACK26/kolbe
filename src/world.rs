@@ -10,7 +10,7 @@ use crate::{
     },
     networking::{MeshRow, MeshTable, NetworkingBundle},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
-    recovery::{ContactMemory, RecoveryState},
+    recovery::{ContactMemory, PositionHistory, RecoveryState},
     seeking::SeekState,
     theme::{Theme, ThemeRole},
     ui::{
@@ -20,23 +20,18 @@ use crate::{
 };
 
 pub const WORLD_SIZE: f32 = 20.0;
-/// How many drones it takes to cover the patrol area.
-///
-/// Not a free choice — it falls out of the radio. The area is 14 x 14 km and
-/// no two neighbours may sit further apart than
-/// [`MAX_LINK_SPACING_KM`] (3.0 km) or they cannot link at all, so the grid
-/// needs `ceil(14 / 3) = 6` drones per side. Fewer drones would leave the mesh
-/// permanently partitioned no matter how well the antennas were aimed; this is
-/// the count that gives the area continuous coverage.
-pub const DRONE_COUNT: usize = 36;
 /// Extra airframes above the minimum spacing-derived coverage count. This
 /// leaves replacement paths when a node drops or has to return to base.
 pub const COVERAGE_REDUNDANCY: f32 = 0.15;
-/// Drawn radius of a drone, km. Still far larger than a real airframe — a
-/// true-scale quad is sub-pixel on a 20 km map — but 4x smaller than the
-/// original marker, so the 3 km separation ring reads as real distance between
-/// drones rather than a couple of body widths.
+/// A temporary mesh always launches enough nodes for multiple redundant
+/// routes, even when its selected target fits inside one radio cell.
+pub const MIN_MESH_DRONES: usize = 6;
+/// Physical safety radius of a drone, km, used by ground clearance and
+/// avoidance.
 pub const DRONE_RADIUS: f32 = 0.045;
+/// Rendered marker radius, km. Kept separate from the safety envelope so the
+/// map reads as aircraft rather than oversized balls.
+pub const DRONE_RENDER_RADIUS: f32 = DRONE_RADIUS / 4.0;
 
 /// Fixed seed for the spawn scatter and each drone's drift stream, so a run is
 /// reproducible: same layout, same sequence of direction changes.
@@ -107,13 +102,14 @@ pub fn scatter_spawn_points(count: usize, volume: &PatrolVolume, seed: u64) -> V
 /// `ceil(width / MAX_LINK_SPACING_KM) * ceil(height / MAX_LINK_SPACING_KM)`
 /// is the smallest rectangular lattice whose cell pitch stays within the
 /// safe link spacing. The final `ceil(... * 1.15)` adds spare nodes without
-/// weakening that guarantee; [`scatter_spawn_points`] recomputes the denser
-/// lattice from this count.
+/// weakening that guarantee. [`MIN_MESH_DRONES`] prevents tiny targets from
+/// degenerating into a non-redundant pair.
 pub fn drones_required_for_coverage(volume: &PatrolVolume) -> usize {
     let span = volume.span_km();
     let columns = (span.x / MAX_LINK_SPACING_KM).ceil().max(1.0) as usize;
     let rows = (span.y / MAX_LINK_SPACING_KM).ceil().max(1.0) as usize;
-    ((columns * rows) as f32 * (1.0 + COVERAGE_REDUNDANCY)).ceil() as usize
+    (((columns * rows) as f32 * (1.0 + COVERAGE_REDUNDANCY)).ceil() as usize)
+        .max(MIN_MESH_DRONES)
 }
 
 pub fn setup(
@@ -159,7 +155,7 @@ pub fn setup(
         }
     }
 
-    let drone_mesh = meshes.add(Sphere::new(DRONE_RADIUS));
+    let drone_mesh = meshes.add(Sphere::new(DRONE_RENDER_RADIUS));
     // Initial colors come from the palette; `apply_theme` keeps them in sync on
     // theme toggles (these entities carry ThemeRole markers).
     let drone_mat = materials.add(StandardMaterial {
@@ -231,8 +227,11 @@ pub fn setup(
         })
         .collect();
 
-    for (i, (drone_pos, networking)) in placed.into_iter().enumerate() {
-        let drone_pos = drone_pos;
+    for (i, (_drone_pos, networking)) in placed.into_iter().enumerate() {
+        // Airframes launch from the ground station. `drone_pos` remains in
+        // the pre-flight briefing as this slot's base-relative reference,
+        // while the live transform begins at the shared base origin.
+        let launch_pos = base_pos;
         let drone_type = if i % 3 == 0 { DroneType::Attack } else { DroneType::Node };
 
         let az0 = (i as f32 * 137.5) % 360.0;
@@ -266,7 +265,7 @@ pub fn setup(
             .spawn((
                 Mesh3d(drone_mesh.clone()),
                 MeshMaterial3d(drone_mat.clone()),
-                Transform::from_translation(drone_pos),
+                Transform::from_translation(launch_pos),
                 Drone { id: drone_id(i), drone_type, antennas: antennas.clone() },
                 DroneKinematics::default(),
                 DroneAi::default(),
@@ -276,6 +275,7 @@ pub fn setup(
                 SeekState::default(),
                 RecoveryState::default(),
                 ContactMemory::default(),
+                PositionHistory::default(),
                 ThemeRole::Drone,
                 crate::SimulationEntity,
             ))
@@ -291,16 +291,16 @@ pub fn setup(
             )
             .id();
 
-        for antenna in &antennas {
+        for (antenna_index, antenna) in antennas.iter().enumerate() {
             commands.spawn((
                 Mesh3d(cone_mesh_for(antenna, &mut meshes)),
                 MeshMaterial3d(cone_mat.clone()),
                 // heading 0.0 matches the DroneKinematics::default() this
                 // drone spawns with; apply_velocity updates heading as it
                 // moves, but nothing currently re-syncs the cone transform.
-                cone_transform_for(antenna, 0.0, drone_pos),
+                cone_transform_for(antenna, 0.0, launch_pos),
                 Visibility::Hidden,
-                RadarCone { drone_entity },
+                RadarCone { drone_entity, antenna_index },
                 ThemeRole::DroneCone,
                 crate::SimulationEntity,
             ));
@@ -484,8 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn small_target_still_launches_a_redundant_mesh() {
+        let volume = PatrolVolume::inset(1.0, BOUNDARY_MARGIN_KM);
+        assert_eq!(volume.span_km(), Vec2::splat(1.0));
+        assert_eq!(drones_required_for_coverage(&volume), MIN_MESH_DRONES);
+    }
+
+    #[test]
+    fn tiny_target_keeps_its_selected_footprint() {
+        let volume = PatrolVolume::inset(0.2, BOUNDARY_MARGIN_KM);
+        assert_eq!(volume.span_km(), Vec2::splat(0.2));
+    }
+
+    #[test]
     fn redundant_formation_keeps_neighbour_spacing_safe() {
-        let volume = PatrolVolume::inset(50.0, BOUNDARY_MARGIN_KM);
+        let volume = PatrolVolume::inset(30.0, BOUNDARY_MARGIN_KM);
         let count = drones_required_for_coverage(&volume);
         let columns = (count as f32).sqrt().ceil() as usize;
         let rows = count.div_ceil(columns);

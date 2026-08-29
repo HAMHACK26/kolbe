@@ -2,7 +2,8 @@ use bevy::{mesh::primitives::ConeAnchor, prelude::*};
 
 use crate::{
     antenna::{Antenna, radar_direction},
-    drone::SelectedDrone,
+    drone::{Drone, SelectedDrone},
+    factories::movement::DroneKinematics,
 };
 
 /// Fixed visual beam length (km). The drone knows only its pointing angles —
@@ -13,6 +14,8 @@ pub const BEAM_KM: f32 = 3.0;
 #[derive(Component)]
 pub struct RadarCone {
     pub drone_entity: Entity,
+    /// Slot in the owning drone's antenna array.
+    pub antenna_index: usize,
 }
 
 /// Build a cone mesh: fixed `BEAM_KM` length, half-angle = θ₃dB / 2.
@@ -42,16 +45,24 @@ pub fn cone_transform_for(antenna: &Antenna, heading_deg: f32, drone_pos: Vec3) 
 
 pub fn sync_radar_visibility(
     selected: Res<SelectedDrone>,
-    mut cones: Query<(&RadarCone, &mut Visibility)>,
+    // Radar cones are separate entities, so this filter proves they cannot
+    // overlap the mutable cone-transform query below.
+    drones: Query<(&Transform, &Drone, &DroneKinematics), Without<RadarCone>>,
+    mut cones: Query<(&RadarCone, &mut Transform, &mut Visibility)>,
 ) {
-    if !selected.is_changed() {
-        return;
-    }
-    for (cone, mut vis) in &mut cones {
+    for (cone, mut transform, mut vis) in &mut cones {
         *vis = if selected.0 == Some(cone.drone_entity) {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
+
+        // The cone is a separate render entity, so it must be refreshed from
+        // its owner every frame rather than remaining at the launch point.
+        if let Ok((drone_transform, drone, kin)) = drones.get(cone.drone_entity)
+            && let Some(antenna) = drone.antennas.get(cone.antenna_index)
+        {
+            *transform = cone_transform_for(antenna, kin.heading_deg, drone_transform.translation);
+        }
     }
 }

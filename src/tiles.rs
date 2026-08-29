@@ -14,6 +14,8 @@
 //! of a fixed-resolution texture.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use bevy::{
@@ -90,9 +92,76 @@ const RETRY_COOLDOWN: Duration = Duration::from_secs(8);
 /// simultaneous connections at OSM's tile server — exactly the kind of
 /// bulk/bursty use their tile usage policy asks clients not to do, and
 /// almost certainly why fetches were failing with "error sending request"
-/// under normal use. Real map clients (browsers, Leaflet) cap this the same
-/// way; 6 matches a typical browser's per-host connection limit.
-const MAX_CONCURRENT_FETCHES: usize = 6;
+/// under normal use. Real map clients cap this the same way; 8 is in the
+/// range a browser uses per host, and since every request now goes through
+/// one pooled client (see [`HTTP`]) these share connections rather than
+/// opening eight of them.
+const MAX_CONCURRENT_FETCHES: usize = 8;
+
+/// One HTTP client for the whole session.
+///
+/// This used to be built per tile, which meant every single tile paid for a
+/// fresh DNS lookup and a full TLS handshake before a byte of PNG moved — on
+/// a normal connection that is the majority of the time each tile took, and
+/// it was paid 20+ times per pan. A shared client keeps the connection pool
+/// (and TLS session state) alive, so everything after the first tile reuses
+/// an already-open connection.
+static HTTP: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(MAX_CONCURRENT_FETCHES)
+        .pool_idle_timeout(Duration::from_secs(90))
+        // OpenStreetMap's tile usage policy requires a descriptive
+        // User-Agent identifying the application:
+        // https://operations.osmfoundation.org/policies/tiles/
+        .user_agent(
+            "Kolbe/0.1 (github.com — EDTH Hamburg 2026 hackathon; drone-mesh-sim area picker)",
+        )
+        .build()
+        // A client that cannot be built is a broken TLS backend, not a
+        // per-tile condition — there is no useful per-tile error to report.
+        .expect("HTTP client")
+});
+
+/// Where downloaded tile PNGs are kept between runs.
+///
+/// Tiles are immutable for our purposes and tiny, so re-downloading one the
+/// session already saw is pure latency. This makes a second visit to an area
+/// — and every restart during development — draw from local disk instead of
+/// the network, which is also the neighbourly thing to do with a free tile
+/// service.
+static TILE_CACHE_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    let dir = std::env::temp_dir().join("kolbe-osm-tiles");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(e) => {
+            // Not fatal: without a cache directory every tile just comes off
+            // the network like it used to.
+            warn!("[tiles] no on-disk tile cache ({}): {e}", dir.display());
+            None
+        }
+    }
+});
+
+fn cache_path(key: TileKey) -> Option<PathBuf> {
+    TILE_CACHE_DIR
+        .as_ref()
+        .map(|dir| dir.join(format!("{}_{}_{}.png", key.z, key.x, key.y)))
+}
+
+fn read_cached(key: TileKey) -> Option<Vec<u8>> {
+    std::fs::read(cache_path(key)?).ok().filter(|bytes| !bytes.is_empty())
+}
+
+/// Write through a temporary name, then rename. Two Kolbe windows sharing the
+/// cache directory would otherwise be able to read a half-written PNG.
+fn write_cached(key: TileKey, bytes: &[u8]) {
+    let Some(path) = cache_path(key) else { return };
+    let staging = path.with_extension("part");
+    if std::fs::write(&staging, bytes).is_ok() && std::fs::rename(&staging, &path).is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+}
 
 /// Live per-tile fetch state, and the cache of tiles already decoded.
 #[derive(Resource, Default)]
@@ -132,6 +201,15 @@ impl TileCache {
         }
     }
 
+    /// Forget queued tiles from any zoom but `zoom`.
+    ///
+    /// Zooming twice in quick succession would otherwise leave the queue full
+    /// of tiles for a level nothing is drawing any more, and those get fetched
+    /// ahead of the ones actually on screen.
+    pub fn drop_other_zooms(&mut self, zoom: u8) {
+        self.queued.retain(|key| key.z == zoom);
+    }
+
     fn start_fetch(&mut self, key: TileKey) {
         self.failed.remove(&key);
         self.in_flight.insert(key, IoTaskPool::get().spawn(async move { fetch_tile(key) }));
@@ -148,26 +226,44 @@ impl TileCache {
     }
 }
 
-/// Blocking HTTP fetch + PNG decode for one tile. Runs on a background task
+/// Fetch (or load) and decode one tile. Runs on a background task
 /// (`IoTaskPool`) — never the main thread.
+///
+/// Disk first, network second. A tile that decodes badly out of the cache is
+/// treated as a truncated file rather than a bad tile: it is dropped and
+/// re-downloaded once, so a partial write can't poison that tile forever.
 fn fetch_tile(key: TileKey) -> FetchResult {
+    if let Some(bytes) = read_cached(key) {
+        match decode_tile(key, &bytes) {
+            Ok(tile) => return Ok(tile),
+            Err(_) => {
+                if let Some(path) = cache_path(key) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+
+    let bytes = download_tile(key)?;
+    let tile = decode_tile(key, &bytes)?;
+    write_cached(key, &bytes);
+    Ok(tile)
+}
+
+fn download_tile(key: TileKey) -> Result<Vec<u8>, (TileKey, String)> {
     let url = format!("https://tile.openstreetmap.org/{}/{}/{}.png", key.z, key.x, key.y);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        // OpenStreetMap's tile usage policy requires a descriptive
-        // User-Agent identifying the application:
-        // https://operations.osmfoundation.org/policies/tiles/
-        .user_agent("Kolbe/0.1 (github.com — EDTH Hamburg 2026 hackathon; drone-mesh-sim area picker)")
-        .build()
-        .map_err(|e| (key, e.to_string()))?;
-    let bytes = client
+    let bytes = HTTP
         .get(&url)
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| (key, format!("{url}: {e}")))?
         .bytes()
         .map_err(|e| (key, e.to_string()))?;
-    let rgba = image::load_from_memory(&bytes).map_err(|e| (key, e.to_string()))?.to_rgba8();
+    Ok(bytes.to_vec())
+}
+
+fn decode_tile(key: TileKey, bytes: &[u8]) -> FetchResult {
+    let rgba = image::load_from_memory(bytes).map_err(|e| (key, e.to_string()))?.to_rgba8();
     let width = rgba.width();
     Ok((key, rgba.into_raw(), width))
 }

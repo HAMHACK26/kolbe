@@ -10,33 +10,43 @@ use bevy::{
 use crate::{
     polygon, sweden_geo,
     terrain::{DENSITY_STEP, MAX_DENSITY, MIN_DENSITY, VegetationSettings},
-    theme::Theme, tiles, AppState,
+    theme::{Palette, Slot, Theme, UiFill, UiInk, UiStroke},
+    tiles, AppState,
 };
 
 /// Kept for existing callers (terrain fetch math) — the network-area picker
 /// now drives `ScenarioArea.size_km` dynamically instead.
 pub const AREA_SIZE_KM: f32 = 20.0;
 
-/// On-screen size of the map viewport. No longer tied to any fixed source
-/// image (the map is live OSM tiles, effectively infinite) — this is just
-/// how big a window into the world the panel gives you.
-const MAP_VIEWPORT_W: f32 = 343.0;
-const MAP_VIEWPORT_H: f32 = 760.0;
+/// Fallback viewport size, used only for the frame or two before Bevy's
+/// layout has measured the real one. The map fills whatever space the window
+/// leaves beside the instrument rail, so its true size lives in
+/// [`MapView::size`] and is refreshed every frame by `track_viewport_size`.
+const FALLBACK_VIEWPORT: Vec2 = Vec2::new(900.0, 800.0);
 
-fn viewport_size() -> Vec2 {
-    Vec2::new(MAP_VIEWPORT_W, MAP_VIEWPORT_H)
-}
+/// Width of the instrument rail down the right-hand side.
+const RAIL_W: f32 = 392.0;
+/// Height of the title strip across the top.
+const TOP_RAIL_H: f32 = 44.0;
+/// Every rule and control border in this screen is exactly one pixel. Nothing
+/// on it is drawn with a fill where a line will do.
+const HAIRLINE: f32 = 1.0;
+/// Horizontal padding inside the rail and the title strip.
+const RAIL_PAD: f32 = 18.0;
 
 const MIN_POINTS: usize = 3;
-const MAX_SIDE_KM: f64 = 50.0;
-const POINT_DOT_SIZE: f32 = 9.0;
-const EDGE_THICKNESS: f32 = 2.0;
+/// Largest practical side length for a temporary, self-healing drone mesh.
+/// With the 3 km radio pitch and 15% redundancy this caps a square mission at
+/// about 74 airframes, keeping link checks and reconnection traffic responsive.
+const MAX_SIDE_KM: f64 = 30.0;
+const POINT_DOT_SIZE: f32 = 8.0;
+const EDGE_THICKNESS: f32 = 1.0;
 const SQUARE_THICKNESS: f32 = 2.0;
 
 /// Sweden's rough centroid — the default view on first opening the picker.
 const DEFAULT_CENTER_LON: f64 = 17.65;
 const DEFAULT_CENTER_LAT: f64 = 62.15;
-/// Shows roughly the whole country in `MAP_VIEWPORT_W`/`H`.
+/// Shows roughly the whole country at a typical viewport size.
 const DEFAULT_ZOOM: u8 = 5;
 
 /// Sweden's bounding box, with a little slack. Clamps `MapView::center` so
@@ -215,25 +225,57 @@ fn recompute_network_area(points: &[(f64, f64)]) -> NetworkArea {
 pub(crate) struct MapView {
     pub zoom: u8,
     pub center: (f64, f64),
+    /// Logical (not physical) pixel size of the viewport node. Every
+    /// projection on this screen is relative to the viewport's own box, so
+    /// this is the one number that lets the map fill the window instead of
+    /// being pinned to a hardcoded rectangle.
+    pub size: Vec2,
 }
 
 impl Default for MapView {
     fn default() -> Self {
-        Self { zoom: DEFAULT_ZOOM, center: (DEFAULT_CENTER_LON, DEFAULT_CENTER_LAT) }
+        Self {
+            zoom: DEFAULT_ZOOM,
+            center: (DEFAULT_CENTER_LON, DEFAULT_CENTER_LAT),
+            size: FALLBACK_VIEWPORT,
+        }
     }
 }
 
 impl MapView {
+    /// Back to the default view. Keeps `size` — that is a property of the
+    /// window, not of what the operator is looking at.
     fn reset(&mut self) {
-        *self = Self::default();
+        let size = self.size;
+        *self = Self { size, ..Self::default() };
+    }
+}
+
+/// Keep [`MapView::size`] in step with the laid-out viewport node.
+///
+/// `ComputedNode::size` is in physical pixels while `Node` positions are
+/// logical, so this scales back down — otherwise every overlay would be
+/// placed at double coordinates on a retina display.
+pub fn track_viewport_size(
+    mut view: ResMut<MapView>,
+    viewport_q: Query<&ComputedNode, With<MapViewport>>,
+) {
+    let Ok(node) = viewport_q.single() else {
+        return;
+    };
+    let size = node.size() * node.inverse_scale_factor();
+    if size.x < 1.0 || size.y < 1.0 {
+        return;
+    }
+    // Guarded so a stable window doesn't mark `MapView` changed every frame —
+    // tile sync and the overlay redraw both key off that flag.
+    if size.distance_squared(view.size) > 0.01 {
+        view.size = size;
     }
 }
 
 #[derive(Component)]
 pub(crate) struct AreaSelectionRoot;
-
-#[derive(Component)]
-pub(crate) struct AreaBg;
 
 #[derive(Component)]
 pub(crate) struct MapViewport;
@@ -270,20 +312,39 @@ pub(crate) struct SpawnedTiles {
 #[derive(Component)]
 pub(crate) struct PolygonVisual;
 
-#[derive(Component)]
-pub(crate) struct HeadingText;
+/// Every piece of text on the rail that `update_status_text` writes to.
+///
+/// One component naming a field, rather than one marker component per field:
+/// a `Query<&mut Text>` per marker would be a dozen mutable queries over the
+/// same component, and Bevy cannot prove those disjoint without every pair
+/// carrying a `Without` of the other. This collapses all of them into a
+/// single query and a `match`.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RailField {
+    Vertices,
+    Side,
+    Rotation,
+    Fetch,
+    Airframes,
+    Station,
+    /// The state chip in the title strip — the one thing on screen that says
+    /// whether the mission can be launched.
+    StatusChip,
+    Warning,
+    AddStopLabel,
+    SetBaseLabel,
+    GenerateLabel,
+}
 
+/// The chip's border, which is recolored alongside its text.
 #[derive(Component)]
-pub(crate) struct BodyText;
+pub(crate) struct StatusChip;
 
+/// Live centre/zoom readout under the map. Kept separate from [`RailField`]
+/// because it is driven by `MapView`, which changes on pan frames when no
+/// mission state does.
 #[derive(Component)]
-pub(crate) struct SummaryText;
-
-#[derive(Component)]
-pub(crate) struct WarningText;
-
-#[derive(Component)]
-pub(crate) struct SourceText;
+pub(crate) struct MapCoordReadout;
 
 #[derive(Component)]
 pub(crate) struct GenerateTerrain;
@@ -292,10 +353,12 @@ pub(crate) struct GenerateTerrain;
 pub(crate) struct AddStopButton;
 
 #[derive(Component)]
-pub(crate) struct AddStopLabel;
-
-#[derive(Component)]
 pub(crate) struct ClearButton;
+
+/// Present only so `spawn_button` always has a label marker to attach; the
+/// Clear button's caption never changes.
+#[derive(Component)]
+pub(crate) struct ClearLabel;
 
 #[derive(Component)]
 pub(crate) struct PointsTableRoot;
@@ -307,42 +370,10 @@ pub(crate) struct RemovePointButton(usize);
 pub(crate) struct SetBaseButton;
 
 #[derive(Component)]
-pub(crate) struct SetBaseLabel;
-
-#[derive(Component)]
 pub(crate) struct ZoomInButton;
 
 #[derive(Component)]
 pub(crate) struct ZoomOutButton;
-
-fn spawn_zoom_button(
-    parent: &mut ChildSpawnerCommands,
-    label: &str,
-    marker: impl Component,
-    bg: Color,
-    fg: Color,
-) {
-    parent
-        .spawn((
-            Button,
-            Node {
-                width: Val::Px(28.0),
-                height: Val::Px(28.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border_radius: BorderRadius::all(Val::Px(4.0)),
-                ..default()
-            },
-            BackgroundColor(bg),
-            marker,
-        ))
-        .with_child((
-            Text::new(label),
-            TextFont { font_size: FontSize::Px(18.0), ..default() },
-            TextColor(fg),
-            Pickable::IGNORE,
-        ));
-}
 
 /// Button that turns the procedural forest on and off.
 #[derive(Component)]
@@ -358,11 +389,226 @@ pub(crate) struct DensityLabel;
 #[derive(Component)]
 pub(crate) struct DensityFill;
 
+// ─── Type ──────────────────────────────────────────────────────────────────
+
+/// Widen a short label by inserting thin spaces between its characters.
+///
+/// `TextFont` has no letter-spacing, and all-caps at 10 px without any reads
+/// as a solid bar rather than words. Only for section headers and the state
+/// chip — it is a typographic workaround, so nothing should ever compare or
+/// parse the string it returns.
+fn tracked(label: &str) -> String {
+    label.chars().map(String::from).collect::<Vec<_>>().join("\u{2009}")
+}
+
+/// Fira Mono at `size`, for anything numeric. See `crate::MONO_UI_FONT`.
+fn mono(fonts: &crate::UiFonts, size: f32) -> TextFont {
+    TextFont {
+        font: fonts.mono.clone().into(),
+        font_size: FontSize::Px(size),
+        ..default()
+    }
+}
+
+/// The default UI face at `size`, for prose and labels.
+fn sans(size: f32) -> TextFont {
+    TextFont { font_size: FontSize::Px(size), ..default() }
+}
+
+// ─── Chrome builders ───────────────────────────────────────────────────────
+
+/// A section header: an amber tick, a tracked caps label, and a rule running
+/// out to the edge of the rail. The rule is what separates sections — there
+/// are no boxes around them, because a box costs two lines where one will do.
+fn spawn_section(parent: &mut ChildSpawnerCommands, label: &str, p: &Palette) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            margin: UiRect::top(Val::Px(6.0)),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Node { width: Val::Px(2.0), height: Val::Px(9.0), ..default() },
+                BackgroundColor(p.signal),
+                UiFill::new(Slot::Signal),
+            ));
+            row.spawn((
+                Text::new(tracked(label)),
+                sans(10.0),
+                TextColor(p.subtext),
+                UiInk::new(Slot::Subtext),
+            ));
+            row.spawn((
+                Node { flex_grow: 1.0, height: Val::Px(HAIRLINE), ..default() },
+                BackgroundColor(p.line),
+                UiFill::new(Slot::Line),
+            ));
+        });
+}
+
+/// One `LABEL ................ VALUE` line inside a readout block. The label
+/// is sans and dim, the value is mono and bright, so a column of these scans
+/// as a column of numbers rather than a paragraph.
+fn spawn_readout(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    initial: &str,
+    field: RailField,
+    fonts: &crate::UiFonts,
+    p: &Palette,
+) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                sans(10.0),
+                TextColor(p.subtext),
+                UiInk::new(Slot::Subtext),
+            ));
+            row.spawn((
+                Text::new(initial),
+                mono(fonts, 12.0),
+                TextColor(p.text),
+                UiInk::new(Slot::Text),
+                field,
+            ));
+        });
+}
+
+/// Which of the two button treatments this screen has. There are only two on
+/// purpose: exactly one action per screen is the one you came here to take.
+enum ButtonKind {
+    /// Outline only. Everything that changes what you are editing.
+    Ghost,
+    /// Amber fill. The single action that leaves this screen.
+    Primary,
+}
+
+/// A square-cornered, tracked-caps button. `label_marker` rides on the text
+/// entity so callers can retitle it later without touching the button itself.
+fn spawn_button(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    kind: ButtonKind,
+    marker: impl Component,
+    label_marker: impl Component,
+    fill: bool,
+    p: &Palette,
+) {
+    let (bg, fg, border) = match kind {
+        ButtonKind::Ghost => (Color::NONE, p.text, p.line),
+        ButtonKind::Primary => (p.signal, p.bg, p.signal),
+    };
+    let mut button = parent.spawn((
+        Button,
+        Node {
+            flex_grow: if fill { 1.0 } else { 0.0 },
+            height: Val::Px(34.0),
+            padding: UiRect::horizontal(Val::Px(14.0)),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            border: UiRect::all(Val::Px(HAIRLINE)),
+            ..default()
+        },
+        BackgroundColor(bg),
+        BorderColor::all(border),
+        marker,
+    ));
+    if matches!(kind, ButtonKind::Ghost) {
+        // The primary button's colors are driven by readiness every frame,
+        // so only the ghost treatment can be left to the theme system.
+        button.insert((UiFill(Slot::Line, 0.0), UiStroke::new(Slot::Line)));
+    }
+    button.with_child((
+        Text::new(tracked(label)),
+        sans(11.0),
+        TextColor(fg),
+        label_marker,
+        Pickable::IGNORE,
+    ));
+}
+
+/// A single corner bracket on the map — two hairlines meeting at `corner`,
+/// inset from the edge. Four of these frame the viewport without drawing a
+/// full box around it, which would fight the map's own linework.
+fn spawn_bracket(parent: &mut ChildSpawnerCommands, right: bool, bottom: bool, color: Color) {
+    const INSET: f32 = 12.0;
+    const ARM: f32 = 20.0;
+
+    let edge = |horizontal: bool| {
+        let (w, h) = if horizontal { (ARM, HAIRLINE) } else { (HAIRLINE, ARM) };
+        let mut node = Node {
+            position_type: PositionType::Absolute,
+            width: Val::Px(w),
+            height: Val::Px(h),
+            ..default()
+        };
+        if right {
+            node.right = Val::Px(INSET);
+        } else {
+            node.left = Val::Px(INSET);
+        }
+        if bottom {
+            node.bottom = Val::Px(INSET);
+        } else {
+            node.top = Val::Px(INSET);
+        }
+        node
+    };
+
+    for horizontal in [true, false] {
+        parent.spawn((edge(horizontal), BackgroundColor(color), Pickable::IGNORE));
+    }
+}
+
+fn spawn_zoom_button(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    marker: impl Component,
+    fonts: &crate::UiFonts,
+    p: &Palette,
+) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                width: Val::Px(26.0),
+                height: Val::Px(26.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(HAIRLINE)),
+                ..default()
+            },
+            BackgroundColor(p.panel.with_alpha(0.92)),
+            BorderColor::all(p.line),
+            UiFill(Slot::Panel, 0.92),
+            UiStroke::new(Slot::Line),
+            marker,
+        ))
+        .with_child((
+            Text::new(label),
+            mono(fonts, 14.0),
+            TextColor(p.text),
+            UiInk::new(Slot::Text),
+            Pickable::IGNORE,
+        ));
+}
+
 pub fn setup(
     mut commands: Commands,
     vegetation: Res<VegetationSettings>,
     load_error: Option<Res<crate::terrain::TerrainLoadError>>,
     theme: Res<Theme>,
+    fonts: Res<crate::UiFonts>,
 ) {
     commands.insert_resource(PendingPoints::default());
     commands.insert_resource(PickMode::default());
@@ -372,254 +618,392 @@ pub fn setup(
     commands.insert_resource(SpawnedTiles::default());
 
     let p = theme.palette();
+    let fonts = fonts.clone();
 
     commands
         .spawn((
             Node {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(40.0),
+                flex_direction: FlexDirection::Column,
                 ..default()
             },
             BackgroundColor(p.bg),
+            UiFill::new(Slot::Bg),
             AreaSelectionRoot,
-            AreaBg,
         ))
         .with_children(|root| {
-            // Clipped viewport: fixed size, click target for adding points.
-            // `MapContent` holds every OSM tile plus the point/polygon/base
-            // overlay — all positioned directly in screen space from the
-            // current `MapView` (see `lonlat_to_screen_px`), rebuilt
-            // whenever pan/zoom/points change rather than carrying any
-            // scale/translate transform of its own.
-            root.spawn((
-                Node {
-                    width: Val::Px(MAP_VIEWPORT_W),
-                    height: Val::Px(MAP_VIEWPORT_H),
-                    overflow: Overflow::clip(),
-                    position_type: PositionType::Relative,
-                    ..default()
-                },
-                BackgroundColor(p.surface),
-                Interaction::None,
-                RelativeCursorPosition::default(),
-                MapViewport,
-            ))
-            .with_children(|viewport| {
-                viewport.spawn((
-                    Node {
-                        width: Val::Px(MAP_VIEWPORT_W),
-                        height: Val::Px(MAP_VIEWPORT_H),
-                        ..default()
-                    },
-                    MapContent,
-                    Pickable::IGNORE,
-                ));
-
-                // Zoom controls — scroll-wheel zoom is unreliable on macOS
-                // trackpads, so these buttons (Google Maps-style) are the
-                // primary way to zoom. Siblings of `MapContent`, not
-                // children, so they stay fixed in the corner instead of
-                // panning with the map.
-                viewport
-                    .spawn((
-                        Node {
-                            position_type: PositionType::Absolute,
-                            right: Val::Px(10.0),
-                            bottom: Val::Px(10.0),
-                            flex_direction: FlexDirection::Column,
-                            ..default()
-                        },
-                        Pickable::IGNORE,
-                    ))
-                    .with_children(|controls| {
-                        spawn_zoom_button(controls, "+", ZoomInButton, p.surface, p.text);
-                        controls.spawn(Node { height: Val::Px(2.0), ..default() });
-                        spawn_zoom_button(controls, "\u{2212}", ZoomOutButton, p.surface, p.text);
-                    });
-
-                // OpenStreetMap's tile usage policy requires visible
-                // attribution wherever the tiles are displayed:
-                // https://operations.osmfoundation.org/policies/tiles/
-                viewport.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: Val::Px(4.0),
-                        bottom: Val::Px(2.0),
-                        padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::BLACK.with_alpha(0.35)),
-                    Pickable::IGNORE,
-                    children![(
-                        Text::new("\u{00A9} OpenStreetMap contributors"),
-                        TextFont { font_size: FontSize::Px(9.0), ..default() },
-                        TextColor(Color::WHITE.with_alpha(0.85)),
-                    )],
-                ));
-            });
+            spawn_title_strip(root, &p);
 
             root.spawn(Node {
-                width: Val::Px(440.0),
-                height: Val::Px(MAP_VIEWPORT_H),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(14.0),
-                overflow: Overflow::clip_y(),
+                flex_grow: 1.0,
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                min_height: Val::Px(0.0),
                 ..default()
             })
-            .with_children(|panel| {
-                panel.spawn((
-                    Text::new("Select a network area"),
-                    TextFont { font_size: FontSize::Px(30.0), ..default() },
-                    TextColor(p.text),
-                    HeadingText,
-                ));
-                panel.spawn((
-                    Text::new(
-                        "Click points on the map to draw the area's outline (3+ points). \
-                         We'll fit the smallest square around them and fetch that terrain.",
-                    ),
-                    TextFont { font_size: FontSize::Px(15.0), ..default() },
-                    TextColor(p.text.with_alpha(0.8)),
-                    BodyText,
-                ));
-
-                panel.spawn((
-                    Text::new(""),
-                    TextFont { font_size: FontSize::Px(16.0), ..default() },
-                    TextColor(p.accent),
-                    SummaryText,
-                ));
-                panel.spawn((
-                    Text::new(""),
-                    TextFont { font_size: FontSize::Px(13.0), ..default() },
-                    TextColor(Color::srgb(1.0, 0.55, 0.4)),
-                    WarningText,
-                ));
-
-                panel.spawn(Node {
-                    display: Display::Grid,
-                    grid_template_columns: vec![RepeatedGridTrack::auto(4)],
-                    column_gap: Val::Px(14.0),
-                    row_gap: Val::Px(3.0),
-                    ..default()
-                })
-                .with_children(|grid| {
-                    for h in ["#", "Lat", "Lon", ""] {
-                        grid.spawn((
-                            Text::new(h),
-                            TextFont { font_size: FontSize::Px(12.0), ..default() },
-                            TextColor(p.accent),
-                        ));
-                    }
-                })
-                .insert(PointsTableRoot);
-
-                panel.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(12.0),
-                    ..default()
-                })
-                .with_children(|row| {
-                    row.spawn((
-                        Button,
-                        Node {
-                            padding: UiRect::axes(Val::Px(14.0), Val::Px(9.0)),
-                            border_radius: BorderRadius::all(Val::Px(6.0)),
-                            ..default()
-                        },
-                        BackgroundColor(p.surface),
-                        AddStopButton,
-                    ))
-                    .with_child((
-                        Text::new("Stop adding points"),
-                        TextFont { font_size: FontSize::Px(14.0), ..default() },
-                        TextColor(p.text),
-                        AddStopLabel,
-                    ));
-
-                    row.spawn((
-                        Button,
-                        Node {
-                            padding: UiRect::axes(Val::Px(14.0), Val::Px(9.0)),
-                            border_radius: BorderRadius::all(Val::Px(6.0)),
-                            ..default()
-                        },
-                        BackgroundColor(p.surface),
-                        ClearButton,
-                    ))
-                    .with_child((
-                        Text::new("Clear"),
-                        TextFont { font_size: FontSize::Px(14.0), ..default() },
-                        TextColor(p.text),
-                    ));
-                });
-
-                panel
-                    .spawn((
-                        Button,
-                        Node {
-                            padding: UiRect::axes(Val::Px(14.0), Val::Px(9.0)),
-                            border_radius: BorderRadius::all(Val::Px(6.0)),
-                            ..default()
-                        },
-                        BackgroundColor(p.surface),
-                        SetBaseButton,
-                    ))
-                    .with_child((
-                        Text::new("Set base location"),
-                        TextFont { font_size: FontSize::Px(14.0), ..default() },
-                        TextColor(p.text),
-                        SetBaseLabel,
-                    ));
-
-                spawn_vegetation_controls(panel, &vegetation, &p);
-
-                panel
-                    .spawn((
-                        Button,
-                        Node {
-                            width: Val::Px(230.0),
-                            height: Val::Px(48.0),
-                            justify_content: JustifyContent::Center,
-                            align_items: AlignItems::Center,
-                            border_radius: BorderRadius::all(Val::Px(7.0)),
-                            ..default()
-                        },
-                        BackgroundColor(p.accent),
-                        GenerateTerrain,
-                    ))
-                    .with_child((
-                        Text::new("Generate terrain"),
-                        TextFont { font_size: FontSize::Px(18.0), ..default() },
-                        TextColor(p.bg),
-                    ));
-                panel.spawn((
-                    Text::new("Terrain source: Lantmateriet (local)"),
-                    TextFont { font_size: FontSize::Px(14.0), ..default() },
-                    TextColor(p.subtext),
-                    SourceText,
-                ));
-                if let Some(error) = load_error.as_ref() {
-                    panel.spawn((
-                        Text::new(format!("Last attempt failed: {}", error.0)),
-                        TextFont { font_size: FontSize::Px(14.0), ..default() },
-                        TextColor(p.danger),
-                    ));
-                }
+            .with_children(|body| {
+                spawn_map(body, &fonts, &p);
+                spawn_rail(body, &vegetation, load_error.as_deref(), &fonts, &p);
             });
         });
+}
+
+/// Title strip: who we are, what this screen is for, and the one-word state.
+/// Right padding leaves the day/night toggle its corner.
+fn spawn_title_strip(root: &mut ChildSpawnerCommands, p: &Palette) {
+    root.spawn((
+        Node {
+            width: Val::Percent(100.0),
+            height: Val::Px(TOP_RAIL_H),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(12.0),
+            padding: UiRect::new(Val::Px(RAIL_PAD), Val::Px(58.0), Val::ZERO, Val::ZERO),
+            border: UiRect::bottom(Val::Px(HAIRLINE)),
+            flex_shrink: 0.0,
+            ..default()
+        },
+        BackgroundColor(p.panel),
+        BorderColor::all(p.line),
+        UiFill::new(Slot::Panel),
+        UiStroke::new(Slot::Line),
+    ))
+    .with_children(|strip| {
+        strip.spawn((
+            Text::new(tracked("KOLBE")),
+            sans(13.0),
+            TextColor(p.signal),
+            UiInk::new(Slot::Signal),
+        ));
+        strip.spawn((
+            Node { width: Val::Px(HAIRLINE), height: Val::Px(16.0), ..default() },
+            BackgroundColor(p.line),
+            UiFill::new(Slot::Line),
+        ));
+        strip.spawn((
+            Text::new(tracked("MESH AREA DEFINITION")),
+            sans(10.0),
+            TextColor(p.subtext),
+            UiInk::new(Slot::Subtext),
+        ));
+        strip.spawn(Node { flex_grow: 1.0, ..default() });
+
+        // Colors here are rewritten every frame from mission state, so this
+        // one carries no slot tags — see `update_status_text`.
+        strip
+            .spawn((
+                Node {
+                    padding: UiRect::axes(Val::Px(9.0), Val::Px(4.0)),
+                    border: UiRect::all(Val::Px(HAIRLINE)),
+                    ..default()
+                },
+                BorderColor::all(p.line),
+                StatusChip,
+            ))
+            .with_child((
+                Text::new(tracked("NO AREA")),
+                sans(9.0),
+                TextColor(p.subtext),
+                RailField::StatusChip,
+            ));
+    });
+}
+
+/// The map: everything left of the rail. Fills the window, so its pixel size
+/// is whatever is left over — see `track_viewport_size`.
+fn spawn_map(body: &mut ChildSpawnerCommands, fonts: &crate::UiFonts, p: &Palette) {
+    body.spawn((
+        Node {
+            flex_grow: 1.0,
+            height: Val::Percent(100.0),
+            min_width: Val::Px(0.0),
+            overflow: Overflow::clip(),
+            position_type: PositionType::Relative,
+            ..default()
+        },
+        BackgroundColor(p.bg),
+        UiFill::new(Slot::Bg),
+        Interaction::None,
+        RelativeCursorPosition::default(),
+        MapViewport,
+    ))
+    .with_children(|viewport| {
+        // Tiles plus the point/polygon/base overlay, all positioned directly
+        // in screen space from the current `MapView` (see
+        // `lonlat_to_screen_px`) and rebuilt on pan/zoom/point changes rather
+        // than carrying a scale/translate transform of their own.
+        viewport.spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..default()
+            },
+            MapContent,
+            Pickable::IGNORE,
+        ));
+
+        for (right, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
+            spawn_bracket(viewport, right, bottom, p.line);
+        }
+
+        // Centre reticle. Not decoration: the +/- buttons zoom about the
+        // viewport centre, so this marks where that zoom is anchored.
+        viewport
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ))
+            .with_children(|centre| {
+                centre.spawn((
+                    Node {
+                        width: Val::Px(26.0),
+                        height: Val::Px(26.0),
+                        border: UiRect::all(Val::Px(HAIRLINE)),
+                        ..default()
+                    },
+                    BorderColor::all(p.line.with_alpha(0.75)),
+                    UiStroke(Slot::Line, 0.75),
+                    Pickable::IGNORE,
+                ));
+            });
+
+        // Zoom controls. Siblings of `MapContent`, not children, so they hold
+        // their corner instead of panning with the map.
+        viewport
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    right: Val::Px(12.0),
+                    top: Val::Px(12.0),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(4.0),
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ))
+            .with_children(|controls| {
+                spawn_zoom_button(controls, "+", ZoomInButton, fonts, p);
+                spawn_zoom_button(controls, "\u{2212}", ZoomOutButton, fonts, p);
+            });
+
+        // Footer strip: live centre/zoom on the left, and the attribution
+        // OpenStreetMap's tile usage policy requires wherever tiles are shown
+        // (https://operations.osmfoundation.org/policies/tiles/) on the right.
+        viewport
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::ZERO,
+                    right: Val::ZERO,
+                    bottom: Val::ZERO,
+                    height: Val::Px(22.0),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::SpaceBetween,
+                    padding: UiRect::horizontal(Val::Px(10.0)),
+                    border: UiRect::top(Val::Px(HAIRLINE)),
+                    ..default()
+                },
+                BackgroundColor(p.panel.with_alpha(0.9)),
+                BorderColor::all(p.line),
+                UiFill(Slot::Panel, 0.9),
+                UiStroke::new(Slot::Line),
+                Pickable::IGNORE,
+            ))
+            .with_children(|footer| {
+                // Cyan: this is the system reporting where it is looking,
+                // not anything the operator placed.
+                footer.spawn((
+                    Text::new(""),
+                    mono(fonts, 10.0),
+                    TextColor(p.accent),
+                    UiInk::new(Slot::Accent),
+                    MapCoordReadout,
+                ));
+                footer.spawn((
+                    Text::new("\u{00A9} OpenStreetMap contributors"),
+                    sans(9.0),
+                    TextColor(p.subtext),
+                    UiInk::new(Slot::Subtext),
+                ));
+            });
+    });
+}
+
+/// The instrument rail: a scrolling body of sections, and a footer pinned to
+/// the bottom holding the warning line and the one action that leaves here.
+fn spawn_rail(
+    body: &mut ChildSpawnerCommands,
+    vegetation: &VegetationSettings,
+    load_error: Option<&crate::terrain::TerrainLoadError>,
+    fonts: &crate::UiFonts,
+    p: &Palette,
+) {
+    body.spawn((
+        Node {
+            width: Val::Px(RAIL_W),
+            flex_shrink: 0.0,
+            height: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            border: UiRect::left(Val::Px(HAIRLINE)),
+            ..default()
+        },
+        BackgroundColor(p.panel),
+        BorderColor::all(p.line),
+        UiFill::new(Slot::Panel),
+        UiStroke::new(Slot::Line),
+    ))
+    .with_children(|rail| {
+        rail.spawn(Node {
+            flex_grow: 1.0,
+            min_height: Val::Px(0.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(10.0),
+            padding: UiRect::all(Val::Px(RAIL_PAD)),
+            overflow: Overflow::clip_y(),
+            ..default()
+        })
+        .with_children(|col| {
+            spawn_section(col, "AREA DEFINITION", p);
+            col.spawn((
+                Text::new(
+                    "Click the map to mark the outline of the area to cover. \
+                     Three points or more; the smallest enclosing square becomes \
+                     the mesh area.",
+                ),
+                sans(11.0),
+                TextColor(p.subtext),
+                UiInk::new(Slot::Subtext),
+            ));
+
+            // Derived mission figures, boxed together because they are read
+            // as a set: change one vertex and all five move at once.
+            col.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(5.0),
+                    padding: UiRect::axes(Val::Px(12.0), Val::Px(10.0)),
+                    border: UiRect::all(Val::Px(HAIRLINE)),
+                    ..default()
+                },
+                BackgroundColor(p.raised),
+                BorderColor::all(p.line),
+                UiFill::new(Slot::Raised),
+                UiStroke::new(Slot::Line),
+            ))
+            .with_children(|box_| {
+                spawn_readout(box_, "VERTICES", "0", RailField::Vertices, fonts, p);
+                spawn_readout(box_, "SIDE", "—", RailField::Side, fonts, p);
+                spawn_readout(box_, "ROTATION", "—", RailField::Rotation, fonts, p);
+                spawn_readout(box_, "FETCH SPAN", "—", RailField::Fetch, fonts, p);
+                spawn_readout(box_, "AIRFRAMES", "—", RailField::Airframes, fonts, p);
+            });
+
+            col.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(8.0),
+                ..default()
+            })
+            .with_children(|row| {
+                spawn_button(row, "STOP ADDING", ButtonKind::Ghost, AddStopButton, RailField::AddStopLabel, true, p);
+                spawn_button(row, "CLEAR", ButtonKind::Ghost, ClearButton, ClearLabel, false, p);
+            });
+
+            spawn_section(col, "VERTEX LIST", p);
+            col.spawn(Node {
+                display: Display::Grid,
+                grid_template_columns: vec![
+                    RepeatedGridTrack::px(1, 22.0),
+                    RepeatedGridTrack::flex(2, 1.0),
+                    RepeatedGridTrack::px(1, 20.0),
+                ],
+                column_gap: Val::Px(10.0),
+                row_gap: Val::Px(4.0),
+                ..default()
+            })
+            .with_children(|grid| {
+                for h in ["#", "LATITUDE", "LONGITUDE", ""] {
+                    grid.spawn((
+                        Text::new(h),
+                        sans(9.0),
+                        TextColor(p.subtext),
+                        UiInk::new(Slot::Subtext),
+                    ));
+                }
+            })
+            .insert(PointsTableRoot);
+
+            spawn_section(col, "GROUND STATION", p);
+            spawn_readout(col, "POSITION", "NOT SET", RailField::Station, fonts, p);
+            spawn_button(col, "SET LOCATION", ButtonKind::Ghost, SetBaseButton, RailField::SetBaseLabel, true, p);
+
+            spawn_section(col, "TERRAIN", p);
+            spawn_vegetation_controls(col, vegetation, fonts, p);
+            col.spawn((
+                Text::new("Elevation source: Lantmateriet DTM"),
+                sans(10.0),
+                TextColor(p.subtext),
+                UiInk::new(Slot::Subtext),
+            ));
+            if let Some(error) = load_error {
+                col.spawn((
+                    Text::new(format!("Last attempt failed: {}", error.0)),
+                    sans(10.0),
+                    TextColor(p.danger),
+                    UiInk::new(Slot::Danger),
+                ));
+            }
+        });
+
+        // Footer. Pinned below the scrolling body so the launch action never
+        // scrolls out of reach, however many vertices are in the list.
+        rail.spawn((
+            Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(8.0),
+                padding: UiRect::all(Val::Px(RAIL_PAD)),
+                border: UiRect::top(Val::Px(HAIRLINE)),
+                flex_shrink: 0.0,
+                ..default()
+            },
+            BorderColor::all(p.line),
+            UiStroke::new(Slot::Line),
+        ))
+        .with_children(|footer| {
+            footer.spawn((
+                Text::new(""),
+                sans(10.0),
+                TextColor(p.danger),
+                RailField::Warning,
+            ));
+            spawn_button(
+                footer,
+                "GENERATE TERRAIN",
+                ButtonKind::Primary,
+                GenerateTerrain,
+                RailField::GenerateLabel,
+                true,
+                p,
+            );
+        });
+    });
 }
 
 /// Trees toggle plus the density slider it controls.
 fn spawn_vegetation_controls(
     panel: &mut ChildSpawnerCommands,
     vegetation: &VegetationSettings,
-    p: &crate::theme::Palette,
+    fonts: &crate::UiFonts,
+    p: &Palette,
 ) {
-    let (accent, text, subtext) = (p.accent, p.text, p.subtext);
     panel
         .spawn(Node {
             flex_direction: FlexDirection::Column,
@@ -631,29 +1015,49 @@ fn spawn_vegetation_controls(
                 .spawn((
                     Button,
                     Node {
-                        width: Val::Px(230.0),
-                        height: Val::Px(38.0),
-                        justify_content: JustifyContent::Center,
+                        width: Val::Percent(100.0),
+                        height: Val::Px(30.0),
+                        justify_content: JustifyContent::SpaceBetween,
                         align_items: AlignItems::Center,
-                        border_radius: BorderRadius::all(Val::Px(7.0)),
+                        padding: UiRect::horizontal(Val::Px(10.0)),
+                        border: UiRect::all(Val::Px(HAIRLINE)),
                         ..default()
                     },
-                    BackgroundColor(toggle_fill(vegetation.enabled, accent, text)),
+                    BackgroundColor(Color::NONE),
+                    BorderColor::all(p.line),
+                    UiStroke::new(Slot::Line),
                     TreesToggle,
                 ))
                 .with_child((
                     Text::new(trees_text(vegetation)),
-                    TextFont { font_size: FontSize::Px(16.0), ..default() },
-                    TextColor(text),
+                    sans(11.0),
+                    TextColor(toggle_ink(vegetation.enabled, p)),
                     TreesToggleLabel,
+                    Pickable::IGNORE,
                 ));
 
-            group.spawn((
-                Text::new(density_text(vegetation)),
-                TextFont { font_size: FontSize::Px(14.0), ..default() },
-                TextColor(subtext),
-                DensityLabel,
-            ));
+            group
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new("CANOPY DENSITY"),
+                        sans(10.0),
+                        TextColor(p.subtext),
+                        UiInk::new(Slot::Subtext),
+                    ));
+                    row.spawn((
+                        Text::new(density_text(vegetation)),
+                        mono(fonts, 12.0),
+                        TextColor(p.text),
+                        UiInk::new(Slot::Text),
+                        DensityLabel,
+                    ));
+                });
 
             // Headless slider: the widget reports a new value, we own the state.
             // With no `SliderThumb` in the subtree the usable travel is the full
@@ -661,12 +1065,14 @@ fn spawn_vegetation_controls(
             group
                 .spawn((
                     Node {
-                        width: Val::Px(230.0),
-                        height: Val::Px(14.0),
-                        border_radius: BorderRadius::all(Val::Px(7.0)),
+                        width: Val::Percent(100.0),
+                        height: Val::Px(8.0),
+                        border: UiRect::all(Val::Px(HAIRLINE)),
                         ..default()
                     },
-                    BackgroundColor(text.with_alpha(0.15)),
+                    BackgroundColor(Color::NONE),
+                    BorderColor::all(p.line),
+                    UiStroke::new(Slot::Line),
                     Slider { track_click: TrackClick::Snap, ..default() },
                     SliderValue(vegetation.density),
                     SliderRange::new(MIN_DENSITY, MAX_DENSITY),
@@ -685,14 +1091,13 @@ fn spawn_vegetation_controls(
                 .with_child((
                     Node {
                         position_type: PositionType::Absolute,
-                        left: Val::Px(0.0),
-                        top: Val::Px(0.0),
+                        left: Val::ZERO,
+                        top: Val::ZERO,
                         width: Val::Percent(density_fraction(vegetation.density) * 100.0),
                         height: Val::Percent(100.0),
-                        border_radius: BorderRadius::all(Val::Px(7.0)),
                         ..default()
                     },
-                    BackgroundColor(accent),
+                    BackgroundColor(p.signal),
                     // The fill covers the whole track, so it has to be
                     // invisible to the pointer or it eats every click.
                     Pickable::IGNORE,
@@ -719,15 +1124,15 @@ pub fn trees_toggle_interactions(
 fn lonlat_to_screen_px(lon: f64, lat: f64, view: &MapView) -> Vec2 {
     let world = tiles::lonlat_to_world_px(lon, lat, view.zoom);
     let center_world = tiles::lonlat_to_world_px(view.center.0, view.center.1, view.zoom);
-    world - center_world + viewport_size() * 0.5
+    world - center_world + view.size * 0.5
 }
 
 /// Turn a click's viewport-relative `normalized` position into lon/lat at
 /// the current pan/zoom — the inverse of `lonlat_to_screen_px`.
 fn cursor_to_lonlat(normalized: Vec2, view: &MapView) -> (f64, f64) {
-    let screen = (normalized + Vec2::splat(0.5)) * viewport_size();
+    let screen = (normalized + Vec2::splat(0.5)) * view.size;
     let center_world = tiles::lonlat_to_world_px(view.center.0, view.center.1, view.zoom);
-    let world = center_world + screen - viewport_size() * 0.5;
+    let world = center_world + screen - view.size * 0.5;
     tiles::world_px_to_lonlat(world, view.zoom)
 }
 
@@ -853,10 +1258,10 @@ pub fn point_table_and_buttons(
 /// cursor (or the viewport's center, for the +/- buttons) instead of always
 /// re-centering on whatever `view.center` already was.
 fn rezoom_around(view: &mut MapView, anchor_px: Vec2, new_zoom: u8) {
-    let (lon, lat) = cursor_to_lonlat(anchor_px / viewport_size() - Vec2::splat(0.5), view);
+    let (lon, lat) = cursor_to_lonlat(anchor_px / view.size - Vec2::splat(0.5), view);
     view.zoom = new_zoom;
     let anchor_world = tiles::lonlat_to_world_px(lon, lat, new_zoom);
-    let new_center_world = anchor_world - anchor_px + viewport_size() * 0.5;
+    let new_center_world = anchor_world - anchor_px + view.size * 0.5;
     view.center = clamp_to_sweden(tiles::world_px_to_lonlat(new_center_world, new_zoom));
 }
 
@@ -890,7 +1295,7 @@ pub fn pan_zoom(
             // `normalized` is in [-0.5, 0.5] over the viewport's own box —
             // zoom around wherever the cursor actually is.
             if let Some(normalized) = cursor.normalized {
-                let anchor = (normalized + Vec2::splat(0.5)) * viewport_size();
+                let anchor = (normalized + Vec2::splat(0.5)) * view.size;
                 rezoom_around(&mut view, anchor, new_zoom);
             } else {
                 view.zoom = new_zoom;
@@ -914,7 +1319,7 @@ pub fn zoom_buttons(
     zoom_out: Query<&Interaction, (Changed<Interaction>, With<ZoomOutButton>)>,
     mut view: ResMut<MapView>,
 ) {
-    let center = viewport_size() * 0.5;
+    let center = view.size * 0.5;
     if zoom_in.iter().any(|i| *i == Interaction::Pressed) && view.zoom < tiles::MAX_ZOOM {
         let new_zoom = view.zoom + 1;
         rezoom_around(&mut view, center, new_zoom);
@@ -971,6 +1376,13 @@ pub fn sync_map_tiles(
     view: Res<MapView>,
     content_q: Query<Entity, With<MapContent>>,
 ) {
+    // With a stationary map, every tile is already at the correct position.
+    // Avoid issuing ECS layout updates for the full visible tile set every
+    // frame; we only need to revisit it after a pan/zoom or a cache update
+    // (for example, when a real tile replaces a placeholder).
+    if !view.is_changed() && !cache.is_changed() {
+        return;
+    }
     let Ok(content) = content_q.single() else {
         return;
     };
@@ -979,12 +1391,13 @@ pub fn sync_map_tiles(
         for (_, tile) in spawned.entities.drain() {
             commands.entity(tile.entity).despawn();
         }
+        cache.drop_other_zooms(view.zoom);
         spawned.zoom = Some(view.zoom);
     }
 
     let center_world = tiles::lonlat_to_world_px(view.center.0, view.center.1, view.zoom);
-    let top_left_world = center_world - viewport_size() * 0.5;
-    let bottom_right_world = center_world + viewport_size() * 0.5;
+    let top_left_world = center_world - view.size * 0.5;
+    let bottom_right_world = center_world + view.size * 0.5;
 
     // One tile of margin on every side so tiles are already loaded by the
     // time a pan scrolls them into view, not popping in at the edge.
@@ -1091,6 +1504,7 @@ pub fn redraw_polygon(
     net: Res<NetworkArea>,
     base: Res<BasePosition>,
     theme: Res<Theme>,
+    fonts: Res<crate::UiFonts>,
     view: Res<MapView>,
     content_q: Query<Entity, With<MapContent>>,
     visuals: Query<Entity, With<PolygonVisual>>,
@@ -1106,23 +1520,30 @@ pub fn redraw_polygon(
         return;
     };
 
-    let pal = theme.palette();
+    let p = theme.palette();
     let pixels: Vec<Vec2> =
         points.0.iter().map(|&(lat, lon)| lonlat_to_screen_px(lon, lat, &view)).collect();
 
     commands.entity(content).with_children(|parent| {
-        // Polygon edges (only meaningful once the shape is closed, 3+ points).
+        // The outline the operator drew. Dimmer than the square derived from
+        // it: it is the input, not the result.
         if pixels.len() >= 2 {
             let n = pixels.len();
             let edge_count = if pixels.len() >= 3 { n } else { n - 1 };
             for i in 0..edge_count {
-                spawn_edge(parent, pixels[i], pixels[(i + 1) % n], pal.accent, EDGE_THICKNESS);
+                spawn_edge(
+                    parent,
+                    pixels[i],
+                    pixels[(i + 1) % n],
+                    p.accent.with_alpha(0.55),
+                    EDGE_THICKNESS,
+                );
             }
         }
 
-        // The area that's actually going to be fetched (axis-aligned, always
-        // a bit bigger than the rotated square) — drawn first, dimmer, so
-        // the network-area square reads as the "real" selection on top.
+        // The axis-aligned box that actually gets fetched — always a little
+        // bigger than the rotated square. Faintest of the three, since the
+        // operator never chose it directly.
         if net.valid {
             let fetch_px: Vec<Vec2> = net
                 .fetch_corners
@@ -1130,13 +1551,14 @@ pub fn redraw_polygon(
                 .map(|&(lat, lon)| lonlat_to_screen_px(lon, lat, &view))
                 .collect();
             for i in 0..4 {
-                spawn_edge(parent, fetch_px[i], fetch_px[(i + 1) % 4], pal.text.with_alpha(0.35), 1.0);
+                spawn_edge(parent, fetch_px[i], fetch_px[(i + 1) % 4], p.line, HAIRLINE);
             }
         }
 
-        // Bounding square outline — the "network area".
+        // The mesh area itself: the brightest mark on the map, and amber
+        // because it is the operator's own selection.
         if net.valid {
-            let square_color = if net.over_limit { Color::srgb(1.0, 0.35, 0.3) } else { pal.base };
+            let square_color = if net.over_limit { p.danger } else { p.signal };
             let corners_px: Vec<Vec2> = net
                 .corners
                 .iter()
@@ -1145,75 +1567,105 @@ pub fn redraw_polygon(
             for i in 0..4 {
                 spawn_edge(parent, corners_px[i], corners_px[(i + 1) % 4], square_color, SQUARE_THICKNESS);
             }
+            // Side length written on the map, so the number and the shape it
+            // describes are read in one place.
+            let label_at = (corners_px[0] + corners_px[1]) * 0.5;
+            spawn_map_label(
+                parent,
+                label_at + Vec2::new(6.0, -14.0),
+                &format!("{:.2} km", net.side_km),
+                square_color,
+                &fonts,
+            );
         }
 
-        // Base marker.
+        // Ground station: a hollow square with a centre dot — a site marker,
+        // not a dropped pin.
         if let Some((lat, lon)) = base.0 {
-            let p: Vec2 = lonlat_to_screen_px(lon, lat, &view);
-            const BASE_SIZE: f32 = 11.0;
+            let at: Vec2 = lonlat_to_screen_px(lon, lat, &view);
+            const BASE_SIZE: f32 = 13.0;
             parent.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(p.x - BASE_SIZE * 0.5),
-                    top: Val::Px(p.y - BASE_SIZE * 0.5),
+                    left: Val::Px(at.x - BASE_SIZE * 0.5),
+                    top: Val::Px(at.y - BASE_SIZE * 0.5),
                     width: Val::Px(BASE_SIZE),
                     height: Val::Px(BASE_SIZE),
+                    border: UiRect::all(Val::Px(HAIRLINE)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
                     ..default()
                 },
-                BackgroundColor(pal.base),
+                BorderColor::all(p.base),
                 Pickable::IGNORE,
                 PolygonVisual,
                 ZIndex(1),
+                children![(
+                    Node { width: Val::Px(3.0), height: Val::Px(3.0), ..default() },
+                    BackgroundColor(p.base),
+                    Pickable::IGNORE,
+                )],
             ));
-            parent.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(p.x + BASE_SIZE),
-                    top: Val::Px(p.y - 8.0),
-                    ..default()
-                },
-                Text::new("BASE"),
-                TextFont { font_size: FontSize::Px(11.0), ..default() },
-                TextColor(pal.base),
-                Pickable::IGNORE,
-                PolygonVisual,
-                ZIndex(1),
-            ));
+            spawn_map_label(parent, at + Vec2::new(10.0, -6.0), "STATION", p.base, &fonts);
         }
 
-        // Point dots + index labels.
-        for (i, &p) in pixels.iter().enumerate() {
+        // Vertices: small squares, numbered to match the rail's vertex list.
+        for (i, &at) in pixels.iter().enumerate() {
             parent.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(p.x - POINT_DOT_SIZE * 0.5),
-                    top: Val::Px(p.y - POINT_DOT_SIZE * 0.5),
+                    left: Val::Px(at.x - POINT_DOT_SIZE * 0.5),
+                    top: Val::Px(at.y - POINT_DOT_SIZE * 0.5),
                     width: Val::Px(POINT_DOT_SIZE),
                     height: Val::Px(POINT_DOT_SIZE),
-                    border_radius: BorderRadius::MAX,
+                    border: UiRect::all(Val::Px(HAIRLINE)),
                     ..default()
                 },
-                BackgroundColor(pal.drone),
+                BackgroundColor(p.bg.with_alpha(0.85)),
+                BorderColor::all(p.accent),
                 Pickable::IGNORE,
                 PolygonVisual,
                 ZIndex(1),
             ));
-            parent.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(p.x + POINT_DOT_SIZE),
-                    top: Val::Px(p.y - 8.0),
-                    ..default()
-                },
-                Text::new(format!("{}", i + 1)),
-                TextFont { font_size: FontSize::Px(11.0), ..default() },
-                TextColor(pal.text),
-                Pickable::IGNORE,
-                PolygonVisual,
-                ZIndex(1),
-            ));
+            spawn_map_label(
+                parent,
+                at + Vec2::new(POINT_DOT_SIZE * 0.7, -6.0),
+                &format!("{:02}", i + 1),
+                p.accent,
+                &fonts,
+            );
         }
     });
+}
+
+/// A small mono caption pinned at `at`, over a dark plate so it stays legible
+/// against whatever the map happens to be underneath it.
+fn spawn_map_label(
+    parent: &mut ChildSpawnerCommands,
+    at: Vec2,
+    label: &str,
+    color: Color,
+    fonts: &crate::UiFonts,
+) {
+    parent.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(at.x),
+            top: Val::Px(at.y),
+            padding: UiRect::axes(Val::Px(3.0), Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(Color::BLACK.with_alpha(0.55)),
+        Pickable::IGNORE,
+        PolygonVisual,
+        ZIndex(1),
+        children![(
+            Text::new(label.to_string()),
+            mono(fonts, 10.0),
+            TextColor(color),
+            Pickable::IGNORE,
+        )],
+    ));
 }
 
 /// A thin bar Node rotated to connect `from` to `to` (screen-space pixels).
@@ -1241,23 +1693,22 @@ fn spawn_edge(parent: &mut ChildSpawnerCommands, from: Vec2, to: Vec2, color: Co
     ));
 }
 
-/// Rebuild the points table whenever the point list changes.
+/// Rebuild the vertex list whenever the point list changes.
 pub fn redraw_table(
     mut commands: Commands,
     points: Res<PendingPoints>,
     theme: Res<Theme>,
+    fonts: Res<crate::UiFonts>,
     table_q: Query<(Entity, Option<&Children>), With<PointsTableRoot>>,
-    mut last_len: Local<usize>,
 ) {
     if !points.is_changed() && !theme.is_changed() {
         return;
     }
-    *last_len = points.0.len();
 
     let Ok((table_entity, children)) = table_q.single() else {
         return;
     };
-    let pal = theme.palette();
+    let p = theme.palette();
 
     // Keep the 4 header cells (first 4 children); drop the rest.
     if let Some(children) = children {
@@ -1268,101 +1719,227 @@ pub fn redraw_table(
 
     commands.entity(table_entity).with_children(|grid| {
         for (i, &(lat, lon)) in points.0.iter().enumerate() {
+            // The index is amber because it is also drawn on the map next to
+            // the vertex it names — same colour, same number, one mark.
             grid.spawn((
-                Text::new(format!("{}", i + 1)),
-                TextFont { font_size: FontSize::Px(12.0), ..default() },
-                TextColor(pal.text),
+                Text::new(format!("{:02}", i + 1)),
+                mono(&fonts, 11.0),
+                TextColor(p.signal),
+                UiInk::new(Slot::Signal),
             ));
-            grid.spawn((
-                Text::new(format!("{lat:.4}")),
-                TextFont { font_size: FontSize::Px(12.0), ..default() },
-                TextColor(pal.text),
-            ));
-            grid.spawn((
-                Text::new(format!("{lon:.4}")),
-                TextFont { font_size: FontSize::Px(12.0), ..default() },
-                TextColor(pal.text),
-            ));
+            for value in [lat, lon] {
+                grid.spawn((
+                    Text::new(format!("{value:.4}")),
+                    mono(&fonts, 11.0),
+                    TextColor(p.text),
+                    UiInk::new(Slot::Text),
+                ));
+            }
             grid.spawn((
                 Button,
-                Node { padding: UiRect::axes(Val::Px(5.0), Val::Px(1.0)), ..default() },
-                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.08)),
+                Node {
+                    width: Val::Px(16.0),
+                    height: Val::Px(16.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(HAIRLINE)),
+                    ..default()
+                },
+                BackgroundColor(Color::NONE),
+                BorderColor::all(p.line),
+                UiStroke::new(Slot::Line),
                 RemovePointButton(i),
             ))
             .with_child((
-                Text::new("x"),
-                TextFont { font_size: FontSize::Px(11.0), ..default() },
-                TextColor(Color::srgb(1.0, 0.55, 0.5)),
+                Text::new("\u{00D7}"),
+                mono(&fonts, 10.0),
+                TextColor(p.danger),
+                UiInk::new(Slot::Danger),
+                Pickable::IGNORE,
             ));
         }
     });
 }
 
-/// Keeps the summary/warning text, add-stop label, and generate-button
-/// affordance in sync with the current picking state — cheap enough to run
-/// every frame rather than tracking another change signature.
+/// What the mission is currently waiting on. Exactly one of these is true at
+/// any moment, and the title-strip chip shows which — so "why can't I press
+/// Generate" is answerable without reading the rail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MissionState {
+    NeedPoints,
+    OverLimit,
+    PlacingStation,
+    NeedStation,
+    Ready,
+}
+
+impl MissionState {
+    fn current(net: &NetworkArea, mode: PickMode, base: &BasePosition) -> Self {
+        if net.over_limit {
+            Self::OverLimit
+        } else if mode == PickMode::PlacingBase {
+            Self::PlacingStation
+        } else if !net.valid {
+            Self::NeedPoints
+        } else if base.0.is_none() {
+            Self::NeedStation
+        } else {
+            Self::Ready
+        }
+    }
+
+    fn chip(self) -> &'static str {
+        match self {
+            Self::NeedPoints => "NO AREA",
+            Self::OverLimit => "OVER LIMIT",
+            Self::PlacingStation => "PLACING STATION",
+            Self::NeedStation => "NO STATION",
+            Self::Ready => "READY",
+        }
+    }
+
+    /// Cyan means the system is satisfied, amber means it wants something from
+    /// the operator, red means a limit is broken.
+    fn tone(self, p: &Palette) -> Color {
+        match self {
+            Self::OverLimit => p.danger,
+            Self::Ready => p.accent,
+            Self::NeedPoints => p.subtext,
+            Self::PlacingStation | Self::NeedStation => p.signal,
+        }
+    }
+}
+
+/// Drives every live value on the rail plus the title-strip chip. Cheap enough
+/// to run unconditionally rather than tracking a change signature across five
+/// resources.
 pub fn update_status_text(
     points: Res<PendingPoints>,
     net: Res<NetworkArea>,
     mode: Res<PickMode>,
     base: Res<BasePosition>,
     theme: Res<Theme>,
-    mut summary_q: Query<&mut Text, (With<SummaryText>, Without<WarningText>, Without<AddStopLabel>, Without<SetBaseLabel>)>,
-    mut warning_q: Query<&mut Text, (With<WarningText>, Without<SummaryText>, Without<AddStopLabel>, Without<SetBaseLabel>)>,
-    mut label_q: Query<&mut Text, (With<AddStopLabel>, Without<SummaryText>, Without<WarningText>, Without<SetBaseLabel>)>,
-    mut base_label_q: Query<&mut Text, (With<SetBaseLabel>, Without<SummaryText>, Without<WarningText>, Without<AddStopLabel>)>,
-    mut generate_bg: Query<&mut BackgroundColor, With<GenerateTerrain>>,
+    mut fields: Query<(&RailField, &mut Text, &mut TextColor)>,
+    mut chip_border: Query<&mut BorderColor, With<StatusChip>>,
+    mut generate: Query<(&mut BackgroundColor, &mut BorderColor), (With<GenerateTerrain>, Without<StatusChip>)>,
 ) {
-    let pal = theme.palette();
+    let p = theme.palette();
+    let state = MissionState::current(&net, *mode, &base);
+    let dash = "\u{2014}";
+    // The primary action is the only filled control on the screen, so it has
+    // to go quiet the moment it can't be taken — otherwise it reads as the
+    // obvious next step when it isn't.
+    let ready = state == MissionState::Ready;
 
-    if let Ok(mut text) = summary_q.single_mut() {
-        **text = if net.valid {
-            let base_str = match base.0 {
-                Some((lat, lon)) => format!("base at {lat:.4}, {lon:.4}"),
-                None => "base not set".into(),
-            };
-            format!(
-                "{} points  |  {:.1} km square  |  rotated {:.0}°  |  {base_str}",
-                points.0.len(),
-                net.side_km,
-                net.rotation_deg
-            )
-        } else {
-            format!("{} point(s) — need at least {MIN_POINTS} to form an area", points.0.len())
-        };
+    for (field, mut text, mut color) in &mut fields {
+        match field {
+            RailField::Vertices => **text = format!("{}", points.0.len()),
+            RailField::Side => {
+                **text = if net.valid { format!("{:.2} km", net.side_km) } else { dash.into() }
+            }
+            RailField::Rotation => {
+                **text =
+                    if net.valid { format!("{:.0}\u{00B0}", net.rotation_deg) } else { dash.into() }
+            }
+            RailField::Fetch => {
+                **text =
+                    if net.valid { format!("{:.2} km", net.fetch_size_km) } else { dash.into() }
+            }
+            // The same count `world::setup` will actually spawn — the radio
+            // spacing decides it, so the operator can see the cost of an extra
+            // kilometre of area before committing to the fetch.
+            RailField::Airframes => {
+                **text = match airframes_for(&net) {
+                    Some(count) => format!("{count}"),
+                    None => dash.into(),
+                }
+            }
+            RailField::Station => {
+                **text = match base.0 {
+                    Some((lat, lon)) => format!("{lat:.4} {lon:.4}"),
+                    None => "NOT SET".into(),
+                }
+            }
+            RailField::StatusChip => {
+                **text = tracked(state.chip());
+                color.0 = state.tone(&p);
+            }
+            RailField::Warning => {
+                **text = match state {
+                    MissionState::OverLimit => format!(
+                        "Area is {:.1} km across \u{2014} over the {MAX_SIDE_KM:.0} km mesh limit. Move or remove vertices.",
+                        net.side_km
+                    ),
+                    MissionState::PlacingStation => format!(
+                        "Click within {MAX_BASE_DISTANCE_KM:.0} km of the area to place the ground station."
+                    ),
+                    MissionState::NeedStation => {
+                        "Ground station required before terrain can be fetched.".into()
+                    }
+                    MissionState::NeedPoints | MissionState::Ready => String::new(),
+                }
+            }
+            RailField::AddStopLabel => {
+                **text = tracked(match *mode {
+                    PickMode::Adding => "STOP ADDING",
+                    PickMode::Reviewing | PickMode::PlacingBase => "ADD VERTICES",
+                })
+            }
+            RailField::SetBaseLabel => {
+                **text = tracked(match *mode {
+                    PickMode::PlacingBase => "CANCEL",
+                    _ if base.0.is_some() => "MOVE STATION",
+                    _ => "SET LOCATION",
+                })
+            }
+            RailField::GenerateLabel => color.0 = if ready { p.bg } else { p.subtext },
+        }
     }
 
-    if let Ok(mut text) = warning_q.single_mut() {
-        **text = if net.over_limit {
-            format!("Area is {:.1} km — over the {MAX_SIDE_KM:.0} km limit. Remove or move points.", net.side_km)
-        } else if *mode == PickMode::PlacingBase {
-            format!("Click within {MAX_BASE_DISTANCE_KM:.0} km of the network area to place the base.")
-        } else if net.valid && base.0.is_none() {
-            "Set the base location before generating terrain.".into()
-        } else {
-            String::new()
-        };
+    if let Ok(mut border) = chip_border.single_mut() {
+        border.set_all(state.tone(&p));
     }
+    if let Ok((mut bg, mut border)) = generate.single_mut() {
+        bg.0 = if ready { p.signal } else { Color::NONE };
+        border.set_all(if ready { p.signal } else { p.line });
+    }
+}
 
-    if let Ok(mut text) = label_q.single_mut() {
-        **text = match *mode {
-            PickMode::Adding => "Stop adding points".into(),
-            PickMode::Reviewing | PickMode::PlacingBase => "Add points".into(),
-        };
+/// How many airframes the current selection would need, or `None` if there is
+/// no valid area yet. Mirrors `world::setup`: the patrol volume is the area
+/// inset by the boundary margin, and the count falls out of the radio pitch.
+fn airframes_for(net: &NetworkArea) -> Option<usize> {
+    if !net.valid || net.over_limit {
+        return None;
     }
+    let volume = crate::navigation::PatrolVolume::inset(
+        net.side_km as f32,
+        crate::navigation::BOUNDARY_MARGIN_KM,
+    );
+    Some(crate::world::drones_required_for_coverage(&volume))
+}
 
-    if let Ok(mut text) = base_label_q.single_mut() {
-        **text = match *mode {
-            PickMode::PlacingBase => "Cancel placing base".into(),
-            _ if base.0.is_some() => "Change base location".into(),
-            _ => "Set base location".into(),
-        };
+/// Live centre/zoom readout under the map. Separate from the rail's status
+/// pass because it keys off `MapView`, which changes on every pan frame while
+/// none of the mission state does.
+pub fn update_map_readout(
+    view: Res<MapView>,
+    mut readout: Query<&mut Text, With<MapCoordReadout>>,
+) {
+    if !view.is_changed() {
+        return;
     }
-
-    let ready = net.valid && !net.over_limit && base.0.is_some();
-    if let Ok(mut bg) = generate_bg.single_mut() {
-        bg.0 = if ready { pal.accent } else { pal.accent.with_alpha(0.35) };
-    }
+    let Ok(mut text) = readout.single_mut() else {
+        return;
+    };
+    let (lon, lat) = view.center;
+    let (ns, ew) = (if lat >= 0.0 { 'N' } else { 'S' }, if lon >= 0.0 { 'E' } else { 'W' });
+    **text = format!(
+        "CENTRE {:.4}{ns}  {:.4}{ew}   Z{:02}",
+        lat.abs(),
+        lon.abs(),
+        view.zoom
+    );
 }
 
 pub fn generate_terrain(
@@ -1392,34 +1969,33 @@ pub fn generate_terrain(
 /// widget did the changing.
 pub fn refresh_vegetation_controls(
     vegetation: Res<VegetationSettings>,
-    theme: Res<crate::theme::Theme>,
-    mut toggle_labels: Query<&mut Text, With<TreesToggleLabel>>,
+    theme: Res<Theme>,
+    mut toggle_labels: Query<(&mut Text, &mut TextColor), With<TreesToggleLabel>>,
     mut density_labels: Query<&mut Text, (With<DensityLabel>, Without<TreesToggleLabel>)>,
-    mut toggles: Query<&mut BackgroundColor, With<TreesToggle>>,
-    mut fills: Query<(&mut Node, &mut BackgroundColor), (With<DensityFill>, Without<TreesToggle>)>,
+    mut toggles: Query<&mut BorderColor, With<TreesToggle>>,
+    mut fills: Query<(&mut Node, &mut BackgroundColor), With<DensityFill>>,
 ) {
     if !vegetation.is_changed() && !theme.is_changed() {
         return;
     }
     let p = theme.palette();
 
-    for mut label in &mut toggle_labels {
+    for (mut label, mut color) in &mut toggle_labels {
         **label = trees_text(&vegetation);
+        color.0 = toggle_ink(vegetation.enabled, &p);
     }
     for mut label in &mut density_labels {
         **label = density_text(&vegetation);
     }
-    for mut color in &mut toggles {
-        *color = BackgroundColor(toggle_fill(vegetation.enabled, p.accent, p.text));
+    // The toggle is an outline, not a fill: an amber border says "on" without
+    // adding a second filled control to a screen that has exactly one.
+    for mut border in &mut toggles {
+        border.set_all(if vegetation.enabled { p.signal } else { p.line });
     }
     for (mut node, mut color) in &mut fills {
         node.width = Val::Percent(density_fraction(vegetation.density) * 100.0);
         // Dim the fill when the slider drives nothing.
-        *color = BackgroundColor(if vegetation.enabled {
-            p.accent
-        } else {
-            p.accent.with_alpha(0.25)
-        });
+        color.0 = if vegetation.enabled { p.signal } else { p.signal.with_alpha(0.22) };
     }
 }
 
@@ -1432,18 +2008,14 @@ pub fn cleanup(mut commands: Commands, roots: Query<Entity, With<AreaSelectionRo
 
 fn trees_text(vegetation: &VegetationSettings) -> String {
     if vegetation.enabled {
-        "Trees: on  (contours off)".into()
+        "CANOPY  \u{2022}  ON".into()
     } else {
-        "Trees: off  (contours on)".into()
+        "CANOPY  \u{2022}  OFF \u{2014} CONTOURS".into()
     }
 }
 
 fn density_text(vegetation: &VegetationSettings) -> String {
-    if vegetation.enabled {
-        format!("Tree density: {:.2}x", vegetation.density)
-    } else {
-        format!("Tree density: {:.2}x (trees off)", vegetation.density)
-    }
+    format!("{:.2}x", vegetation.density)
 }
 
 /// Slider value as a 0-1 position along its range.
@@ -1451,12 +2023,8 @@ fn density_fraction(density: f32) -> f32 {
     ((density - MIN_DENSITY) / (MAX_DENSITY - MIN_DENSITY)).clamp(0.0, 1.0)
 }
 
-fn toggle_fill(enabled: bool, accent: Color, text: Color) -> Color {
-    if enabled {
-        accent.with_alpha(0.35)
-    } else {
-        text.with_alpha(0.12)
-    }
+fn toggle_ink(enabled: bool, p: &Palette) -> Color {
+    if enabled { p.signal } else { p.subtext }
 }
 
 #[cfg(test)]
@@ -1516,9 +2084,9 @@ mod tests {
     fn screen_lonlat_roundtrip_is_close_at_any_zoom() {
         let cases = [(17.65, 62.15, 5u8), (18.0686, 59.3293, 12), (11.0, 68.0, 9)];
         for (lon, lat, zoom) in cases {
-            let view = MapView { zoom, center: (lon + 0.4, lat - 0.3) };
+            let view = MapView { zoom, center: (lon + 0.4, lat - 0.3), ..default() };
             let screen = lonlat_to_screen_px(lon, lat, &view);
-            let normalized = screen / viewport_size() - Vec2::splat(0.5);
+            let normalized = screen / view.size - Vec2::splat(0.5);
             let (back_lon, back_lat) = cursor_to_lonlat(normalized, &view);
             assert!((back_lon - lon).abs() < 1e-4, "lon {back_lon} vs {lon} at zoom {zoom}");
             assert!((back_lat - lat).abs() < 1e-4, "lat {back_lat} vs {lat} at zoom {zoom}");
@@ -1528,17 +2096,23 @@ mod tests {
     /// Zooming in/out around an anchor point must leave the lon/lat under
     /// that anchor unchanged — the actual fix for "zoom doesn't follow the
     /// cursor" / "goes through the map".
+    ///
+    /// The anchor is deliberately near the viewport centre. `rezoom_around`
+    /// runs its new centre through `clamp_to_sweden`, so an anchor far enough
+    /// out at a shallow zoom resolves to a lon/lat outside Sweden entirely and
+    /// the clamp — correctly — moves it. That is the boundary being enforced,
+    /// not the projection failing.
     #[test]
     fn rezoom_keeps_the_anchor_point_fixed() {
-        let mut view = MapView { zoom: 6, center: (17.65, 62.15) };
-        let anchor = Vec2::new(100.0, 300.0);
+        let mut view = MapView { zoom: 6, center: (17.65, 62.15), ..default() };
+        let anchor = view.size * 0.5 + Vec2::new(120.0, -90.0);
         let (lon_before, lat_before) =
-            cursor_to_lonlat(anchor / viewport_size() - Vec2::splat(0.5), &view);
+            cursor_to_lonlat(anchor / view.size - Vec2::splat(0.5), &view);
 
         rezoom_around(&mut view, anchor, 10);
 
         let (lon_after, lat_after) =
-            cursor_to_lonlat(anchor / viewport_size() - Vec2::splat(0.5), &view);
+            cursor_to_lonlat(anchor / view.size - Vec2::splat(0.5), &view);
         assert!((lon_after - lon_before).abs() < 1e-4);
         assert!((lat_after - lat_before).abs() < 1e-4);
     }
@@ -1571,7 +2145,7 @@ mod tests {
         for zoom in [5u8, 10, 15, 19] {
             // Zoomed in tight on the area's own center, same as a user
             // would do to place the base precisely.
-            let view = MapView { zoom, center: (center_lon, center_lat) };
+            let view = MapView { zoom, center: (center_lon, center_lat), ..default() };
             let (lon, lat) = cursor_to_lonlat(Vec2::ZERO, &view); // dead center of the viewport
             let distance = net.distance_to_square_km(lat, lon);
             assert!(

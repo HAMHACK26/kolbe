@@ -36,7 +36,7 @@
 //! move the airframe, unlike the comms/aiming systems). Once `P` re-appears
 //! in my links, recovery is done and I hold station again.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bevy::prelude::*;
 
@@ -54,9 +54,43 @@ pub const RECOVERY_ARRIVE_KM: f32 = 0.05;
 pub enum RecoveryState {
     #[default]
     Nominal,
-    /// Flying back to `return_to` to re-acquire the partitioned peer
-    /// `lost_peer` (UUID).
+    /// Holding and searching after `lost_peer` drops; once connected again,
+    /// the drone returns to the remembered base-relative vector.
     Recovering { lost_peer: String, return_to: Vec3 },
+}
+
+/// Two one-second samples of the drone's own displacement from the base.
+/// This deliberately stores vectors rather than world positions.
+#[derive(Component, Default)]
+pub struct PositionHistory {
+    elapsed_secs: f32,
+    samples: VecDeque<Vec3>,
+}
+
+impl PositionHistory {
+    fn one_second_ago(&self) -> Option<Vec3> {
+        self.samples.front().copied()
+    }
+}
+
+pub fn record_position_history(
+    time: Res<Time>,
+    bases: Query<&Base>,
+    mut drones: Query<(&Transform, &mut PositionHistory)>,
+) {
+    let Some(base_pos) = bases.iter().next().map(|base| base.position) else {
+        return;
+    };
+    for (transform, mut history) in &mut drones {
+        history.elapsed_secs += time.delta_secs();
+        if history.samples.is_empty() || history.elapsed_secs >= 1.0 {
+            history.elapsed_secs %= 1.0;
+            history.samples.push_back(transform.translation - base_pos);
+            while history.samples.len() > 2 {
+                history.samples.pop_front();
+            }
+        }
+    }
 }
 
 /// Per-peer memory of where this drone was when it last had contact, plus the
@@ -98,12 +132,15 @@ pub fn detect_partitions(
         &DroneUuid,
         &LinkSet,
         &MeshTable,
+        &PositionHistory,
         &mut ContactMemory,
         &mut RecoveryState,
     )>,
     uuids: Query<&DroneUuid>,
+    bases: Query<&Base>,
 ) {
-    for (transform, self_uuid, links, table, mut memory, mut recovery) in &mut drones {
+    let base_pos = bases.iter().next().map(|base| base.position).unwrap_or(Vec3::ZERO);
+    for (transform, self_uuid, links, table, history, mut memory, mut recovery) in &mut drones {
         let self_pos = transform.translation;
 
         // Current linked-peer UUIDs, and refresh last-contact positions.
@@ -123,8 +160,7 @@ pub fn detect_partitions(
         if matches!(*recovery, RecoveryState::Nominal) {
             for peer in dropped {
                 if peer_is_orphaned(table, &peer, &self_uuid.0) {
-                    let return_to =
-                        memory.last_contact_pos.get(&peer).copied().unwrap_or(self_pos);
+                    let return_to = history.one_second_ago().unwrap_or(self_pos - base_pos);
                     *recovery = RecoveryState::Recovering { lost_peer: peer, return_to };
                     break; // handle one partition at a time.
                 }
@@ -148,8 +184,8 @@ pub fn run_recovery(
         &mut DroneKinematics,
         &mut RecoveryState,
     )>,
-    uuids: Query<&DroneUuid>,
-    _bases: Query<&Base>,
+    _uuids: Query<&DroneUuid>,
+    bases: Query<&Base>,
     speed: Res<MovementSpeed>,
 ) {
     let dt = time.delta_secs();
@@ -157,27 +193,25 @@ pub fn run_recovery(
     // moment it enters recovery.
     let limits = speed.limits_km();
 
+    let Some(base_pos) = bases.iter().next().map(|base| base.position) else {
+        return;
+    };
     for (transform, _self_uuid, links, mut kin, mut recovery) in &mut drones {
         let RecoveryState::Recovering { lost_peer, return_to } = &*recovery else {
             continue;
         };
 
-        // Re-acquired? If the lost peer is back in our links, we're done.
-        let reacquired = links
-            .connected
-            .keys()
-            .any(|&e| uuids.get(e).map(|u| u.0 == *lost_peer).unwrap_or(false));
-        if reacquired {
+        // Never fly while disconnected. `seeking` keeps scanning for a peer;
+        // the return leg only starts after that scan restores a live link.
+        if links.connected.is_empty() {
             kin.velocity = Vec3::ZERO;
-            *recovery = RecoveryState::Nominal;
             continue;
         }
 
-        let target = *return_to;
-        // Arrived at the waypoint but still no contact: hold here and let the
-        // seeking spiral keep sweeping from the last-known spot.
+        let target = base_pos + *return_to;
         if (target - transform.translation).length() <= RECOVERY_ARRIVE_KM {
             kin.velocity = Vec3::ZERO;
+            *recovery = RecoveryState::Nominal;
             continue;
         }
 

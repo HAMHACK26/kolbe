@@ -5,6 +5,8 @@ use bevy::{
     prelude::*,
 };
 
+use crate::drone::SelectedDrone;
+
 /// Closest the camera may orbit to its target — 1 meter (world space is km).
 const MIN_RADIUS_KM: f32 = 0.001;
 /// Farthest the camera may orbit from its target.
@@ -26,6 +28,20 @@ pub struct OrbitCamera {
 impl Default for OrbitCamera {
     fn default() -> Self {
         Self { yaw: PI / 4.0, pitch: PI / 4.0, radius: 25.0, drag_total: 0.0, target: Vec3::ZERO }
+    }
+}
+
+/// Keep a selected airframe or base at the orbit centre. The UI popup uses
+/// the same live transform, so the visual focus and its table stay together.
+pub fn focus_selected(
+    selected: Res<SelectedDrone>,
+    selected_transform: Query<&GlobalTransform>,
+    mut orbit: ResMut<OrbitCamera>,
+) {
+    if let Some(entity) = selected.0
+        && let Ok(transform) = selected_transform.get(entity)
+    {
+        orbit.target = transform.translation();
     }
 }
 

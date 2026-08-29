@@ -151,6 +151,7 @@ impl MovementLogic for RustMove {
 /// Clamps altitude to [DRONE_RADIUS, max_altitude_km].
 pub fn apply_velocity(
     time: Res<Time>,
+    terrain: Res<crate::terrain::TerrainHeightMap>,
     mut drones: Query<(&mut Transform, &mut DroneKinematics)>,
 ) {
     let dt = time.delta_secs();
@@ -161,9 +162,11 @@ pub fn apply_velocity(
         kin.flown_velocity = kin.velocity;
         transform.translation += kin.velocity * dt;
 
-        // Keep above ground
-        transform.translation.y = transform.translation.y
-            .max(crate::world::DRONE_RADIUS);
+        // Hard terrain-following floor: navigation targets the same height,
+        // but this protects clearance while the drone crosses a rising ridge.
+        let ground = terrain.height_at(transform.translation.x, transform.translation.z);
+        let (canopy_floor, _) = crate::navigation::PatrolVolume::altitude_band(ground);
+        transform.translation.y = transform.translation.y.max(canopy_floor);
 
         // Update heading from velocity XZ projection
         if kin.velocity.xz().length_squared() > 1e-6 {

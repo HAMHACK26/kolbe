@@ -18,6 +18,10 @@ use bevy::{asset::RenderAssetUsages, log::info, mesh::Indices, prelude::*};
 /// triangle count and vertex memory. Lower it for a thicker forest if your GPU
 /// has the headroom.
 const DEFAULT_SPACING_M: f32 = 40.0;
+/// Upper bound for generated scenery. A target area can be 50 km across;
+/// without this cap, a 40 m lattice would create over 1.5 million trees and
+/// stall both mesh creation and rendering.
+const MAX_TREE_COUNT: f32 = 100_000.0;
 const DEFAULT_TREE_HEIGHT_M: f32 = 50.0;
 /// Fraction of the spacing a tree may wander from its grid slot. Enough to
 /// break up the lattice without opening gaps.
@@ -90,8 +94,13 @@ impl ScatterConfig {
         // square root: twice the density gives each tree half the ground.
         let base = env_f32("TREE_SPACING_M", DEFAULT_SPACING_M, 5.0, 500.0);
         let density = settings.density.clamp(MIN_DENSITY, MAX_DENSITY);
+        let requested_spacing = (base / density.sqrt()).clamp(5.0, 500.0);
+        let area_m2 = (area_size_km * 1_000.0).powi(2);
+        // N ≈ area / spacing², so spacing ≥ sqrt(area / max_n) guarantees
+        // the scenery budget across every selectable target area.
+        let budget_spacing = (area_m2 / MAX_TREE_COUNT).sqrt();
         Self {
-            spacing_m: (base / density.sqrt()).clamp(5.0, 500.0),
+            spacing_m: requested_spacing.max(budget_spacing),
             height_m: env_f32("TREE_HEIGHT_M", DEFAULT_TREE_HEIGHT_M, 1.0, 150.0),
             area_size_km,
         }

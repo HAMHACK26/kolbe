@@ -110,11 +110,18 @@ impl FetchConfig {
             secret: var("SECRET")?,
             search_url: var("STAC_SEARCH_URL")?,
             collection: std::env::var("STAC_COLLECTION").unwrap_or_else(|_| "dtm-cog".to_string()),
+            // The grid is a fixed sample count, so its ground spacing is set
+            // by the chosen area: 513 samples across the 30 km maximum side
+            // (`area::MAX_SIDE_KM`) is 58 m per sample. Drones fly 53 m AGL
+            // (`navigation::MIN_ALTITUDE_AGL_KM`) and take their ground
+            // clearance from `height_at`, so anything coarser than roughly
+            // 60 m interpolates real relief away and makes canopy-following
+            // flight unsafe in a way the simulation cannot see.
             output_size: std::env::var("OUTPUT_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&size: &usize| (2..=1025).contains(&size))
-                .unwrap_or(129),
+                .unwrap_or(513),
             timeout_secs: std::env::var("DEFAULT_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())

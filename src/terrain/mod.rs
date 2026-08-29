@@ -264,9 +264,10 @@ pub fn spawn_mesh(
             crate::SimulationEntity,
         ))
         .observe(
-            |_: On<Pointer<Click>>, orbit: Res<OrbitCamera>, mut selected: ResMut<SelectedDrone>| {
+            |_: On<Pointer<Click>>, mut orbit: ResMut<OrbitCamera>, mut selected: ResMut<SelectedDrone>| {
                 if orbit.drag_total < 5.0 {
                     selected.0 = None;
+                    orbit.target = Vec3::ZERO;
                 }
             },
         );
@@ -339,9 +340,12 @@ pub fn draw_network_area(
         (x, z)
     };
 
-    let fetch_color = Color::srgba(1.0, 1.0, 1.0, 0.25);
-    let square_color = Color::srgb(1.0, 0.85, 0.2);
-    let polygon_color = Color::srgb(0.3, 0.9, 1.0);
+    // Keep the operational target square unmistakable over both terrain and
+    // the 50 m forest canopy. The fetched terrain boundary is intentionally
+    // quieter, while the target square remains the dominant amber outline.
+    let fetch_color = Color::srgba(0.9, 0.95, 1.0, 0.65);
+    let square_color = Color::srgb(1.0, 0.65, 0.05);
+    let polygon_color = Color::srgb(0.1, 0.95, 1.0);
 
     draw_ring(&mut gizmos, &terrain, net.fetch_corners.map(|(lat, lon)| to_local(lat, lon)), fetch_color);
     draw_ring(&mut gizmos, &terrain, net.corners.map(|(lat, lon)| to_local(lat, lon)), square_color);
@@ -356,7 +360,9 @@ fn draw_ring(
     color: Color,
 ) {
     const SEGMENTS: usize = 12;
-    const SURFACE_OFFSET: f32 = 0.02;
+    // 65 m clears the rendered 50 m canopy and the drones' 3 m flight band,
+    // avoiding outlines that disappear inside vegetation.
+    const SURFACE_OFFSET: f32 = 0.065;
 
     let points: Vec<(f32, f32)> = points.into_iter().collect();
     if points.len() < 2 {

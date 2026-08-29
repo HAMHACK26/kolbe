@@ -38,8 +38,35 @@ use theme::Theme;
 /// `Assets<Font>::insert(AssetId::default(), ..)` trick to install its own.
 const DEFAULT_UI_FONT: &[u8] = include_bytes!("../assets/fonts/FiraSans-Bold.ttf");
 
-fn install_default_font(mut fonts: ResMut<Assets<Font>>) {
-    let _ = fonts.insert(AssetId::<Font>::default(), Font::from_bytes(DEFAULT_UI_FONT.to_vec()));
+/// Fira Mono, for numeric readouts. Proportional digits make a live value
+/// jitter sideways as it changes — a lat/lon or a distance that reflows on
+/// every frame is unreadable at a glance, which is the only way these get
+/// read. Monospaced digits hold their column.
+const MONO_UI_FONT: &[u8] = include_bytes!("../assets/fonts/FiraMono-Medium.ttf");
+
+/// Handles for the fonts installed at startup, so widgets can ask for the
+/// mono face by name instead of re-embedding it.
+#[derive(Resource, Clone, Default)]
+pub struct UiFonts {
+    pub mono: Handle<Font>,
+}
+
+/// Install both faces straight into the world, before the app ever runs a
+/// schedule.
+///
+/// Deliberately not a `Startup` system: `bevy_state` inserts `StateTransition`
+/// *before* `PreStartup` (`insert_startup_before(PreStartup, StateTransition)`),
+/// so `OnEnter` for the initial state — which is where the area picker builds
+/// its whole UI — runs ahead of every startup system. A `Startup` system here
+/// would leave that screen's first frame asking for a `UiFonts` that does not
+/// exist yet.
+fn install_fonts(app: &mut App) {
+    let mono = {
+        let mut fonts = app.world_mut().resource_mut::<Assets<Font>>();
+        let _ = fonts.insert(AssetId::<Font>::default(), Font::from_bytes(DEFAULT_UI_FONT.to_vec()));
+        fonts.add(Font::from_bytes(MONO_UI_FONT.to_vec()))
+    };
+    app.insert_resource(UiFonts { mono });
 }
 
 #[derive(States, Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -88,11 +115,11 @@ fn main() {
         return;
     }
 
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Drone Map — 20km × 20km".into(),
-                resolution: (1100u32, 800u32).into(),
+                title: "Kolbe — Mesh Mission Planner".into(),
+                resolution: (1480u32, 940u32).into(),
                 ..default()
             }),
             ..default()
@@ -117,11 +144,17 @@ fn main() {
         .init_resource::<networking::ReconnectRequests>()
         .init_resource::<ui::NetworkTablePanelOpen>()
         .init_resource::<tiles::TileCache>()
-        .add_systems(Startup, (install_default_font, ui::setup_camera, theme::setup_moon))
+        // `OnEnter(AreaSelection)` can run before deferred Startup commands
+        // are applied, while its UI builders require this resource. A default
+        // handle keeps that transition valid; `install_fonts` replaces it
+        // with the embedded mono face during Startup.
+        .init_resource::<UiFonts>()
+        .add_systems(Startup, (ui::setup_camera, theme::setup_moon))
         .add_systems(OnEnter(AppState::AreaSelection), area::setup)
         .add_systems(
             Update,
             (
+                area::track_viewport_size,
                 area::add_point_on_click,
                 area::place_base_on_click,
                 area::point_table_and_buttons,
@@ -133,6 +166,7 @@ fn main() {
                 area::redraw_polygon,
                 area::redraw_table,
                 area::update_status_text,
+                area::update_map_readout,
                 area::trees_toggle_interactions,
                 area::refresh_vegetation_controls,
                 area::generate_terrain,
@@ -158,12 +192,21 @@ fn main() {
                 base::spawn_base,
                 ui::make_camera_overlay,
                 ui::spawn_reset_button,
+                ui::spawn_speed_control,
             )
                 .chain(),
         )
         .add_systems(OnExit(AppState::Simulation), teardown_simulation)
         .add_systems(Update, ui::reset_button_interactions.run_if(in_state(AppState::Simulation)))
-        .add_systems(Update, camera::orbit_camera.run_if(in_state(AppState::Simulation)))
+        .add_systems(Update, ui::update_speed_label.run_if(in_state(AppState::Simulation)))
+        .add_systems(
+            Update,
+            (
+                camera::focus_selected,
+                camera::orbit_camera.after(camera::focus_selected),
+            )
+                .run_if(in_state(AppState::Simulation)),
+        )
         .add_systems(Update, radar::sync_radar_visibility.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
@@ -181,6 +224,7 @@ fn main() {
         .add_systems(OnExit(AppState::Simulation), terrain::cleanup_trees)
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
+        .add_systems(Update, theme::apply_ui_slots)
         .add_systems(Update, theme::apply_loading_theme)
         // Integration runs last in the movement chain: every system that wants
         // a say in this frame's velocity — navigation, recovery, then the
@@ -194,6 +238,12 @@ fn main() {
         )
         .add_systems(
             Update,
+            recovery::record_position_history
+                .after(factories::movement::apply_velocity)
+                .run_if(in_state(AppState::Simulation)),
+        )
+        .add_systems(
+            Update,
             networking::advance_clocks.run_if(in_state(AppState::Simulation)),
         )
         .add_systems(
@@ -202,12 +252,14 @@ fn main() {
                 // Priority reconnection flood first, so a fresh slew-freeze is
                 // visible to the aiming systems this same frame.
                 networking::process_reconnect,
+                networking::bootstrap_base_links,
                 // Aim live links at their ring neighbours, then spiral-search
                 // whichever antenna slots have gone unlinked. Order matters:
                 // seeking only overrides slots tracking left without a lock.
                 tracking::maintain_mesh_antennas,
                 seeking::seek_lost_links,
                 networking::detect_links_and_send_headers,
+                networking::detect_base_links_and_send_headers,
                 networking::route_packets,
                 base::update_base_comms,
                 // Partition detection + recovery run last — they need the
@@ -228,6 +280,8 @@ fn main() {
             )
                 .chain()
                 .run_if(in_state(AppState::Simulation)),
-        )
-        .run();
+        );
+
+    install_fonts(&mut app);
+    app.run();
 }

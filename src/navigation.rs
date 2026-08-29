@@ -36,12 +36,16 @@
 //!     straight at full speed and overshooting, because a real autopilot
 //!     always plans a stopping distance.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 
+use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
-use crate::networking::{DroneClock, LinkSet};
+use crate::networking::{DroneClock, DroneUuid, LinkSet, MeshTable};
 use crate::recovery::RecoveryState;
+use crate::tracking::TrackedPeers;
 
 /// The flight envelope a drone is governed to. All limits are deliberately
 /// modest: real consumer/enterprise quads are electronically governed well
@@ -340,7 +344,8 @@ pub const MIN_SEPARATION_KM: f32 = 1.5;
 ///
 /// This is what sizes the formation. The patrol area is fixed by
 /// [`BOUNDARY_MARGIN_KM`], so the drone *count* is whatever it takes to keep
-/// every neighbour inside this spacing — see [`crate::world::DRONE_COUNT`].
+/// every neighbour inside this spacing — see
+/// [`crate::world::drones_required_for_coverage`].
 pub const MAX_LINK_SPACING_KM: f32 = 3.0;
 
 /// How often a drone re-rolls its drift direction — seconds on *that drone's
@@ -349,16 +354,14 @@ pub const MAX_LINK_SPACING_KM: f32 = 3.0;
 /// lockstep on the same frame.
 pub const DRIFT_REROLL_SECS: f64 = 10.0;
 
-/// Lowest a drone flies, km **above ground level**.
-pub const MIN_ALTITUDE_AGL_KM: f32 = 0.02;
-
-/// Highest a drone flies, km **above ground level** — 60 m.
-///
-/// Above ground, not above sea level: these are low-flying drones that follow
-/// the terrain rather than holding a fixed altitude, so the ceiling has to be
-/// measured from whatever is underneath them at the time. A fixed sea-level
-/// band would put a drone 60 m up over a valley and underground over a ridge.
-pub const MAX_ALTITUDE_AGL_KM: f32 = 0.06;
+/// Height of the uniform rendered canopy, km (50 m).
+pub const TREE_CANOPY_HEIGHT_KM: f32 = 0.050;
+/// Required clearance over the canopy, km (3 m).
+pub const TREE_CLEARANCE_KM: f32 = 0.003;
+/// The flight height is exactly 3 m above the tree canopy.
+pub const MIN_ALTITUDE_AGL_KM: f32 = TREE_CANOPY_HEIGHT_KM + TREE_CLEARANCE_KM;
+/// The fixed canopy-following flight height has no vertical roam band.
+pub const MAX_ALTITUDE_AGL_KM: f32 = MIN_ALTITUDE_AGL_KM;
 
 /// The region the drones are allowed to fly inside — the "target area".
 ///
@@ -385,7 +388,11 @@ impl PatrolVolume {
     /// The volume for a square world `world_size_km` across (centered on the
     /// origin), inset by `margin_km` horizontally.
     pub fn inset(world_size_km: f32, margin_km: f32) -> Self {
-        let half = world_size_km / 2.0 - margin_km;
+        // Keep the selected footprint exactly. For a small target, reduce the
+        // usual edge margin instead of growing the target to a fixed minimum.
+        let size = world_size_km.max(f32::EPSILON);
+        let effective_margin = if size > margin_km * 2.0 { margin_km } else { 0.0 };
+        let half = size * 0.5 - effective_margin;
         Self { min: Vec3::new(-half, 0.0, -half), max: Vec3::new(half, 0.0, half) }
     }
 
@@ -408,7 +415,7 @@ impl PatrolVolume {
     }
 
     /// Is this point inside the footprint *and* within the AGL band over the
-    /// ground beneath it?
+    /// ground beneath it? The band is fixed at canopy height + 3 m.
     pub fn contains(&self, point: Vec3, ground_km: f32) -> bool {
         let (floor, ceiling) = Self::altitude_band(ground_km);
         self.contains_horizontally(point) && point.y >= floor && point.y <= ceiling
@@ -641,6 +648,20 @@ pub fn braking_distance(limits: &FlightLimits) -> f32 {
 /// Drones in recovery are therefore skipped entirely; two systems writing the
 /// same velocity field would fight.
 ///
+/// ## What a drone is allowed to know about the others
+///
+/// Only what came over the radio. Peer positions are read from this drone's
+/// own [`MeshTable`] (gossiped rows, base-relative, as stale as the path they
+/// travelled) and from [`TrackedPeers`] (predicted from headers it received
+/// itself, which wins where both exist). No peer `Transform` is queried, so
+/// there is no way for ground truth to reach the steering.
+///
+/// The consequence is deliberate: a drone that has never heard of another
+/// drone will fly straight at it, and a drone working from a stale row will
+/// deflect around where that peer *was*. That is what a real airframe does.
+/// The 3 m proximity ring in [`crate::avoidance`] runs after this and is the
+/// only thing entitled to see a body the mesh never mentioned.
+///
 /// Like [`crate::recovery::run_recovery`], this only writes
 /// `DroneKinematics::velocity`; `factories::movement::apply_velocity`
 /// integrates it, so there is exactly one integration per frame.
@@ -651,10 +672,22 @@ pub fn drift_navigate(
     speed: Res<MovementSpeed>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
     mut drones: Query<
-        (Entity, &Transform, &DriftVector, &LinkSet, &RecoveryState, &mut DroneKinematics),
+        (
+            &Transform,
+            &DriftVector,
+            &LinkSet,
+            &MeshTable,
+            &TrackedPeers,
+            &RecoveryState,
+            &mut DroneKinematics,
+        ),
         With<Drone>,
     >,
-    positions: Query<(Entity, &Transform), With<Drone>>,
+    // Deliberately *not* `&Transform`: a drone may resolve a peer entity to a
+    // UUID (that is just addressing, it is what its own link set is keyed by),
+    // but it may never read where that peer actually is.
+    uuids: Query<&DroneUuid, With<Drone>>,
+    bases: Query<&Base>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
@@ -666,12 +699,11 @@ pub fn drift_navigate(
     // sailing past it and needing to be shoved back inside.
     let lookahead_km = braking_distance(&limits).max(limits.max_speed_mps * dt);
 
-    // Snapshot first — the loop below needs mutable access to each drone in
-    // turn, so it can't also hold an immutable borrow of the whole set.
-    let others: Vec<(Entity, Vec3)> =
-        positions.iter().map(|(entity, t)| (entity, t.translation)).collect();
+    // Mesh rows carry base-relative positions, so making one absolute needs the
+    // base's own location — which every drone was briefed with at launch.
+    let base_pos = bases.iter().next().map(|b| b.position);
 
-    for (self_entity, transform, drift, links, recovery, mut kin) in &mut drones {
+    for (transform, drift, links, table, tracked, recovery, mut kin) in &mut drones {
         if matches!(recovery, RecoveryState::Recovering { .. }) {
             continue;
         }
@@ -691,11 +723,51 @@ pub fn drift_navigate(
             continue;
         }
 
-        let peers: Vec<Vec3> = others
-            .iter()
-            .filter(|(entity, _)| *entity != self_entity)
-            .map(|(_, pos)| *pos)
-            .collect();
+        // A launch base may sit outside the selected target. A connected
+        // drone must therefore re-enter at the nearest point inside the
+        // patrol footprint, rather than treating an out-of-bounds launch as a
+        // reason to hold forever.
+        if !volume.contains_horizontally(self_pos) {
+            let entry = Vec3::new(
+                self_pos.x.clamp(volume.min.x, volume.max.x),
+                self_pos.y,
+                self_pos.z.clamp(volume.min.z, volume.max.z),
+            );
+            let ground = terrain.height_at(entry.x, entry.z);
+            let (floor, ceiling) = PatrolVolume::altitude_band(ground);
+            let target = Vec3::new(entry.x, entry.y.clamp(floor, ceiling), entry.z);
+            let mut state = DroneState {
+                position: self_pos,
+                velocity: kin.velocity,
+                heading_deg: kin.heading_deg,
+            };
+            navigate(&mut state, target, &limits, dt);
+            kin.velocity = state.velocity;
+            kin.heading_deg = state.heading_deg;
+            continue;
+        }
+
+        // Where this drone *believes* the others are. Comms only: gossiped
+        // lookup-table rows, overridden by the live prediction for any peer
+        // whose header it received itself. Same priority order the antenna
+        // tracking uses (`crate::tracking`) — direct beats relayed, because a
+        // relayed row is as stale as the path it travelled. Nothing here reads
+        // a peer's `Transform`, so a drone the mesh has never mentioned is
+        // simply not steered around; that is the intended blindness, and the
+        // 3 m proximity ring in `crate::avoidance` is what catches it.
+        let mut estimates: HashMap<&str, Vec3> = HashMap::new();
+        if let Some(base) = base_pos {
+            for (uuid, row) in &table.0 {
+                estimates.insert(uuid.as_str(), base + row.location);
+            }
+        }
+        for (&peer_entity, predicted) in &tracked.0 {
+            if let Ok(peer_uuid) = uuids.get(peer_entity) {
+                estimates.insert(peer_uuid.0.as_str(), *predicted);
+            }
+        }
+
+        let peers: Vec<Vec3> = estimates.values().copied().collect();
 
         let heading = deflect_around_peers(self_pos, drift.direction, &peers);
 
@@ -723,11 +795,15 @@ pub fn drift_navigate(
         };
         navigate(&mut state, target, &limits, dt);
 
-        // Don't outrun the antenna. The binding peer is the *closest* one:
-        // the lateral budget grows with range, so the nearest tracked drone is
-        // always the one whose lock breaks first.
-        if let Some(nearest) = peers
-            .iter()
+        // Don't outrun the antenna. Only a peer this drone actually holds a
+        // link to has a lock to break, so the cap binds against its own link
+        // set — not against every row it has heard gossip about. Among those,
+        // the closest is the binding one: the lateral budget grows with range.
+        if let Some(nearest) = links
+            .connected
+            .keys()
+            .filter_map(|&peer_entity| uuids.get(peer_entity).ok())
+            .filter_map(|peer_uuid| estimates.get(peer_uuid.0.as_str()))
             .map(|peer| *peer - self_pos)
             .filter(|offset| offset.length() > f32::EPSILON)
             .min_by(|a, b| a.length().total_cmp(&b.length()))

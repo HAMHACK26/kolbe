@@ -22,6 +22,7 @@ use crate::{
     camera::OrbitCamera,
     drone::{Drone, SelectedDrone, make_antenna},
     factories::{movement::DroneKinematics, track::Track},
+    networking::{BootstrapBaseLinks, NetworkingBundle},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     theme::ThemeRole,
     world::DRONE_RADIUS,
@@ -33,6 +34,8 @@ use crate::{
 /// physical footprint — [`crate::avoidance`] derives the base's bounding
 /// radius from it so drones keep clear of the structure.
 pub const BASE_BOX_SIZE_KM: f32 = 0.3;
+/// Visual marker size, kept separate from the operational exclusion footprint.
+pub const BASE_RENDER_SIZE_KM: f32 = BASE_BOX_SIZE_KM / 4.0;
 
 /// Marks the ground control station entity.
 #[derive(Component)]
@@ -125,7 +128,7 @@ pub fn spawn_base(
     let base_entity = commands
         .spawn((
         // Visual: yellow box
-        Mesh3d(meshes.add(Cuboid::from_length(BASE_BOX_SIZE_KM))),
+        Mesh3d(meshes.add(Cuboid::from_length(BASE_RENDER_SIZE_KM))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: pal.base,
             emissive: LinearRgba::new(1.5, 1.5, 0.0, 1.0),
@@ -138,6 +141,11 @@ pub fn spawn_base(
             antennas: antennas.clone(),
         },
         BaseNetworkState::default(),
+        // The station is a static mesh node: same header/table protocol as a
+        // drone, but five antenna slots and no flight systems.
+        NetworkingBundle::random(usize::MAX),
+        BootstrapBaseLinks,
+        DroneKinematics::default(),
         ThemeRole::BaseMarker,
         crate::SimulationEntity,
     ))
@@ -160,14 +168,14 @@ pub fn spawn_base(
         cull_mode: None,
         ..default()
     });
-    for antenna in &antennas {
+    for (antenna_index, antenna) in antennas.iter().enumerate() {
         commands.spawn((
             Mesh3d(cone_mesh_for(antenna, &mut meshes)),
             MeshMaterial3d(cone_mat.clone()),
             // Bases have no heading — 0.0 leaves azimuth effectively world-frame.
             cone_transform_for(antenna, 0.0, pos),
             Visibility::Hidden,
-            RadarCone { drone_entity: base_entity },
+            RadarCone { drone_entity: base_entity, antenna_index },
             ThemeRole::BaseCone,
             crate::SimulationEntity,
         ));

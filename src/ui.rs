@@ -2,9 +2,10 @@ use bevy::{prelude::*, window::PrimaryWindow};
 
 use crate::{
     antenna::Antenna,
-    base::Base,
+    base::{Base, BaseNetworkState},
     drone::{Drone, DroneType, SelectedDrone},
     networking::MeshTable,
+    navigation::{MAX_MOVEMENT_SPEED, MIN_MOVEMENT_SPEED, MOVEMENT_SPEED_STEP, MovementSpeed},
     theme::Theme,
 };
 
@@ -90,6 +91,117 @@ pub struct NetworkTablePanelText;
 #[derive(Resource, Default)]
 pub struct NetworkTablePanelOpen(pub bool);
 
+#[derive(Component)]
+pub struct SpeedLabel;
+
+#[derive(Component)]
+pub struct SpeedFill;
+
+const SPEED_SLIDER_WIDTH_PX: f32 = 120.0;
+
+fn adjust_speed(speed: &mut MovementSpeed, delta: f32) {
+    speed.0 = ((speed.0 + delta).clamp(MIN_MOVEMENT_SPEED, MAX_MOVEMENT_SPEED)
+        / MOVEMENT_SPEED_STEP)
+        .round()
+        * MOVEMENT_SPEED_STEP;
+}
+
+/// Compact flight-speed control for the live simulation.
+pub fn spawn_speed_control(mut commands: Commands, theme: Res<Theme>) {
+    let pal = theme.palette();
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(16.0),
+                bottom: Val::Px(16.0),
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(7.0)),
+                column_gap: Val::Px(8.0),
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(pal.surface.with_alpha(0.88)),
+            crate::SimulationEntity,
+        ))
+        .with_children(|p| {
+            p.spawn((Text::new("Drone speed"), TextFont { font_size: FontSize::Px(12.0), ..default() }, TextColor(pal.subtext)));
+            for delta in [-MOVEMENT_SPEED_STEP] {
+                p.spawn((
+                    Button,
+                    Node { padding: UiRect::axes(Val::Px(7.0), Val::Px(2.0)), ..default() },
+                    BackgroundColor(pal.text.with_alpha(0.12)),
+                ))
+                .observe(move |mut event: On<Pointer<Click>>, mut speed: ResMut<MovementSpeed>| {
+                    event.propagate(false);
+                    adjust_speed(&mut speed, delta);
+                })
+                .with_child((
+                    Text::new(if delta.is_sign_negative() { "−" } else { "+" }),
+                    TextFont { font_size: FontSize::Px(16.0), ..default() },
+                    TextColor(pal.text),
+                ));
+            }
+            // The draggable track covers the full 1×–4× flight envelope.
+            p.spawn((
+                Button,
+                Node {
+                    width: Val::Px(SPEED_SLIDER_WIDTH_PX),
+                    height: Val::Px(8.0),
+                    padding: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BackgroundColor(pal.text.with_alpha(0.18)),
+            ))
+            .observe(|mut event: On<Pointer<Drag>>, mut speed: ResMut<MovementSpeed>| {
+                event.propagate(false);
+                let span = MAX_MOVEMENT_SPEED - MIN_MOVEMENT_SPEED;
+                adjust_speed(&mut speed, event.delta.x / SPEED_SLIDER_WIDTH_PX * span);
+            })
+            .with_child((
+                Node {
+                    width: Val::Percent(0.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                BackgroundColor(pal.accent),
+                Pickable::IGNORE,
+                SpeedFill,
+            ));
+            for delta in [MOVEMENT_SPEED_STEP] {
+                p.spawn((
+                    Button,
+                    Node { padding: UiRect::axes(Val::Px(7.0), Val::Px(2.0)), ..default() },
+                    BackgroundColor(pal.text.with_alpha(0.12)),
+                ))
+                .observe(move |mut event: On<Pointer<Click>>, mut speed: ResMut<MovementSpeed>| {
+                    event.propagate(false);
+                    adjust_speed(&mut speed, delta);
+                })
+                .with_child((
+                    Text::new("+"),
+                    TextFont { font_size: FontSize::Px(16.0), ..default() },
+                    TextColor(pal.text),
+                ));
+            }
+            p.spawn((Text::new("1.0×"), TextFont { font_size: FontSize::Px(13.0), ..default() }, TextColor(pal.accent), SpeedLabel));
+        });
+}
+
+pub fn update_speed_label(
+    speed: Res<MovementSpeed>,
+    mut labels: Query<&mut Text, With<SpeedLabel>>,
+    mut fills: Query<&mut Node, With<SpeedFill>>,
+) {
+    if !speed.is_changed() { return; }
+    for mut label in &mut labels {
+        **label = format!("{:.1}×", speed.0);
+    }
+    let percent = (speed.0 - MIN_MOVEMENT_SPEED) / (MAX_MOVEMENT_SPEED - MIN_MOVEMENT_SPEED) * 100.0;
+    for mut fill in &mut fills {
+        fill.width = Val::Percent(percent);
+    }
+}
+
 // All antennas share the same hardware — only the pointing angles differ,
 // and those angles are all the drone can know.
 const COLS: usize = 3;
@@ -100,7 +212,8 @@ pub fn update_popup_position(
     mut commands: Commands,
     selected: Res<SelectedDrone>,
     drones: Query<(&GlobalTransform, &Drone)>,
-    bases: Query<(&GlobalTransform, &Base)>,
+    bases: Query<(Entity, &GlobalTransform, &Base)>,
+    base_networks: Query<&BaseNetworkState>,
     camera_q: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     _windows: Query<&Window, With<PrimaryWindow>>,
     mut popup_q: Query<(&mut Node, &mut Visibility), With<InfoPopup>>,
@@ -176,10 +289,10 @@ pub fn update_popup_position(
             drone_title(drone),
             antenna_rows(&drone.antennas),
         )
-    } else if let Ok((gt, base)) = bases.get(entity) {
+    } else if let Ok((base_entity, gt, base)) = bases.get(entity) {
         (
             gt.translation(),
-            base_title(base),
+            base_title(base, base_networks.get(base_entity).map_or(0, |state| state.reachable_drones.len())),
             antenna_rows(&base.antennas),
         )
     } else {
@@ -268,8 +381,9 @@ fn drone_title(drone: &Drone) -> String {
     format!("{}  [{}]  {} ant", drone.id, type_str, drone.antennas.len())
 }
 
-fn base_title(base: &Base) -> String {
-    format!("{}  [Base]  {} connections", base.id, base.antennas.len())
+fn base_title(base: &Base, connections: usize) -> String {
+    let connection_label = if connections == 1 { "connection" } else { "connections" };
+    format!("{}  [Base]  {} antennas  ·  {connections} {connection_label}", base.id, base.antennas.len())
 }
 
 fn antenna_rows(antennas: &[Antenna]) -> Vec<[String; COLS]> {
