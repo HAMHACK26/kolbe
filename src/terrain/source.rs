@@ -1023,3 +1023,34 @@ pub fn fetch_terrain(
     set_phase(progress, "Terrain ready", 1, 1, PHASE_TERRAIN_READY);
     Ok(TerrainGrid { heights_m: heights, size: config.output_size })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live end-to-end fetch. Network + .env required, so ignored by default.
+    /// Run: `cargo test --lib terrain::source::tests::smoke_fetch -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn smoke_fetch_stockholm() {
+        let progress: ProgressHandle = Arc::new(Mutex::new(Progress::default()));
+        let grid = fetch_terrain(59.3293, 18.0686, 10.0, &progress).expect("fetch");
+        let finite: Vec<f32> = grid.heights_m.iter().copied().filter(|v| v.is_finite()).collect();
+        let covered = finite.len();
+        let max = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!(
+            "grid {}x{}, covered {}/{}, max relief {:.1} m",
+            grid.size,
+            grid.size,
+            covered,
+            grid.heights_m.len(),
+            max
+        );
+        assert_eq!(grid.heights_m.len(), grid.size * grid.size);
+        // Every cell is finite (gaps filled with 0) and Stockholm relief is
+        // gentle — a correct decode lands well under 200 m, garbage would not.
+        assert_eq!(covered, grid.heights_m.len());
+        assert!(max > 1.0, "terrain is suspiciously flat: {max}");
+        assert!(max < 200.0, "relief implausible — decode likely wrong: {max}");
+    }
+}

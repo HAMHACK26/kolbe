@@ -143,3 +143,68 @@ pub fn min_bounding_square(points: &[LocalPoint]) -> Option<BoundingSquare> {
         rotation,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pt(x: f64, z: f64) -> LocalPoint {
+        LocalPoint { x_km: x, z_km: z }
+    }
+
+    #[test]
+    fn projection_round_trips() {
+        let (ref_lon, ref_lat) = (18.0, 59.0);
+        let (lon, lat) = (18.5, 59.3);
+        let local = project(ref_lon, ref_lat, lon, lat);
+        let (lon2, lat2) = unproject(ref_lon, ref_lat, local);
+        assert!((lon - lon2).abs() < 1e-9);
+        assert!((lat - lat2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn convex_hull_of_axis_aligned_square_is_its_corners() {
+        let points = [pt(0.0, 0.0), pt(10.0, 0.0), pt(10.0, 10.0), pt(0.0, 10.0), pt(5.0, 5.0)];
+        let hull = convex_hull(&points);
+        assert_eq!(hull.len(), 4);
+    }
+
+    #[test]
+    fn bounding_square_of_axis_aligned_square_has_zero_or_right_angle_rotation() {
+        let points = [pt(-5.0, -5.0), pt(5.0, -5.0), pt(5.0, 5.0), pt(-5.0, 5.0)];
+        let square = min_bounding_square(&points).unwrap();
+        assert!((square.side_km() - 10.0).abs() < 0.05);
+        assert!(square.center.x_km.abs() < 0.05 && square.center.z_km.abs() < 0.05);
+    }
+
+    #[test]
+    fn bounding_square_of_diamond_is_rotated_45_degrees_smaller_than_axis_aligned() {
+        // A diamond with diagonal 10 needs only a ~7.07 side square if rotated
+        // 45°, versus a 10-side square if axis-aligned.
+        let points = [pt(5.0, 0.0), pt(0.0, 5.0), pt(-5.0, 0.0), pt(0.0, -5.0)];
+        let square = min_bounding_square(&points).unwrap();
+        assert!(square.side_km() < 7.2, "side_km={}", square.side_km());
+    }
+
+    #[test]
+    fn single_point_has_a_zero_size_square() {
+        let square = min_bounding_square(&[pt(1.0, 1.0)]).unwrap();
+        assert!(square.side_km() < 1e-6);
+    }
+
+    #[test]
+    fn no_points_returns_none() {
+        assert!(min_bounding_square(&[]).is_none());
+    }
+
+    #[test]
+    fn corners_are_all_half_side_from_center() {
+        let square = BoundingSquare { center: pt(2.0, 3.0), half_side_km: 4.0, rotation: 0.3 };
+        for corner in square.corners() {
+            let dx = corner.x_km - square.center.x_km;
+            let dz = corner.z_km - square.center.z_km;
+            let dist = (dx * dx + dz * dz).sqrt();
+            assert!((dist - 4.0 * std::f64::consts::SQRT_2).abs() < 1e-9);
+        }
+    }
+}

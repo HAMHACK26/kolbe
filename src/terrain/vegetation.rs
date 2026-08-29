@@ -11,6 +11,8 @@
 //! parallax, not a forestry model.
 
 use super::TerrainHeightMap;
+use std::collections::HashMap;
+
 use bevy::{asset::RenderAssetUsages, log::info, mesh::Indices, prelude::*};
 
 /// Distance between trees before jitter, in metres. The dominant cost knob:
@@ -50,6 +52,50 @@ pub struct TreeInstance {
 
 #[derive(Component)]
 pub struct TerrainTree;
+
+/// Compact canopy data used by radio line-of-sight checks. Rendering remains
+/// chunked, while radio queries use this spatial index instead of a mesh read.
+#[derive(Clone, Copy)]
+pub struct RadioCanopy {
+    pub position: Vec3,
+    pub radius_km: f32,
+}
+
+#[derive(Resource, Default)]
+pub struct RadioCanopies(pub HashMap<(i32, i32), Vec<RadioCanopy>>);
+
+const RADIO_CELL_KM: f32 = 0.05;
+
+impl RadioCanopies {
+    fn cell(position: Vec3) -> (i32, i32) {
+        ((position.x / RADIO_CELL_KM).floor() as i32, (position.z / RADIO_CELL_KM).floor() as i32)
+    }
+
+    pub fn blocks_path(&self, from: Vec3, to: Vec3) -> bool {
+        let horizontal = Vec2::new(to.x - from.x, to.z - from.z).length();
+        let steps = (horizontal / (RADIO_CELL_KM * 0.5)).ceil().max(1.0) as usize;
+        for step in 0..=steps {
+            let point = from.lerp(to, step as f32 / steps as f32);
+            let (cx, cz) = Self::cell(point);
+            for x in cx - 1..=cx + 1 {
+                for z in cz - 1..=cz + 1 {
+                    let Some(canopies) = self.0.get(&(x, z)) else { continue };
+                    for canopy in canopies {
+                        let horizontal_gap = Vec2::new(
+                            point.x - canopy.position.x,
+                            point.z - canopy.position.z,
+                        )
+                        .length();
+                        if horizontal_gap <= canopy.radius_km && point.y <= canopy.position.y {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
 
 /// Density multipliers the area-selection slider offers, relative to
 /// `DEFAULT_SPACING_M`. The ceiling is where a 20 km area stops fitting
@@ -241,6 +287,7 @@ pub fn spawn_trees(
         .collect();
 
     let mut planted = 0usize;
+    let mut radio_canopies = RadioCanopies::default();
     for tree in candidates {
         if !is_land(&height_map, tree.x_km, tree.z_km) {
             continue;
@@ -258,6 +305,15 @@ pub fn spawn_trees(
         let yaw = hash_to_unit(key.0, key.1, 3) * std::f32::consts::TAU;
         let scale = 0.8 + hash_to_unit(key.0, key.1, 4) * 0.45;
         let ground = height_map.height_at(tree.x_km, tree.z_km);
+        let canopy = RadioCanopy {
+            position: Vec3::new(tree.x_km, ground + tree.height_m / 1_000.0 * scale, tree.z_km),
+            radius_km: tree.crown_radius_m / 1_000.0 * scale,
+        };
+        radio_canopies
+            .0
+            .entry(RadioCanopies::cell(canopy.position))
+            .or_default()
+            .push(canopy);
         builders[chunk_z * chunks_per_side + chunk_x].push_tree(
             Vec3::new(tree.x_km, ground, tree.z_km) - origin,
             tree.height_m / 1_000.0 * scale,
@@ -301,12 +357,14 @@ pub fn spawn_trees(
         config.height_m,
         config.spacing_m
     );
+    commands.insert_resource(radio_canopies);
 }
 
 pub fn cleanup_trees(mut commands: Commands, trees: Query<Entity, With<TerrainTree>>) {
     for entity in &trees {
         commands.entity(entity).despawn();
     }
+    commands.remove_resource::<RadioCanopies>();
 }
 
 fn vegetation_enabled() -> bool {

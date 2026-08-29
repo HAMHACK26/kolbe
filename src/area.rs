@@ -1458,3 +1458,126 @@ fn toggle_fill(enabled: bool, accent: Color, text: Color) -> Color {
         text.with_alpha(0.12)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bbox_contains_selected_center() {
+        let area = ScenarioArea::default();
+        let [west, south, east, north] = area.wgs84_bbox();
+        assert!(west < area.longitude && area.longitude < east);
+        assert!(south < area.latitude && area.latitude < north);
+    }
+
+    #[test]
+    fn bbox_represents_requested_square_size() {
+        let area = ScenarioArea::default();
+        let [west, south, east, north] = area.wgs84_bbox();
+        let north_south_km = (north - south) * 110.574;
+        let east_west_km =
+            (east - west) * 111.320 * area.latitude.to_radians().cos();
+
+        assert!((north_south_km - area.size_km as f64).abs() < 0.001);
+        assert!((east_west_km - area.size_km as f64).abs() < 0.001);
+    }
+
+    #[test]
+    fn fewer_than_3_points_is_invalid() {
+        let net = recompute_network_area(&[(59.0, 18.0), (59.1, 18.1)]);
+        assert!(!net.valid);
+    }
+
+    #[test]
+    fn a_triangle_produces_a_valid_covering_square() {
+        let net = recompute_network_area(&[(59.0, 18.0), (59.05, 18.05), (58.98, 18.06)]);
+        assert!(net.valid);
+        assert!(net.side_km > 0.0);
+        assert!(net.fetch_size_km as f64 >= net.side_km);
+        assert!(!net.over_limit);
+    }
+
+    #[test]
+    fn a_huge_triangle_is_over_the_limit() {
+        let net = recompute_network_area(&[(58.0, 17.0), (60.0, 19.0), (58.0, 19.0)]);
+        assert!(net.valid);
+        assert!(net.over_limit);
+    }
+
+    /// `lonlat_to_screen_px`/`cursor_to_lonlat` must invert each other at any
+    /// pan/zoom, or clicks stop landing where they visually appear to (the
+    /// bug that made point-adding and base-placement feel broken once zoom
+    /// started working). Tolerance is ~11 m (1e-4°) at Sweden's latitude —
+    /// not exact, since the round trip goes through `Vec2` (f32) pixel
+    /// coordinates like the real UI does, but well inside what matters for
+    /// clicking a point on a map (`MAX_BASE_DISTANCE_KM` is 3 km).
+    #[test]
+    fn screen_lonlat_roundtrip_is_close_at_any_zoom() {
+        let cases = [(17.65, 62.15, 5u8), (18.0686, 59.3293, 12), (11.0, 68.0, 9)];
+        for (lon, lat, zoom) in cases {
+            let view = MapView { zoom, center: (lon + 0.4, lat - 0.3) };
+            let screen = lonlat_to_screen_px(lon, lat, &view);
+            let normalized = screen / viewport_size() - Vec2::splat(0.5);
+            let (back_lon, back_lat) = cursor_to_lonlat(normalized, &view);
+            assert!((back_lon - lon).abs() < 1e-4, "lon {back_lon} vs {lon} at zoom {zoom}");
+            assert!((back_lat - lat).abs() < 1e-4, "lat {back_lat} vs {lat} at zoom {zoom}");
+        }
+    }
+
+    /// Zooming in/out around an anchor point must leave the lon/lat under
+    /// that anchor unchanged — the actual fix for "zoom doesn't follow the
+    /// cursor" / "goes through the map".
+    #[test]
+    fn rezoom_keeps_the_anchor_point_fixed() {
+        let mut view = MapView { zoom: 6, center: (17.65, 62.15) };
+        let anchor = Vec2::new(100.0, 300.0);
+        let (lon_before, lat_before) =
+            cursor_to_lonlat(anchor / viewport_size() - Vec2::splat(0.5), &view);
+
+        rezoom_around(&mut view, anchor, 10);
+
+        let (lon_after, lat_after) =
+            cursor_to_lonlat(anchor / viewport_size() - Vec2::splat(0.5), &view);
+        assert!((lon_after - lon_before).abs() < 1e-4);
+        assert!((lat_after - lat_before).abs() < 1e-4);
+    }
+
+    /// End-to-end simulation of `place_base_on_click`'s actual condition:
+    /// pick 3 points, compute the network area exactly like
+    /// `recompute_area_on_change` does, then click the square's own center
+    /// at a deeply-zoomed-in view (placing the base usually happens zoomed
+    /// in for precision, per `point_table_and_buttons`'s comment) — the
+    /// resulting `distance_to_square_km` must clear
+    /// `MAX_BASE_DISTANCE_KM`, or `place_base_on_click` would reject a click
+    /// that's visually dead-center on the area.
+    #[test]
+    fn clicking_the_network_areas_own_center_places_the_base() {
+        let points = [(59.0, 18.0), (59.05, 18.05), (58.98, 18.06)];
+        let net = recompute_network_area(&points);
+        assert!(net.valid, "test setup: 3 points should form a valid area");
+
+        // Ground truth independent of `distance_to_square_km`'s own
+        // (lon, lat)-vs-(lat, lon) convention: `center` must land near the
+        // picked points' own coordinates, not off by a lat/lon swap. This
+        // is what would have caught the real bug — that test previously
+        // destructured `net.center` the same wrong way `distance_to_square_km`
+        // did internally, so both sides shared the same mistake and it
+        // passed anyway.
+        let (center_lon, center_lat) = net.center;
+        assert!((center_lon - 18.03).abs() < 0.5, "center_lon {center_lon} looks swapped with lat");
+        assert!((center_lat - 59.0).abs() < 0.5, "center_lat {center_lat} looks swapped with lon");
+
+        for zoom in [5u8, 10, 15, 19] {
+            // Zoomed in tight on the area's own center, same as a user
+            // would do to place the base precisely.
+            let view = MapView { zoom, center: (center_lon, center_lat) };
+            let (lon, lat) = cursor_to_lonlat(Vec2::ZERO, &view); // dead center of the viewport
+            let distance = net.distance_to_square_km(lat, lon);
+            assert!(
+                distance <= MAX_BASE_DISTANCE_KM,
+                "clicking the area's own center at zoom {zoom} landed {distance:.4} km away — should be ~0"
+            );
+        }
+    }
+}

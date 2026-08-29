@@ -48,8 +48,9 @@ pub struct TerrainHeightMap {
 
 impl TerrainHeightMap {
     /// Side length (km) of the fetched terrain — the actual requested
-    /// network-area size. The drone formation and the grid overlay are both
-    /// sized from this rather than any fixed world extent.
+    /// network-area size, which can differ a lot from the fixed
+    /// `world::WORLD_SIZE` (20km) the hand-placed drone ring and grid
+    /// overlay are scaled from.
     pub fn size_km(&self) -> f32 {
         self.size_km
     }
@@ -74,6 +75,18 @@ impl TerrainHeightMap {
     }
 }
 
+/// Whether the straight radio path intersects the sampled terrain.  Antenna
+/// endpoints are included in world-space km coordinates.
+pub fn terrain_blocks_radio_path(terrain: &TerrainHeightMap, from: Vec3, to: Vec3) -> bool {
+    const SAMPLE_SPACING_KM: f32 = 0.025;
+    let distance = from.distance(to);
+    let samples = (distance / SAMPLE_SPACING_KM).ceil().max(1.0) as usize;
+    (1..samples).any(|step| {
+        let point = from.lerp(to, step as f32 / samples as f32);
+        point.y <= terrain.height_at(point.x, point.z)
+    })
+}
+
 struct TerrainData {
     height_map: TerrainHeightMap,
 }
@@ -86,6 +99,12 @@ pub struct TerrainLoadError(pub String);
 
 #[derive(Component)]
 pub(crate) struct LoadingRoot;
+
+#[derive(Component)]
+pub(crate) struct LoadingPanel;
+
+#[derive(Component)]
+pub(crate) struct LoadingEyebrow;
 
 #[derive(Component)]
 pub(crate) struct LoadingHeading;
@@ -128,45 +147,79 @@ pub fn start_loading(
             LoadingRoot,
         ))
         .with_children(|root| {
-            root.spawn((
-                Text::new(format!("Loading terrain around {}", area.name)),
-                TextFont {
-                    font_size: FontSize::Px(30.0),
-                    ..default()
-                },
-                TextColor(p.text),
-                LoadingHeading,
-            ));
-            root.spawn((
-                Text::new("Querying Lantmateriet and building the height map..."),
-                TextFont {
-                    font_size: FontSize::Px(17.0),
-                    ..default()
-                },
-                TextColor(p.subtext),
-                LoadingStatus,
-            ));
-            root.spawn((
-                Node {
-                    width: Val::Px(420.0),
-                    height: Val::Px(18.0),
-                    border_radius: BorderRadius::all(Val::Px(9.0)),
-                    padding: UiRect::all(Val::Px(2.0)),
-                    ..default()
-                },
-                BackgroundColor(p.surface),
-                LoadingTrack,
-            ))
-            .with_child((
-                Node {
-                    width: Val::Percent(2.0),
-                    height: Val::Percent(100.0),
-                    border_radius: BorderRadius::all(Val::Px(7.0)),
-                    ..default()
-                },
-                BackgroundColor(p.accent),
-                LoadingBarFill,
-            ));
+            root
+                .spawn((
+                    Node {
+                        width: Val::Px(560.0),
+                        max_width: Val::Percent(88.0),
+                        padding: UiRect::all(Val::Px(32.0)),
+                        border_radius: BorderRadius::all(Val::Px(12.0)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(14.0),
+                        ..default()
+                    },
+                    BackgroundColor(p.surface),
+                    LoadingPanel,
+                ))
+                .with_children(|panel| {
+                    panel.spawn((
+                        Text::new("KOLBE  /  TERRAIN ACQUISITION"),
+                        TextFont {
+                            font_size: FontSize::Px(13.0),
+                            ..default()
+                        },
+                        TextColor(p.accent),
+                        LoadingEyebrow,
+                    ));
+                    panel.spawn((
+                        Text::new(format!("Preparing {}", area.name)),
+                        TextFont {
+                            font_size: FontSize::Px(32.0),
+                            ..default()
+                        },
+                        TextColor(p.text),
+                        LoadingHeading,
+                    ));
+                    panel.spawn((
+                        Text::new("Fetching elevation tiles and building the mission terrain."),
+                        TextFont {
+                            font_size: FontSize::Px(17.0),
+                            ..default()
+                        },
+                        TextColor(p.subtext),
+                    ));
+                    panel.spawn((
+                        Text::new("Starting terrain request…"),
+                        TextFont {
+                            font_size: FontSize::Px(15.0),
+                            ..default()
+                        },
+                        TextColor(p.text),
+                        LoadingStatus,
+                    ));
+                    panel
+                        .spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(12.0),
+                                border_radius: BorderRadius::all(Val::Px(6.0)),
+                                padding: UiRect::all(Val::Px(2.0)),
+                                ..default()
+                            },
+                            BackgroundColor(p.bg),
+                            LoadingTrack,
+                        ))
+                        .with_child((
+                            Node {
+                                width: Val::Percent(2.0),
+                                height: Val::Percent(100.0),
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(p.accent),
+                            LoadingBarFill,
+                        ));
+                });
         });
 }
 
@@ -265,8 +318,7 @@ pub fn spawn_mesh(
         );
 }
 
-pub use vegetation::spawn_trees;
-pub use vegetation::cleanup_trees;
+pub use vegetation::{RadioCanopies, cleanup_trees, spawn_trees};
 pub use vegetation::{DENSITY_STEP, MAX_DENSITY, MIN_DENSITY, VegetationSettings};
 
 /// A thin sea-level reference plane at the data's zero elevation (the lowest
@@ -528,4 +580,79 @@ fn mesh_from_height_map(map: &TerrainHeightMap) -> Mesh {
     mesh.insert_indices(Indices::U32(indices));
     mesh.compute_smooth_normals();
     mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn samples_height_map_corners_with_vertical_exaggeration() {
+        let map = TerrainHeightMap {
+            heights_km: vec![0.01, 0.02, 0.03, 0.04],
+            resolution: 2,
+            size_km: 20.0,
+            vertical_exaggeration: 5.0,
+        };
+
+        assert_close(map.height_at(-10.0, -10.0), 0.05);
+        assert_close(map.height_at(10.0, -10.0), 0.10);
+        assert_close(map.height_at(-10.0, 10.0), 0.15);
+        assert_close(map.height_at(10.0, 10.0), 0.20);
+    }
+
+    #[test]
+    fn clamps_height_samples_to_map_edges() {
+        let map = TerrainHeightMap {
+            heights_km: vec![1.0, 2.0, 3.0, 4.0],
+            resolution: 2,
+            size_km: 20.0,
+            vertical_exaggeration: 1.0,
+        };
+
+        assert_eq!(map.height_at(-100.0, -100.0), 1.0);
+        assert_eq!(map.height_at(100.0, 100.0), 4.0);
+    }
+
+    #[test]
+    fn bilinearly_interpolates_between_height_samples() {
+        let map = TerrainHeightMap {
+            heights_km: vec![0.0, 2.0, 4.0, 6.0],
+            resolution: 2,
+            size_km: 20.0,
+            vertical_exaggeration: 2.0,
+        };
+
+        assert_close(map.height_at(0.0, 0.0), 6.0);
+    }
+
+    #[test]
+    fn validates_vertical_exaggeration_setting() {
+        assert_eq!(parse_vertical_exaggeration(None), 1.0);
+        assert_eq!(parse_vertical_exaggeration(Some("8")), 8.0);
+        assert_eq!(parse_vertical_exaggeration(Some("0")), 1.0);
+        assert_eq!(parse_vertical_exaggeration(Some("50")), 20.0);
+        assert_eq!(parse_vertical_exaggeration(Some("invalid")), 1.0);
+    }
+
+    #[test]
+    fn contour_crosses_a_sloped_cell_at_the_expected_position() {
+        let corners = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        let crossings = contour_crossings(corners, [0.0, 0.04, 0.04, 0.0], 0.02, 5.0);
+
+        assert_eq!(crossings.len(), 2);
+        assert_close(crossings[0].x, 0.5);
+        assert_close(crossings[1].x, 0.5);
+        assert_close(crossings[0].y, 0.108);
+        assert_close(crossings[1].y, 0.108);
+    }
 }

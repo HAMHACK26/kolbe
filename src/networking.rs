@@ -106,6 +106,7 @@ use crate::factories::movement::DroneKinematics;
 use crate::spherical::SphericalVec;
 use crate::world::MAX_NEIGHBOR_SPACING_KM;
 use crate::tracking::TrackedPeers;
+use crate::terrain::{RadioCanopies, TerrainHeightMap, terrain_blocks_radio_path};
 
 /// How far ahead the flight-direction vector predicts (seconds).
 pub const FLIGHT_LOOKAHEAD_SECS: f32 = 0.1;
@@ -474,6 +475,8 @@ pub fn detect_links_and_send_headers(
     >,
     uuids: Query<&DroneUuid>,
     bases: Query<&Base>,
+    terrain: Res<TerrainHeightMap>,
+    canopies: Option<Res<RadioCanopies>>,
 ) {
     // `connected_antenna` is this drone's position vector relative to base —
     // not the antenna's own pointing direction.
@@ -497,6 +500,11 @@ pub fn detect_links_and_send_headers(
                 }
                 let peer_pos = peer_gt.translation();
                 let distance_km = (peer_pos - self_pos).length();
+                if terrain_blocks_radio_path(&terrain, self_pos, peer_pos)
+                    || canopies.as_ref().is_some_and(|trees| trees.blocks_path(self_pos, peer_pos))
+                {
+                    return None;
+                }
                 let local_antenna = antennas.0.iter().enumerate().find_map(|(index, antenna)| {
                     let theta = antenna.off_boresight_deg(heading_deg, self_pos, peer_pos);
                     (antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm)
@@ -839,21 +847,23 @@ pub fn process_reconnect(
 ///
 /// Runs after `detect_links_and_send_headers`, so `LinkSet` is this frame's.
 pub fn halt_on_link_loss(
-    mut drones: Query<(Entity, &RingIndex, &LinkSet, &mut DroneKinematics)>,
+    mut drones: Query<(Entity, &RingIndex, &LinkSet, &MeshTable, &mut DroneKinematics)>,
     ring_slots: Query<(Entity, &RingIndex), With<Drone>>,
-    bases: Query<Entity, With<Base>>,
+    bases: Query<(Entity, &DroneUuid), With<Base>>,
 ) {
-    let Some(base_entity) = bases.iter().next() else {
+    let Some((base_entity, base_uuid)) = bases.iter().next() else {
         return;
     };
     let mut ring: Vec<(usize, Entity)> = ring_slots.iter().map(|(e, ri)| (ri.0, e)).collect();
     ring.sort_by_key(|(i, _)| *i);
     let n = ring.len();
-    for (self_entity, self_ring, links, mut kin) in &mut drones {
-        // Flight is permitted only while the drone is directly connected to
-        // the ground station. A lost base link takes priority over mesh
-        // movement or recovery commands.
-        if !links.connected.contains_key(&base_entity) {
+    for (self_entity, self_ring, links, table, mut kin) in &mut drones {
+        // A live direct base link is ideal, but a current lookup-table row
+        // for the base proves that a relay path still carries the base
+        // session. Either permits flight.
+        let has_base_session = links.connected.contains_key(&base_entity)
+            || table.0.contains_key(&base_uuid.0);
+        if !has_base_session {
             kin.velocity = Vec3::ZERO;
             continue;
         }

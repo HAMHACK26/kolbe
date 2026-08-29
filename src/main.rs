@@ -111,7 +111,6 @@ fn main() {
         .init_resource::<networking::ReconnectBus>()
         .init_resource::<networking::ReconnectRequests>()
         .init_resource::<ui::NetworkTablePanelOpen>()
-        .init_resource::<ui::SimulationSpeed>()
         .init_resource::<tiles::TileCache>()
         .add_systems(Startup, (install_default_font, ui::setup_camera, theme::setup_moon))
         .add_systems(OnEnter(AppState::AreaSelection), area::setup)
@@ -150,26 +149,19 @@ fn main() {
                 terrain::spawn_mesh,
                 terrain::spawn_water,
                 terrain::spawn_trees,
-                // Base first: `world::setup` reads its position to aim each
-                // drone's antenna #2 at it on spawn.
-                base::spawn_base,
                 world::setup,
+                base::spawn_base,
                 ui::make_camera_overlay,
                 ui::spawn_reset_button,
-                ui::spawn_speed_button,
             )
                 .chain(),
         )
         .add_systems(OnExit(AppState::Simulation), teardown_simulation)
         .add_systems(Update, ui::reset_button_interactions.run_if(in_state(AppState::Simulation)))
-        .add_systems(Update, ui::speed_button_interactions.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, camera::orbit_camera.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, radar::sync_radar_visibility.run_if(in_state(AppState::Simulation)))
-        .add_systems(Update, radar::sync_radar_transforms.run_if(in_state(AppState::Simulation)))
-        .add_systems(Update, radar::draw_mesh_links.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
-        .add_systems(Update, world::spawn_next_drone.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, terrain::draw_network_area.run_if(in_state(AppState::Simulation)))
         // Contours and trees are alternatives: a forest covers the ground the
         // contours describe, so only one of the two is drawn.
@@ -201,36 +193,17 @@ fn main() {
         .add_systems(
             Update,
             (
-                // Navigator first: it commands this frame's velocity, and
-                // everything below — the link-loss halt, recovery, the
-                // proximity ring — gets to override it before
-                // `apply_velocity` integrates.
-                navigation::go_to_network_area,
-                // Handshake bookkeeping, then origination, then the flood
-                // itself — so a request that timed out this frame frees the
-                // drone to ask again in the same frame it becomes idle.
-                networking::expire_stale_handshakes,
-                networking::request_nearby_connections,
-                // Priority reconnection flood next, so a fresh slew-freeze is
+                // Priority reconnection flood first, so a fresh slew-freeze is
                 // visible to the aiming systems this same frame.
                 networking::process_reconnect,
-                // Live antenna aiming, before link detection so this frame's
-                // detection sees this frame's aim: predictive tracking holds
-                // the lock on a moving neighbor, then the spiral search takes
-                // over only on the slots that have gone dark.
-                tracking::maintain_mesh_antennas,
-                tracking::maintain_base_antennas,
-                seeking::seek_lost_links,
+                // Antenna aiming (tracking::maintain_mesh_antennas,
+                // seeking::seek_lost_links) is disabled for now — antennas and
+                // radar cones stay at their spawn angles. Wiring live aiming
+                // back in is a future PR.
                 networking::detect_links_and_send_headers,
                 networking::route_packets,
-                // A drone that has lost a neighbor link stops flying, so it
-                // stops making the loss worse while it re-acquires.
-                networking::halt_on_link_loss,
                 // Partition detection + recovery run last — they need the
-                // freshly (re)detected links and updated mesh table. Recovery
-                // overrides the halt above for the one case where holding
-                // still cannot help: the lost peer's only path was this link,
-                // so someone has to fly back to it.
+                // freshly (re)detected links and updated mesh table.
                 recovery::detect_partitions,
                 recovery::run_recovery,
                 // Last word on velocity: the proximity ring deflects whatever

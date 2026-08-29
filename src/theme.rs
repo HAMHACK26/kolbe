@@ -8,7 +8,7 @@ use bevy::prelude::*;
 
 use crate::{
     area::{AreaBg, BodyText, HeadingText, SourceText},
-    terrain::{LoadingBarFill, LoadingHeading, LoadingRoot, LoadingStatus, LoadingTrack},
+    terrain::{LoadingBarFill, LoadingEyebrow, LoadingHeading, LoadingPanel, LoadingRoot, LoadingStatus, LoadingTrack},
     ui::{InfoPopup, InfoPopupTitle},
 };
 
@@ -196,10 +196,12 @@ pub fn apply_theme(
 pub fn apply_loading_theme(
     theme: Res<Theme>,
     mut root_bg: Query<&mut BackgroundColor, (With<LoadingRoot>, Without<LoadingTrack>, Without<LoadingBarFill>)>,
+    mut panel_bg: Query<&mut BackgroundColor, (With<LoadingPanel>, Without<LoadingRoot>, Without<LoadingTrack>, Without<LoadingBarFill>)>,
     mut track_bg: Query<&mut BackgroundColor, (With<LoadingTrack>, Without<LoadingRoot>, Without<LoadingBarFill>)>,
     mut fill_bg: Query<&mut BackgroundColor, (With<LoadingBarFill>, Without<LoadingTrack>, Without<LoadingRoot>)>,
     mut heading: Query<&mut TextColor, (With<LoadingHeading>, Without<LoadingStatus>)>,
     mut status: Query<&mut TextColor, (With<LoadingStatus>, Without<LoadingHeading>)>,
+    mut eyebrow: Query<&mut TextColor, (With<LoadingEyebrow>, Without<LoadingHeading>, Without<LoadingStatus>)>,
 ) {
     if !theme.is_changed() {
         return;
@@ -207,6 +209,9 @@ pub fn apply_loading_theme(
     let p = theme.palette();
     for mut bg in &mut root_bg {
         bg.0 = p.bg;
+    }
+    for mut bg in &mut panel_bg {
+        bg.0 = p.surface;
     }
     for mut bg in &mut track_bg {
         bg.0 = p.surface;
@@ -218,6 +223,9 @@ pub fn apply_loading_theme(
         tc.0 = p.text;
     }
     for mut tc in &mut status {
+        tc.0 = p.accent;
+    }
+    for mut tc in &mut eyebrow {
         tc.0 = p.accent;
     }
 }

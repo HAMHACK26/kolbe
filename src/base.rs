@@ -18,11 +18,10 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 
 use crate::{
-    antenna::{Antenna, Antennas, angles_toward},
+    antenna::Antenna,
     camera::OrbitCamera,
     drone::{Drone, SelectedDrone, make_antenna},
     factories::{movement::DroneKinematics, track::Track},
-    networking::RadioBundle,
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     theme::ThemeRole,
     world::DRONE_RADIUS,
@@ -33,7 +32,7 @@ use crate::{
 /// Edge length of the cube the ground station is drawn as, km. Doubles as its
 /// physical footprint — [`crate::avoidance`] derives the base's bounding
 /// radius from it so drones keep clear of the structure.
-pub const BASE_BOX_SIZE_KM: f32 = 0.0375;
+pub const BASE_BOX_SIZE_KM: f32 = 0.3;
 
 /// Marks the ground control station entity.
 #[derive(Component)]
@@ -41,6 +40,8 @@ pub struct Base {
     pub id: String,
     /// Fixed world-space position (km). Y = elevation.
     pub position: Vec3,
+    /// Antennas this base uses to communicate with drones.
+    pub antennas: Vec<Antenna>,
 }
 
 /// Tracks which drones the base can currently communicate with.
@@ -87,7 +88,6 @@ pub fn spawn_base(
     theme: Res<crate::theme::Theme>,
     base_position: Res<crate::area::BasePosition>,
     area: Res<crate::area::ScenarioArea>,
-    network_area: Res<crate::area::NetworkArea>,
 ) {
     // Initial colors from the palette; `apply_theme` re-syncs on toggle
     // (these entities carry ThemeRole markers).
@@ -105,22 +105,9 @@ pub fn spawn_base(
     };
     let pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
 
-    // Same hardware as the drones, one antenna per drone, each already aimed
-    // at that drone's slot in the deployment formation — the base is briefed
-    // on where the ring is being flown, the same plan `world::setup` spawns
-    // the drones onto, so its links are up on frame 0 alongside theirs.
-    // `crate::tracking::maintain_base_antennas` keeps them aimed from there.
-    let ring = crate::world::target_area_formation(&network_area, &area, &terrain);
-    let antennas: Vec<Antenna> = ring
-        .iter()
-        .enumerate()
-        .map(|(k, &drone_pos)| {
-            // A base has no heading, so a world-frame bearing is already the
-            // drone-relative azimuth its antennas are expressed in.
-            let (az, el) = angles_toward(pos, drone_pos);
-            make_antenna(az, el, 200 + k)
-        })
-        .collect();
+    // 5 connections — same hardware as the drones, one antenna per 72° sector.
+    let antennas: Vec<Antenna> =
+        (0..5).map(|k| make_antenna(k as f32 * 72.0, 5.0, 200 + k)).collect();
 
     let base_entity = commands
         .spawn((
@@ -132,14 +119,11 @@ pub fn spawn_base(
             ..default()
         })),
         Transform::from_translation(pos),
-        Base { id: "GCS-ALPHA".into(), position: pos },
-        Antennas(antennas.clone()),
-        // The base is a radio node like any other: it detects links, ranges,
-        // gossips the mesh table and relays reconnection floods on the very
-        // same systems the drones run. It deliberately gets no `RingIndex`
-        // (it is not in the ring) and no `DroneKinematics` (it does not fly),
-        // which is what keeps the flight-side systems off it.
-        RadioBundle::random(),
+        Base {
+            id: "GCS-ALPHA".into(),
+            position: pos,
+            antennas: antennas.clone(),
+        },
         BaseNetworkState::default(),
         ThemeRole::BaseMarker,
         crate::SimulationEntity,
@@ -163,14 +147,14 @@ pub fn spawn_base(
         cull_mode: None,
         ..default()
     });
-    for (antenna_index, antenna) in antennas.iter().enumerate() {
+    for antenna in &antennas {
         commands.spawn((
             Mesh3d(cone_mesh_for(antenna, &mut meshes)),
             MeshMaterial3d(cone_mat.clone()),
             // Bases have no heading — 0.0 leaves azimuth effectively world-frame.
             cone_transform_for(antenna, 0.0, pos),
             Visibility::Hidden,
-            RadarCone { drone_entity: base_entity, antenna_index },
+            RadarCone { drone_entity: base_entity },
             ThemeRole::BaseCone,
             crate::SimulationEntity,
         ));
