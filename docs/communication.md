@@ -16,7 +16,10 @@ Our headers are sent with every request and are structured as follows:
 | ---- | ----------------- | ---------------- | ------------- |
 | UUID | vector            | vector           | datetime      |
 
-Note that the connected antenna is the direction of the antenna on the receiver, we use this to calculate the vector in its lookup table.
+The connected antenna is the exchange originator's local direction toward its
+direct neighbour. When the request returns as an echo, the originator is the
+receiver and uses this direction to calculate the neighbour vector in its
+lookup table.
 
 We use the connected antenna vector as a reference to see what the drone considers to be its front. This + the gravity vector (as mentioned in our [coordinates notes](coordinates.md)) allows us to extrapolate the vectors for all other drones, more on that later.
 
@@ -42,6 +45,35 @@ Note that there is still a lot of drift when we do this calculation, hence why w
 
 We also have the connections and timestamp field which is mainly used for reconnection of drones, a timestamp will tell us how recently the data was added this will effectively indicate if this drone is currently out of commission as it needs to be connected to the network with at least one antenna for us to get an accurate reading of its current position.
 The connections tab is similarly used to retain connection but it is actually used so we do not remove a connection to a drone if it has only one connection left, that connection being the drone with that particular id. We will also use this to recursively verify that the connection we cut isn't part of a longer chain which has no other connection to the ground base. Such as the example illustrated below.
+
+### Timestamp provenance
+
+Lookup timestamps are stored in the table owner's local clock domain. When a
+row is relayed, its age is calculated on the sender's clock and then rebased
+onto the receiver's clock:
+
+$$
+a = t_{sender} - t_{row}, \qquad t'_{row} = t_{receiver} - a
+$$
+
+This preserves row age without requiring synchronized drone clocks. Negative
+or non-finite ages are invalid and must not replace the last valid row.
+
+### Directed yaw observations
+
+The UUID list in `connections` remains the lookup-table topology. Each direct
+connection also produces internal directed edge metadata which is relayed with
+the lookup table:
+
+| from | to | measured yaw | vector length | neighbour distance | timestamp |
+| ---- | -- | ------------ | ------------- | ------------------ | --------- |
+
+Yaw is positive clockwise around the shared gravity axis and normalized to
+$[-\pi, \pi)$. It is the relative orientation offset between the two drone
+frames, not the world bearing of the displacement vector. Keeping the measured
+length separate ensures loop closure can change yaw without changing range.
+Only measured observations are transmitted. Each drone stores and applies its
+own corrected yaw locally; corrected values are never accepted from peers.
 
 ```tikz
 \usetikzlibrary{arrows.meta,calc}
@@ -107,7 +139,10 @@ If we would have multiple bases we could express the vector as a list of a key v
 
 One issue we get still have is that we have really just moved the *yaw drift* error, we actually haven't solved it since our drone relation to the base is still established through neighbours (unless a direct link is established) which is what pins the entire network. So we need to pair this solution with a *loop closure*. If we have a loop of drones we know that the yaw angles should sum to zero. Using this we would be able to remove residual errors that might persist after closest neighbour and absolute base vector correction.
 
-We do not need to send any extra data to compute a loop closure, every edge we need is already present as a vector in our [lookup table](communication.md#lookup-table), and every loop is already described by the *connections* field (we walk the connections until we return to an id we have already visited).
+The `connections` field describes every loop, while the directed measured-yaw
+metadata above supplies the independent orientation observation for each edge.
+Corrected yaw is local state and is not transmitted. We discover a loop by
+walking connections until returning to an already visited drone ID.
 
 For a loop of drones $d_1 \to d_2 \to \dots \to d_k \to d_1$ we take the relative yaw offset $\theta_{i,i+1}$ that each edge contributes and compose them around the loop:
 
@@ -116,6 +151,10 @@ $$
 $$
 
 Because the only axis that can drift is yaw, this residual collapses to a single angle. In a perfect system $\theta_{err} = 0$, whatever we actually measure is the accumulated drift around that loop.
+
+The sum is normalized to $[-\pi, \pi)$ before correction so equivalent full
+turns do not create a false residual. A loop requires at least three distinct
+drones; an immediate two-node backtrack is not a closure constraint.
 
 We then distribute $\theta_{err}$ back across the edges of the loop to force it back to zero. We do **not** split it evenly, we weight the correction by the *neighbour distance* of each edge:
 $$

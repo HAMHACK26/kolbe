@@ -196,12 +196,14 @@ fn main() {
                 // Priority reconnection flood first, so a fresh slew-freeze is
                 // visible to the aiming systems this same frame.
                 networking::process_reconnect,
+                networking::maintain_base_frame_references,
                 // Antenna aiming (tracking::maintain_mesh_antennas,
                 // seeking::seek_lost_links) is disabled for now — antennas and
                 // radar cones stay at their spawn angles. Wiring live aiming
                 // back in is a future PR.
                 networking::detect_links_and_send_headers,
                 networking::route_packets,
+                networking::apply_loop_closure,
                 // Partition detection + recovery run last — they need the
                 // freshly (re)detected links and updated mesh table.
                 recovery::detect_partitions,
