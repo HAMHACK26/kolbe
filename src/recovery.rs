@@ -89,19 +89,6 @@ pub fn peer_is_orphaned(table: &MeshTable, peer_uuid: &str, self_uuid: &str) -> 
     true
 }
 
-/// Convert real-world flight limits (m/s, m/s²) to the km-scaled units the
-/// simulation world uses, so `navigate` integrates consistently with
-/// km-space positions.
-fn limits_km(limits: &FlightLimits) -> FlightLimits {
-    FlightLimits {
-        max_speed_mps: limits.max_speed_mps / 1000.0,
-        max_accel_mps2: limits.max_accel_mps2 / 1000.0,
-        max_climb_mps: limits.max_climb_mps / 1000.0,
-        max_descend_mps: limits.max_descend_mps / 1000.0,
-        max_yaw_rate_deg_s: limits.max_yaw_rate_deg_s,
-    }
-}
-
 /// Update contact memory and, when a sole-link peer drops, enter recovery.
 ///
 /// Runs after links are (re)detected each frame so `LinkSet` is current.
@@ -165,7 +152,7 @@ pub fn run_recovery(
     _bases: Query<&Base>,
 ) {
     let dt = time.delta_secs();
-    let limits = limits_km(&FlightLimits::default());
+    let limits = FlightLimits::default().in_km();
 
     for (transform, _self_uuid, links, mut kin, mut recovery) in &mut drones {
         let RecoveryState::Recovering { lost_peer, return_to } = &*recovery else {
