@@ -274,11 +274,11 @@ pub fn go_to_network_area(
     let limits = FlightLimits::default().in_km();
 
     for (transform, mut target, mut kin) in &mut drones {
-        if !target.spreading && inside_operational_area(transform.translation, &network_area, &scenario) {
+        if !target.spreading && inside_target_area(transform.translation, &network_area, &scenario) {
             target.spreading = true;
         }
         let waypoint = if target.spreading {
-            repel_from_target_boundary(transform.translation, target.slot, &network_area, &scenario)
+            clamp_to_target_area(target.slot, &network_area, &scenario)
         } else {
             target.ingress
         };
@@ -293,60 +293,66 @@ pub fn go_to_network_area(
     }
 }
 
-fn inside_operational_area(
+fn target_hull_local(
+    area: &crate::area::NetworkArea,
+    scenario: &crate::area::ScenarioArea,
+) -> Vec<Vec2> {
+    area.hull
+        .iter()
+        .map(|&(lon, lat)| Vec2::new(
+            ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32,
+            ((lat - scenario.latitude) * 110.574) as f32,
+        ))
+        .collect()
+}
+
+fn inside_target_area(
     position: Vec3,
     area: &crate::area::NetworkArea,
     scenario: &crate::area::ScenarioArea,
 ) -> bool {
-    if !area.valid {
+    if !area.valid || area.hull.len() < 3 {
         return false;
     }
-    let (lon, lat) = area.center;
-    let center_x =
-        ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
-    let center_z = ((lat - scenario.latitude) * 110.574) as f32;
-    let half_side = area.side_km as f32 * 0.5;
-    (position.x - center_x).abs() <= half_side && (position.z - center_z).abs() <= half_side
+    let point = position.xz();
+    let hull = target_hull_local(area, scenario);
+    let mut sign = 0.0_f32;
+    for (start, end) in hull.iter().zip(hull.iter().cycle().skip(1)).take(hull.len()) {
+        let cross = (end.x - start.x) * (point.y - start.y)
+            - (end.y - start.y) * (point.x - start.x);
+        if cross.abs() > 1e-5 {
+            if sign != 0.0 && cross.signum() != sign {
+                return false;
+            }
+            sign = cross.signum();
+        }
+    }
+    true
 }
 
-/// Distance over which the target boundary begins steering an in-area drone
-/// back toward the survey region.
-const BOUNDARY_REPULSION_KM: f32 = 3.0;
-
-fn repel_from_target_boundary(
-    position: Vec3,
-    slot: Vec3,
+/// Keep an already-deployed drone inside the blue target polygon.
+/// This is a hard geofence rather than a steering suggestion: collision
+/// avoidance is allowed to change a course, but not to take a drone back out
+/// of the target area after it has entered it.
+pub fn clamp_to_target_area(
+    mut position: Vec3,
     area: &crate::area::NetworkArea,
     scenario: &crate::area::ScenarioArea,
 ) -> Vec3 {
-    if !inside_operational_area(position, area, scenario) {
-        return slot;
+    if !area.valid || area.hull.len() < 3 || inside_target_area(position, area, scenario) {
+        return position;
     }
-    let (lon, lat) = area.center;
-    let center_x =
-        ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
-    let center_z = ((lat - scenario.latitude) * 110.574) as f32;
-    let half_side = area.side_km as f32 * 0.5;
-    let local = Vec2::new(position.x - center_x, position.z - center_z);
-    let distances = [
-        (half_side - local.x, -Vec2::X),
-        (half_side + local.x, Vec2::X),
-        (half_side - local.y, -Vec2::Y),
-        (half_side + local.y, Vec2::Y),
-    ];
-    let mut push = Vec2::ZERO;
-    let mut urgency = 0.0_f32;
-    for (distance, inward) in distances {
-        if distance < BOUNDARY_REPULSION_KM {
-            let weight = ((BOUNDARY_REPULSION_KM - distance) / BOUNDARY_REPULSION_KM)
-                .clamp(0.0, 1.0);
-            push += inward * weight;
-            urgency = urgency.max(weight);
-        }
-    }
-    if push.length_squared() <= f32::EPSILON {
-        return slot;
-    }
-    let escape = position + Vec3::new(push.x, 0.0, push.y).normalize() * BOUNDARY_REPULSION_KM;
-    slot.lerp(escape, urgency)
+    let point = position.xz();
+    let hull = target_hull_local(area, scenario);
+    let closest = hull.iter().zip(hull.iter().cycle().skip(1)).take(hull.len())
+        .map(|(start, end)| {
+            let edge = *end - *start;
+            let t = ((point - *start).dot(edge) / edge.length_squared()).clamp(0.0, 1.0);
+            *start + edge * t
+        })
+        .min_by(|a, b| a.distance_squared(point).total_cmp(&b.distance_squared(point)))
+        .expect("a target polygon has edges");
+    position.x = closest.x;
+    position.z = closest.y;
+    position
 }

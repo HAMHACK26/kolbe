@@ -21,7 +21,8 @@ pub const WORLD_SIZE: f32 = 20.0;
 pub const DRONE_RADIUS: f32 = 0.0225;
 /// Clearance from the terrain to the underside of each drone, in km (50 m).
 pub const DRONE_GROUND_CLEARANCE_KM: f32 = 0.05;
-const DEPLOYMENT_INTERVAL_SECS: f32 = 5.0;
+const DEPLOYMENT_INTERVAL_SECS: f32 = 10.0;
+const DEPLOYMENT_BATCH_SIZE: usize = 3;
 /// Keeps launches clear of the base and of each other before navigation has
 /// had a chance to separate the formation.
 const LAUNCH_RING_RADIUS_KM: f32 = 0.10;
@@ -49,16 +50,49 @@ pub(crate) struct DeploymentQueue {
     cone_mat: Handle<StandardMaterial>,
 }
 
-/// Radius of the initial survey ring around the selected area's center.
+/// Radius each drone's coverage footprint must reach.
 pub const FORMATION_RADIUS_KM: f32 = 3.0;
-/// Fleet multiplier applied after dividing the target span into 3 km coverage
-/// intervals.
+/// Fleet multiplier applied after computing the minimum gap-free coverage grid.
 const COVERAGE_RESERVE: f32 = 1.50;
 
-/// Number of drones for the operational target: its side length in km,
-/// divided into 3 km coverage intervals, with 50% reserve rounded up.
+/// Area of the blue, operator-selected target polygon in km². The orange
+/// square is deliberately excluded: it only exists to fetch terrain.
+fn blue_target_area_km2(area: &crate::area::NetworkArea) -> f32 {
+    if area.hull.len() < 3 {
+        return 0.0;
+    }
+    let (center_lon, center_lat) = area.center;
+    let points: Vec<Vec2> = area
+        .hull
+        .iter()
+        .map(|&(lon, lat)| Vec2::new(
+            ((lon - center_lon) * 111.320 * center_lat.to_radians().cos()) as f32,
+            ((lat - center_lat) * 110.574) as f32,
+        ))
+        .collect();
+    points.iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(a, b)| a.x * b.y - a.y * b.x)
+        .sum::<f32>()
+        .abs()
+        * 0.5
+}
+
+/// Balanced grid dimensions for the fleet calculated from the blue target.
+fn coverage_grid_dimensions(area: &crate::area::NetworkArea) -> (usize, usize) {
+    let count = target_area_drone_count(area);
+    let columns = (count as f32).sqrt().ceil() as usize;
+    (columns, count.div_ceil(columns))
+}
+
+/// Number of drones for the blue target's 3 km coverage cells, including 50%
+/// reserve. A radius-3 km circle's gap-free square cell is 3√2 km wide, or
+/// 18 km², so this uses the selected polygon's area rather than its orange
+/// bounding square.
 pub fn target_area_drone_count(area: &crate::area::NetworkArea) -> usize {
-    ((area.side_km as f32 / FORMATION_RADIUS_KM) * COVERAGE_RESERVE)
+    let safe_cell_area = 2.0 * FORMATION_RADIUS_KM.powi(2);
+    ((blue_target_area_km2(area) / safe_cell_area) * COVERAGE_RESERVE)
         .ceil()
         .max(1.0) as usize
 }
@@ -79,9 +113,9 @@ fn launch_position(base_pos: Vec3, index: usize, count: usize) -> Vec3 {
     )
 }
 
-/// Evenly distribute the swarm on a 3 km ring around the selected area's
-/// center. Communication range is intentionally not part of this deployment
-/// mode; each drone has a fixed survey slot.
+/// Evenly distribute the swarm across a gap-free 3 km coverage grid inside the
+/// selected area. Communication range is intentionally not part of this
+/// deployment mode; each drone has a fixed survey cell.
 pub fn target_area_formation(
     area: &crate::area::NetworkArea,
     scenario: &crate::area::ScenarioArea,
@@ -90,12 +124,15 @@ pub fn target_area_formation(
     let (lon, lat) = area.center;
     let center_x = ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
     let center_z = ((lat - scenario.latitude) * 110.574) as f32;
-    let drone_count = target_area_drone_count(area);
-    (0..drone_count)
-        .map(|i| {
-            let angle = i as f32 / drone_count as f32 * std::f32::consts::TAU;
-            let x = center_x + FORMATION_RADIUS_KM * angle.sin();
-            let z = center_z + FORMATION_RADIUS_KM * angle.cos();
+    let (columns, rows) = coverage_grid_dimensions(area);
+    let cell_width = area.side_km as f32 / columns as f32;
+    let cell_height = area.side_km as f32 / rows as f32;
+    let half_side = area.side_km as f32 * 0.5;
+    (0..rows)
+        .flat_map(|row| (0..columns).map(move |column| (column, row)))
+        .map(|(column, row)| {
+            let x = center_x - half_side + (column as f32 + 0.5) * cell_width;
+            let z = center_z - half_side + (row as f32 + 0.5) * cell_height;
             Vec3::new(
                 x,
                 terrain.height_at(x, z) + DRONE_GROUND_CLEARANCE_KM + DRONE_RADIUS,
@@ -191,26 +228,29 @@ pub fn setup(
         ..default()
     });
 
-    // The base is the launch position. Drones enter the target area one at a
-    // time, then spread toward individual formation slots.
+    // The base is the launch position. Drones deploy in batches of three,
+    // then spread toward individual formation slots.
     let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
     let target_slots = target_area_formation(&network_area, &scenario, &terrain);
     let ingress = target_area_center(&network_area, &scenario, &terrain);
-    spawn_deployment_drone(
-        &mut commands,
-        &mut meshes,
-        &drone_mesh,
-        &drone_mat,
-        &cone_mat,
-        launch_position(base_pos, 0, target_slots.len()),
-        base_pos,
-        ingress,
-        &target_slots,
-        0,
-    );
+    let initial_count = target_slots.len().min(DEPLOYMENT_BATCH_SIZE);
+    for index in 0..initial_count {
+        spawn_deployment_drone(
+            &mut commands,
+            &mut meshes,
+            &drone_mesh,
+            &drone_mat,
+            &cone_mat,
+            launch_position(base_pos, index, target_slots.len()),
+            base_pos,
+            ingress,
+            &target_slots,
+            index,
+        );
+    }
     commands.insert_resource(DeploymentQueue {
         target_slots,
-        next_index: 1,
+        next_index: initial_count,
         timer: Timer::from_seconds(DEPLOYMENT_INTERVAL_SECS, TimerMode::Repeating),
         base_pos,
         ingress,
@@ -318,8 +358,8 @@ pub fn setup(
         });
 }
 
-/// Launch the next node from the base every five seconds until the initial
-/// deployment queue is exhausted.
+/// Launch the next batch of up to three nodes every ten seconds until the
+/// initial deployment queue is exhausted.
 pub fn spawn_next_drone(
     time: Res<Time>,
     mut commands: Commands,
@@ -332,20 +372,22 @@ pub fn spawn_next_drone(
         return;
     }
 
-    let index = deployment.next_index;
-    deployment.next_index += 1;
-    spawn_deployment_drone(
-        &mut commands,
-        &mut meshes,
-        &deployment.drone_mesh.clone(),
-        &deployment.drone_mat.clone(),
-        &deployment.cone_mat.clone(),
-        launch_position(deployment.base_pos, index, deployment.target_slots.len()),
-        deployment.base_pos,
-        deployment.ingress,
-        &deployment.target_slots,
-        index,
-    );
+    let end = (deployment.next_index + DEPLOYMENT_BATCH_SIZE).min(deployment.target_slots.len());
+    for index in deployment.next_index..end {
+        spawn_deployment_drone(
+            &mut commands,
+            &mut meshes,
+            &deployment.drone_mesh.clone(),
+            &deployment.drone_mat.clone(),
+            &deployment.cone_mat.clone(),
+            launch_position(deployment.base_pos, index, deployment.target_slots.len()),
+            deployment.base_pos,
+            deployment.ingress,
+            &deployment.target_slots,
+            index,
+        );
+    }
+    deployment.next_index = end;
 }
 
 fn spawn_deployment_drone(
@@ -462,13 +504,21 @@ mod tests {
     }
 
     #[test]
-    fn coverage_count_adds_fifty_percent_reserve() {
+    fn coverage_grid_has_fifty_percent_reserve_without_gaps() {
         let area = crate::area::NetworkArea {
             side_km: 6.0,
             valid: true,
             ..default()
         };
-        // 6 km / 3 km × 1.5 reserve = 3 drones.
-        assert_eq!(target_area_drone_count(&area), 3);
+        let (columns, rows) = coverage_grid_dimensions(&area);
+        // A 2×2 grid is the minimum gap-free layout; 50% reserve makes it 3×2.
+        assert_eq!((columns, rows), (3, 2));
+        assert_eq!(target_area_drone_count(&area), 6);
+        let farthest_cell_corner =
+            ((area.side_km as f32 / columns as f32).powi(2)
+                + (area.side_km as f32 / rows as f32).powi(2))
+                .sqrt()
+                * 0.5;
+        assert!(farthest_cell_corner <= FORMATION_RADIUS_KM);
     }
 }

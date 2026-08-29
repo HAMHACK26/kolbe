@@ -152,15 +152,42 @@ impl MovementLogic for RustMove {
 pub fn apply_velocity(
     time: Res<Time>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
-    mut drones: Query<(&mut Transform, &mut DroneKinematics)>,
+    network_area: Res<crate::area::NetworkArea>,
+    scenario: Res<crate::area::ScenarioArea>,
+    mut drones: Query<(
+        &mut Transform,
+        &mut DroneKinematics,
+        Option<&crate::world::DeploymentTarget>,
+    )>,
 ) {
     let dt = time.delta_secs();
-    for (mut transform, mut kin) in &mut drones {
+    for (mut transform, mut kin, deployment) in &mut drones {
         // Everything that gets a say in this frame's velocity has now had it,
         // so this is what the airframe actually flies — record it before
         // integrating, for next frame's avoidance to measure against.
         kin.flown_velocity = kin.velocity;
         transform.translation += kin.velocity * dt;
+
+        // Once a drone has crossed into the blue target polygon it is geofenced there.
+        // This runs at integration time, after every navigator and avoidance
+        // system, so a late collision deflection cannot carry it across the
+        // orange boundary.
+        if deployment.is_some_and(|target| target.spreading) {
+            let before_clamp = transform.translation;
+            transform.translation = crate::navigation::clamp_to_target_area(
+                transform.translation,
+                &network_area,
+                &scenario,
+            );
+            if transform.translation.x != before_clamp.x {
+                kin.velocity.x = 0.0;
+                kin.flown_velocity.x = 0.0;
+            }
+            if transform.translation.z != before_clamp.z {
+                kin.velocity.z = 0.0;
+                kin.flown_velocity.z = 0.0;
+            }
+        }
 
         // Terrain following is enforced after every motion command, including
         // avoidance deflections and recovery. The radius converts the 50 m
