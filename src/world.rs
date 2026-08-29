@@ -11,7 +11,7 @@ use crate::{
         DroneAi,
         movement::{DroneKinematics, HoverWind},
     },
-    networking::{LinkSet, NetworkingBundle},
+    networking::{LinkSet, MeshRow, MeshTable, NetworkingBundle},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     recovery::{ContactMemory, RecoveryState},
     seeking::SeekState,
@@ -86,8 +86,8 @@ pub(crate) struct DeploymentQueue {
 /// Protected upstream links created by wave deployment.
 ///
 /// Every drone has exactly one active parent closer to the base. A new wave
-/// starts a pending handoff and the previous wave keeps its base parents until
-/// every replacement edge has been physically acquired and held stable.
+/// starts a pending handoff. Each previous-wave drone keeps its base parent
+/// until its own replacement edge has been physically acquired and held stable.
 #[derive(Resource, Default)]
 pub(crate) struct RelayTopology {
     base: Option<Entity>,
@@ -259,15 +259,24 @@ impl RelayTopology {
         let Some(pending) = self.pending_handoff.as_ref() else {
             return false;
         };
-        if !pending
+        let ready: Vec<RelayEdge> = pending
             .iter()
-            .all(|edge| self.links.get(edge) == Some(&RelayLinkPhase::Tracking))
-        {
+            .copied()
+            .filter(|edge| self.links.get(edge) == Some(&RelayLinkPhase::Tracking))
+            .collect();
+        if ready.is_empty() {
             return false;
         }
         let pending = self.pending_handoff.take().expect("pending was checked");
-        for edge in pending {
+        for edge in ready.iter() {
             self.parents.insert(edge.child, edge.parent);
+        }
+        let remaining: Vec<RelayEdge> = pending
+            .into_iter()
+            .filter(|edge| !ready.contains(edge))
+            .collect();
+        if !remaining.is_empty() {
+            self.pending_handoff = Some(remaining);
         }
         true
     }
@@ -301,8 +310,8 @@ impl RelayEdge {
 }
 
 /// Advance every required drone-to-drone edge through the same acquisition,
-/// tracking, degradation, and reacquisition lifecycle. A pending wave is
-/// promoted only after all of its candidate edges are stably tracking.
+/// tracking, degradation, and reacquisition lifecycle. Each pending edge is
+/// promoted independently as soon as it is stably tracking.
 pub fn update_relay_link_lifecycle(
     mut topology: ResMut<RelayTopology>,
     link_sets: Query<&LinkSet>,
@@ -519,6 +528,7 @@ pub fn setup(
     let ingress = target_area_center(&network_area, &scenario, &terrain);
     let initial_count = total_count.min(DEPLOYMENT_BATCH_SIZE);
     let mut initial_wave = Vec::with_capacity(initial_count);
+    let initial_snapshot = HashMap::new();
     for index in 0..initial_count {
         initial_wave.push(spawn_deployment_drone(
             &mut commands,
@@ -530,6 +540,7 @@ pub fn setup(
             base_pos,
             ingress,
             &target_slots,
+            &initial_snapshot,
             index,
             wind.intensity,
         ));
@@ -649,6 +660,26 @@ pub fn setup(
         });
 }
 
+/// Give a newly launched drone the current network picture maintained by the
+/// base station. Rebase row ages onto the new drone's independent clock so
+/// spiral uncertainty starts at launch instead of comparing unrelated epochs.
+fn networking_with_launch_briefing(
+    ring_index: usize,
+    base_snapshot: &HashMap<String, MeshRow>,
+) -> NetworkingBundle {
+    let mut networking = NetworkingBundle::random(ring_index);
+    let local_now = networking.radio.clock.now;
+    networking.radio.mesh_table.0 = base_snapshot
+        .iter()
+        .map(|(id, row)| {
+            let mut row = row.clone();
+            row.timestamp = local_now;
+            (id.clone(), row)
+        })
+        .collect();
+    networking
+}
+
 /// Launch the next batch of up to three nodes every thirty seconds until the
 /// initial deployment queue is exhausted.
 pub fn spawn_next_drone(
@@ -657,6 +688,7 @@ pub fn spawn_next_drone(
     mut meshes: ResMut<Assets<Mesh>>,
     mut deployment: ResMut<DeploymentQueue>,
     mut relay_topology: ResMut<RelayTopology>,
+    base_tables: Query<&MeshTable, With<Base>>,
     wind: Res<WindSettings>,
 ) {
     if deployment.next_index >= deployment.total_count
@@ -666,6 +698,10 @@ pub fn spawn_next_drone(
         return;
     }
 
+    let base_snapshot = base_tables
+        .get(deployment.base_entity)
+        .map(|table| table.0.clone())
+        .unwrap_or_default();
     let end = (deployment.next_index + DEPLOYMENT_BATCH_SIZE).min(deployment.total_count);
     let mut wave = Vec::with_capacity(end - deployment.next_index);
     for index in deployment.next_index..end {
@@ -679,6 +715,7 @@ pub fn spawn_next_drone(
             deployment.base_pos,
             deployment.ingress,
             &deployment.target_slots,
+            &base_snapshot,
             index,
             wind.intensity,
         ));
@@ -697,6 +734,7 @@ fn spawn_deployment_drone(
     base_pos: Vec3,
     ingress: Vec3,
     target_slots: &[Vec3],
+    base_snapshot: &HashMap<String, MeshRow>,
     index: usize,
     wind_intensity: f32,
 ) -> Entity {
@@ -717,7 +755,7 @@ fn spawn_deployment_drone(
             DroneKinematics::default(),
             DroneAi::default(),
             CommandQueue::default(),
-            NetworkingBundle::random(index),
+            networking_with_launch_briefing(index, base_snapshot),
             SeekState::default(),
             RecoveryState::default(),
             ContactMemory::default(),
@@ -876,6 +914,27 @@ mod tests {
     }
 
     #[test]
+    fn launch_briefing_seeds_previous_wave_at_the_new_drones_local_time() {
+        let previous_id = String::default();
+        let snapshot = HashMap::from([(
+            previous_id.clone(),
+            crate::networking::MeshRow {
+                id: previous_id.clone(),
+                timestamp: 123.0,
+                location: Vec3::new(1.5, 0.0, 0.5),
+                neighbour_distance: 0,
+                connections: Vec::new(),
+            },
+        )]);
+
+        let networking = networking_with_launch_briefing(3, &snapshot);
+        let inherited = networking.radio.mesh_table.0.get(&previous_id).unwrap();
+
+        assert_eq!(inherited.location, Vec3::new(1.5, 0.0, 0.5));
+        assert_eq!(inherited.timestamp, networking.radio.clock.now);
+    }
+
+    #[test]
     fn coverage_count_uses_the_blue_polygon_not_its_orange_square() {
         let area = crate::area::NetworkArea {
             side_km: 6.0,
@@ -896,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn wave_handoff_waits_for_every_stable_replacement_link() {
+    fn wave_handoff_promotes_each_stable_replacement_link() {
         let entity = |id| Entity::from_raw_u32(id).expect("valid test entity");
         let base = entity(1);
         let first = vec![entity(10), entity(11), entity(12)];
@@ -916,8 +975,16 @@ mod tests {
         for _ in 0..RELAY_ACQUIRE_FRAMES {
             topology.observe_link(pending[0], true);
         }
-        assert!(!topology.complete_handoff_if_ready());
-        assert!(first.iter().all(|&drone| topology.requires_link(drone, base)));
+        assert!(topology.complete_handoff_if_ready());
+        assert_eq!(topology.parent(first[0]), Some(second[0]));
+        assert!(!topology.requires_link(first[0], base));
+        assert!(
+            first[1..]
+                .iter()
+                .all(|&drone| topology.requires_link(drone, base))
+        );
+        assert!(topology.handoff_pending());
+        assert!(topology.all_paths_reach_base());
 
         for &edge in pending.iter().skip(1) {
             for _ in 0..RELAY_ACQUIRE_FRAMES {
