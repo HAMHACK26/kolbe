@@ -27,15 +27,40 @@ const DEPLOYMENT_BATCH_SIZE: usize = 3;
 /// had a chance to separate the formation.
 const LAUNCH_RING_RADIUS_KM: f32 = 0.10;
 
-/// The individual destination assigned to a drone during deployment.
+/// Per-drone deployment and in-target survey state.
 #[derive(Component)]
 pub struct DeploymentTarget {
     pub ingress: Vec3,
-    /// Stable, per-drone destination once ingress is complete. Keeping this
-    /// stateful prevents the reactive spacing rule from flipping direction on
-    /// consecutive mesh-table updates.
-    pub slot: Vec3,
     pub spreading: bool,
+    /// Per-drone survey heading used after the drone enters the blue target.
+    pub bias_direction: Vec2,
+    pub bias_seed: u32,
+    pub bias_elapsed_secs: f32,
+    pub next_bias_change_secs: f32,
+    pub bias_window: u32,
+}
+
+/// Deterministic UUID-seeded survey heading. Keeping this pure makes every
+/// simulation repeatable while ensuring drones do not share a direction.
+fn bias_direction(seed: usize, window: u32) -> Vec2 {
+    let mut value = (seed as u32).wrapping_mul(0x9e37_79b9) ^ window.wrapping_mul(0x85eb_ca6b);
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    let angle = value as f32 / u32::MAX as f32 * std::f32::consts::TAU;
+    Vec2::new(angle.sin(), angle.cos())
+}
+
+fn initial_bias_delay_secs(seed: usize) -> f32 {
+    // The UUID seed staggers the first change over the first two minutes;
+    // following changes stay exactly two minutes apart for that drone.
+    ((seed as u32).wrapping_mul(0x9e37_79b9) % 121) as f32
+}
+
+fn uuid_bias_seed(id: &str) -> usize {
+    id.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ byte as u32).wrapping_mul(0x0100_0193)
+    }) as usize
 }
 
 #[derive(Resource)]
@@ -53,7 +78,7 @@ pub(crate) struct DeploymentQueue {
 /// Radius each drone's coverage footprint must reach.
 pub const FORMATION_RADIUS_KM: f32 = 3.0;
 /// Fleet multiplier applied after computing the minimum gap-free coverage grid.
-const COVERAGE_RESERVE: f32 = 1.75;
+const COVERAGE_RESERVE: f32 = 2.0;
 
 /// Area of the blue, operator-selected target polygon in km². The orange
 /// square is deliberately excluded: it only exists to fetch terrain.
@@ -86,7 +111,8 @@ fn coverage_grid_dimensions(area: &crate::area::NetworkArea) -> (usize, usize) {
     (columns, count.div_ceil(columns))
 }
 
-/// Number of drones for the blue target's 3 km coverage cells, including 75%
+/// Number of drones for the blue target's 3 km coverage cells, doubled from
+/// the required coverage count.
 /// reserve. A radius-3 km circle's gap-free square cell is 3√2 km wide, or
 /// 18 km², so this uses the selected polygon's area rather than its orange
 /// bounding square.
@@ -150,9 +176,25 @@ pub fn target_area_center(
     scenario: &crate::area::ScenarioArea,
     terrain: &crate::terrain::TerrainHeightMap,
 ) -> Vec3 {
-    let (lon, lat) = area.center;
-    let x = ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32;
-    let z = ((lat - scenario.latitude) * 110.574) as f32;
+    // The blue target is a convex hull. Its vertex mean is guaranteed to sit
+    // inside it, unlike the orange bounding-square centre for a triangle.
+    let (x, z) = if area.hull.len() >= 3 {
+        let sum = area.hull.iter().fold(Vec2::ZERO, |sum, &(lon, lat)| {
+            sum + Vec2::new(
+                ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos())
+                    as f32,
+                ((lat - scenario.latitude) * 110.574) as f32,
+            )
+        });
+        let center = sum / area.hull.len() as f32;
+        (center.x, center.y)
+    } else {
+        let (lon, lat) = area.center;
+        (
+            ((lon - scenario.longitude) * 111.320 * scenario.latitude.to_radians().cos()) as f32,
+            ((lat - scenario.latitude) * 110.574) as f32,
+        )
+    };
     Vec3::new(
         x,
         terrain.height_at(x, z) + DRONE_GROUND_CLEARANCE_KM + DRONE_RADIUS,
@@ -404,17 +446,23 @@ fn spawn_deployment_drone(
     index: usize,
 ) {
     let antennas = formation_antennas(target_slots, index, base_pos);
+    let id = drone_id(index);
+    let bias_seed = uuid_bias_seed(&id);
     let drone_entity = commands
         .spawn((
             Mesh3d(drone_mesh.clone()),
             MeshMaterial3d(drone_mat.clone()),
             Transform::from_translation(launch_pos),
-            Drone { id: drone_id(index) },
+            Drone { id },
             Antennas(antennas.clone()),
             DeploymentTarget {
                 ingress,
-                slot: target_slots[index],
                 spreading: false,
+                bias_direction: bias_direction(bias_seed, 0),
+                bias_seed: bias_seed as u32,
+                bias_elapsed_secs: 0.0,
+                next_bias_change_secs: initial_bias_delay_secs(bias_seed),
+                bias_window: 0,
             },
             DroneKinematics::default(),
             DroneAi::default(),
@@ -519,7 +567,7 @@ mod tests {
             ..default()
         };
         let (columns, rows) = coverage_grid_dimensions(&area);
-        // The computed four is raised to the five-drone fleet minimum.
+        // 36 km² / 18 km² per cell × 2 = 4, raised to the fleet minimum.
         assert_eq!(target_area_drone_count(&area), 5);
         assert_eq!((columns, rows), (3, 2));
     }

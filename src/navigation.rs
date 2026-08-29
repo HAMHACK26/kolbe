@@ -278,9 +278,24 @@ pub fn go_to_network_area(
             target.spreading = true;
         }
         let waypoint = if target.spreading {
+            target.bias_elapsed_secs += dt;
+            while target.bias_elapsed_secs >= target.next_bias_change_secs {
+                target.bias_window = target.bias_window.wrapping_add(1);
+                target.bias_direction = survey_bias_direction(
+                    target.bias_seed,
+                    target.bias_window,
+                    target.bias_direction,
+                );
+                target.next_bias_change_secs += 120.0;
+            }
+            // The 3 km look-ahead preserves a directional survey motion.
+            // Boundary spacing below can veto this if it would point at a wall.
+            let bias_waypoint = transform.translation
+                + Vec3::new(target.bias_direction.x, 0.0, target.bias_direction.y)
+                    * crate::world::FORMATION_RADIUS_KM;
             repel_from_target_boundary(
                 transform.translation,
-                clamp_to_target_area(target.slot, &network_area, &scenario),
+                bias_waypoint,
                 &network_area,
                 &scenario,
             )
@@ -296,6 +311,16 @@ pub fn go_to_network_area(
         kin.velocity = state.velocity;
         kin.heading_deg = state.heading_deg;
     }
+}
+
+/// Advance the stable UUID-seeded direction without introducing global shared
+/// timing or random state. Rotating it by 30–75° keeps successive paths from
+/// reversing by 90°+ unless obstacle avoidance has to override it.
+fn survey_bias_direction(seed: u32, window: u32, current: Vec2) -> Vec2 {
+    let step_deg = 30.0 + (seed.wrapping_add(window.wrapping_mul(47)) % 46) as f32;
+    let angle = step_deg.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    Vec2::new(current.x * cos - current.y * sin, current.x * sin + current.y * cos)
 }
 
 /// The blue boundary behaves like a virtual survey neighbor at this distance.
