@@ -27,6 +27,9 @@ height_server/.cache/
 # Temporary reference checkout
 .tmp-dies-irae/
 
+# Claude Code project instructions (local only, not shared via git)
+CLAUDE.md
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

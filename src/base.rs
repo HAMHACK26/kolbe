@@ -24,7 +24,7 @@ use crate::{
     factories::{movement::DroneKinematics, track::Track},
     radar::{RadarCone, cone_mesh_for, cone_transform_for},
     theme::ThemeRole,
-    world::{DRONE_RADIUS, WORLD_SIZE},
+    world::DRONE_RADIUS,
 };
 
 // ─── Base entity ──────────────────────────────────────────────────────────────
@@ -86,12 +86,24 @@ pub fn spawn_base(
     mut materials: ResMut<Assets<StandardMaterial>>,
     terrain: Res<crate::terrain::TerrainHeightMap>,
     theme: Res<crate::theme::Theme>,
+    base_position: Res<crate::area::BasePosition>,
+    area: Res<crate::area::ScenarioArea>,
 ) {
     // Initial colors from the palette; `apply_theme` re-syncs on toggle
     // (these entities carry ThemeRole markers).
     let pal = theme.palette();
-    let z = -WORLD_SIZE / 2.0 + 1.0;
-    let pos = Vec3::new(0.0, terrain.height_at(0.0, z) + DRONE_RADIUS, z); // south edge
+    // User-chosen base location, converted from lat/lon into the same local
+    // x/z frame the terrain mesh uses (see `fetch_height_map`'s row-flip
+    // comment: +Z is north, +X is east). Falls back to the south edge if
+    // somehow unset (shouldn't happen — `generate_terrain` requires it).
+    let (x, z) = match base_position.0 {
+        Some((lat, lon)) => (
+            ((lon - area.longitude) * 111.320 * area.latitude.to_radians().cos()) as f32,
+            ((lat - area.latitude) * 110.574) as f32,
+        ),
+        None => (0.0, -terrain.size_km() / 2.0 + 1.0),
+    };
+    let pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
 
     // 5 connections — same hardware as the drones, one antenna per 72° sector.
     let antennas: Vec<Antenna> =
@@ -114,6 +126,7 @@ pub fn spawn_base(
         },
         BaseNetworkState::default(),
         ThemeRole::BaseMarker,
+        crate::SimulationEntity,
     ))
     .observe(
         |mut t: On<Pointer<Click>>, orbit: Res<OrbitCamera>, mut sel: ResMut<SelectedDrone>| {
@@ -143,6 +156,7 @@ pub fn spawn_base(
             Visibility::Hidden,
             RadarCone { drone_entity: base_entity },
             ThemeRole::BaseCone,
+            crate::SimulationEntity,
         ));
     }
 }
