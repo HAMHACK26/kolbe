@@ -61,6 +61,7 @@ pub struct TrackedPeers(pub HashMap<Entity, Vec3>);
 ///
 /// This overrides the fixed 120°-apart layout `world::setup` used to compute
 /// the initial angles; those were only ever a starting point.
+#[allow(dead_code)] // Implemented and tested, but live aiming is not yet enabled in main.
 pub fn maintain_mesh_antennas(
     mut drones: Query<(&Transform, &mut Drone, &RingIndex, &TrackedPeers, &MeshTable, &Pairing)>,
     positions: Query<(Entity, &RingIndex, &DroneUuid), With<Drone>>,

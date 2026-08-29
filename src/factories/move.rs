@@ -4,8 +4,8 @@
 //! Two layers:
 //!   1. `apply_velocity`      — real integration loop; runs every frame, moves drones.
 //!   2. `MovementLogic::update` — per-drone velocity planner (Rust/Python); combines
-//!                              seek direction with avoidance forces before handing
-//!                              the final velocity to the integrator.
+//!      seek direction with avoidance forces before handing the final velocity to
+//!      the integrator.
 //!
 //! Typical pipeline per frame (all per-drone, no shared state):
 //!   SeekLogic  → desired_direction

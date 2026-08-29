@@ -44,6 +44,7 @@ fn main() {
         .add_plugins(MeshPickingPlugin)
         .init_state::<AppState>()
         .init_resource::<area::ScenarioArea>()
+        .init_resource::<terrain::VegetationSettings>()
         .insert_resource(SelectedDrone(None))
         .insert_resource(OrbitCamera::default())
         .insert_resource(Theme::default())
@@ -56,7 +57,12 @@ fn main() {
         .init_resource::<ui::NetworkTablePanelOpen>()
         .add_systems(Startup, (ui::setup_camera, theme::setup_moon))
         .add_systems(OnEnter(AppState::AreaSelection), area::setup)
-        .add_systems(Update, area::interactions.run_if(in_state(AppState::AreaSelection)))
+        .add_systems(
+            Update,
+            (area::interactions, area::refresh_vegetation_controls)
+                .chain()
+                .run_if(in_state(AppState::AreaSelection)),
+        )
         .add_systems(OnExit(AppState::AreaSelection), area::cleanup)
         .add_systems(OnEnter(AppState::LoadingTerrain), terrain::start_loading)
         .add_systems(
@@ -69,6 +75,7 @@ fn main() {
             OnEnter(AppState::Simulation),
             (
                 terrain::spawn_mesh,
+                terrain::spawn_trees,
                 world::setup,
                 base::spawn_base,
                 ui::make_camera_overlay,
@@ -79,7 +86,16 @@ fn main() {
         .add_systems(Update, radar::sync_radar_visibility.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, ui::update_popup_position.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, world::draw_grid.run_if(in_state(AppState::Simulation)))
-        .add_systems(Update, terrain::draw_contours.run_if(in_state(AppState::Simulation)))
+        // Contours and trees are alternatives: a forest covers the ground the
+        // contours describe, so only one of the two is drawn.
+        .add_systems(
+            Update,
+            terrain::draw_contours.run_if(
+                in_state(AppState::Simulation)
+                    .and(|vegetation: Res<terrain::VegetationSettings>| !vegetation.enabled),
+            ),
+        )
+        .add_systems(OnExit(AppState::Simulation), terrain::cleanup_trees)
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
         // Integration runs last in the movement chain: every system that wants

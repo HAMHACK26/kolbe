@@ -28,9 +28,15 @@ pub fn setup(
     theme: Res<Theme>,
 ) {
     let pal = theme.palette();
-    commands.spawn((Camera3d::default(), Transform::default()));
+    // `AmbientLight` is a per-camera override of `GlobalAmbientLight` and so
+    // `#[require(Camera)]`s one. Spawned on its own it lights nothing and leaves
+    // a camera entity with no render graph, which Bevy warns about every run.
+    commands.spawn((
+        Camera3d::default(),
+        Transform::default(),
+        AmbientLight { brightness: 300.0, ..default() },
+    ));
 
-    commands.spawn(AmbientLight { brightness: 300.0, ..default() });
     commands.spawn((
         DirectionalLight { illuminance: 8000.0, shadow_maps_enabled: false, ..default() },
         Transform::from_xyz(8.0, 16.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -60,8 +66,7 @@ pub fn setup(
     });
 
     let half = WORLD_SIZE / 2.0;
-    for i in 0..DRONE_COUNT {
-        let (km_x, km_z) = positions[i];
+    for (i, &(km_x, km_z)) in positions.iter().enumerate().take(DRONE_COUNT) {
         let x = km_x - half;
         let z = km_z - half;
         let drone_pos = Vec3::new(x, terrain.height_at(x, z) + DRONE_RADIUS, z);
