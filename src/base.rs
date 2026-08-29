@@ -33,6 +33,11 @@ use crate::{
 
 // ─── Base entity ──────────────────────────────────────────────────────────────
 
+/// Edge length of the cube the ground station is drawn as, km. Doubles as its
+/// physical footprint — [`crate::avoidance`] derives the base's bounding
+/// radius from it so drones keep clear of the structure.
+pub const BASE_BOX_SIZE_KM: f32 = 0.3;
+
 /// Marks the ground control station entity.
 #[derive(Component)]
 pub struct Base {
@@ -99,7 +104,7 @@ pub fn spawn_base(
     let base_entity = commands
         .spawn((
         // Visual: yellow box
-        Mesh3d(meshes.add(Cuboid::new(0.3, 0.3, 0.3))),
+        Mesh3d(meshes.add(Cuboid::from_length(BASE_BOX_SIZE_KM))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: pal.base,
             emissive: LinearRgba::new(1.5, 1.5, 0.0, 1.0),

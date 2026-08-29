@@ -122,6 +122,22 @@ impl FlightLimits {
     pub fn set_max_speed(&mut self, max_speed_mps: f32) {
         self.max_speed_mps = max_speed_mps.max(0.0);
     }
+
+    /// The same envelope expressed in the kilometer units the simulation
+    /// world is scaled in, so [`navigate`] integrates consistently with
+    /// km-space positions.
+    ///
+    /// Only the linear limits convert — `max_yaw_rate_deg_s` is an angular
+    /// rate and is scale-independent.
+    pub fn in_km(&self) -> Self {
+        Self {
+            max_speed_mps: self.max_speed_mps / 1000.0,
+            max_accel_mps2: self.max_accel_mps2 / 1000.0,
+            max_climb_mps: self.max_climb_mps / 1000.0,
+            max_descend_mps: self.max_descend_mps / 1000.0,
+            max_yaw_rate_deg_s: self.max_yaw_rate_deg_s,
+        }
+    }
 }
 
 /// A drone's current physical state: where it is, how fast it's currently

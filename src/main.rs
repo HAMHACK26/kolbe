@@ -1,5 +1,6 @@
 mod antenna;
 mod area;
+mod avoidance;
 mod base;
 mod camera;
 mod drone;
@@ -81,7 +82,16 @@ fn main() {
         .add_systems(Update, terrain::draw_contours.run_if(in_state(AppState::Simulation)))
         .add_systems(Update, theme::moon_toggle)
         .add_systems(Update, theme::apply_theme)
-        .add_systems(Update, factories::movement::apply_velocity.run_if(in_state(AppState::Simulation)))
+        // Integration runs last in the movement chain: every system that wants
+        // a say in this frame's velocity — navigators first, then the
+        // proximity ring's veto — has already written it by the time this
+        // steps the transforms.
+        .add_systems(
+            Update,
+            factories::movement::apply_velocity
+                .after(avoidance::avoid_collisions)
+                .run_if(in_state(AppState::Simulation)),
+        )
         .add_systems(
             Update,
             networking::advance_clocks.run_if(in_state(AppState::Simulation)),
@@ -102,6 +112,10 @@ fn main() {
                 // freshly (re)detected links and updated mesh table.
                 recovery::detect_partitions,
                 recovery::run_recovery,
+                // Last word on velocity: the proximity ring deflects whatever
+                // the navigators above just committed to, before
+                // `apply_velocity` integrates it.
+                avoidance::avoid_collisions,
             )
                 .chain()
                 .run_if(in_state(AppState::Simulation)),
