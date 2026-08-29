@@ -23,6 +23,9 @@ pub const DRONE_RADIUS: f32 = 0.0225;
 /// Clearance from the terrain to the underside of each drone, in km (50 m).
 pub const DRONE_GROUND_CLEARANCE_KM: f32 = 0.05;
 const DEPLOYMENT_INTERVAL_SECS: f32 = 5.0;
+/// Keeps launches clear of the base and of each other before navigation has
+/// had a chance to separate the formation.
+const LAUNCH_RING_RADIUS_KM: f32 = 0.10;
 
 /// The individual destination assigned to a drone during deployment.
 #[derive(Component)]
@@ -49,6 +52,15 @@ pub(crate) struct DeploymentQueue {
 
 /// Radius of the initial survey ring around the selected area's center.
 pub const FORMATION_RADIUS_KM: f32 = 3.0;
+
+fn launch_position(base_pos: Vec3, index: usize) -> Vec3 {
+    let angle = index as f32 / DRONE_COUNT as f32 * std::f32::consts::TAU;
+    base_pos + Vec3::new(
+        LAUNCH_RING_RADIUS_KM * angle.sin(),
+        0.0,
+        LAUNCH_RING_RADIUS_KM * angle.cos(),
+    )
+}
 
 /// Evenly distribute the swarm on a 3 km ring around the selected area's
 /// center. Communication range is intentionally not part of this deployment
@@ -168,8 +180,16 @@ pub fn setup(
     let target_slots = target_area_formation(&network_area, &scenario, &terrain);
     let ingress = target_area_center(&network_area, &scenario, &terrain);
     spawn_deployment_drone(
-        &mut commands, &mut meshes, &drone_mesh, &drone_mat, &cone_mat, base_pos, ingress,
-        &target_slots, 0,
+        &mut commands,
+        &mut meshes,
+        &drone_mesh,
+        &drone_mat,
+        &cone_mat,
+        launch_position(base_pos, 0),
+        base_pos,
+        ingress,
+        &target_slots,
+        0,
     );
     commands.insert_resource(DeploymentQueue {
         target_slots,
@@ -303,6 +323,7 @@ pub fn spawn_next_drone(
         &deployment.drone_mesh.clone(),
         &deployment.drone_mat.clone(),
         &deployment.cone_mat.clone(),
+        launch_position(deployment.base_pos, index),
         deployment.base_pos,
         deployment.ingress,
         &deployment.target_slots,
@@ -316,6 +337,7 @@ fn spawn_deployment_drone(
     drone_mesh: &Handle<Mesh>,
     drone_mat: &Handle<StandardMaterial>,
     cone_mat: &Handle<StandardMaterial>,
+    launch_pos: Vec3,
     base_pos: Vec3,
     ingress: Vec3,
     target_slots: &[Vec3],
@@ -326,7 +348,7 @@ fn spawn_deployment_drone(
         .spawn((
             Mesh3d(drone_mesh.clone()),
             MeshMaterial3d(drone_mat.clone()),
-            Transform::from_translation(base_pos),
+            Transform::from_translation(launch_pos),
             Drone { id: drone_id(index) },
             Antennas(antennas.clone()),
             DeploymentTarget {
@@ -394,6 +416,27 @@ pub fn draw_grid(
                 Vec3::new(offset, terrain.height_at(offset, b) + 0.01, b),
                 color,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_pads_clear_each_other_and_the_base() {
+        let base = Vec3::ZERO;
+        let pads: Vec<Vec3> = (0..DRONE_COUNT)
+            .map(|index| launch_position(base, index))
+            .collect();
+        for pad in &pads {
+            assert!((pad.xz().length() - LAUNCH_RING_RADIUS_KM).abs() < 1e-6);
+        }
+        for (index, pad) in pads.iter().enumerate() {
+            for other in pads.iter().skip(index + 1) {
+                assert!(pad.xz().distance(other.xz()) > DRONE_RADIUS * 2.0);
+            }
         }
     }
 }
