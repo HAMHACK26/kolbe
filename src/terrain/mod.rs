@@ -69,7 +69,6 @@ impl TerrainHeightMap {
 
 struct TerrainData {
     height_map: TerrainHeightMap,
-    vegetation: vegetation::VegetationMap,
 }
 
 #[derive(Resource)]
@@ -168,11 +167,7 @@ pub fn update_progress(
         return;
     };
 
-    let percent = if snapshot.total > 0 {
-        snapshot.done as f32 / snapshot.total as f32 * 100.0
-    } else {
-        2.0
-    };
+    let percent = snapshot.overall_fraction() * 100.0;
     if let Ok(mut bar) = bars.single_mut() {
         bar.width = Val::Percent(percent.clamp(2.0, 100.0));
     }
@@ -204,7 +199,6 @@ pub fn poll_loading(
         Ok(data) => {
             commands.remove_resource::<TerrainLoadTask>();
             commands.insert_resource(data.height_map);
-            commands.insert_resource(data.vegetation);
             next_state.set(AppState::Simulation);
         }
         Err(message) => {
@@ -257,6 +251,7 @@ pub fn spawn_mesh(
 
 pub use vegetation::spawn_trees;
 pub use vegetation::cleanup_trees;
+pub use vegetation::{DENSITY_STEP, MAX_DENSITY, MIN_DENSITY, VegetationSettings};
 
 /// Draw 20 m contour lines from the local height grid. Heights in the grid are
 /// relative to the lowest point in the selected area, which is sufficient for
@@ -367,24 +362,10 @@ fn fetch_height_map(
 }
 
 fn fetch_terrain_data(area: &ScenarioArea, progress: &ProgressHandle) -> Result<TerrainData, String> {
+    // Vegetation is generated procedurally at spawn time, so the only thing the
+    // background load does is fetch elevation.
     let height_map = fetch_height_map(area, progress)?;
-    if let Ok(mut snapshot) = progress.lock() {
-        snapshot.phase = "Processing vegetation".into();
-        snapshot.done = 0;
-        snapshot.total = 1;
-        snapshot.current.clear();
-    }
-    // Vegetation is optional: terrain remains usable when its source is absent
-    // or malformed, while the warning is still visible in logs.
-    let vegetation = vegetation::load_configured(area).unwrap_or_else(|error| {
-        warn!("vegetation unavailable: {error}");
-        vegetation::VegetationMap::default()
-    });
-    if let Ok(mut snapshot) = progress.lock() {
-        snapshot.phase = "Terrain and vegetation ready".into();
-        snapshot.done = 1;
-    }
-    Ok(TerrainData { height_map, vegetation })
+    Ok(TerrainData { height_map })
 }
 
 fn mesh_from_height_map(map: &TerrainHeightMap) -> Mesh {

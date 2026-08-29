@@ -1,25 +1,44 @@
-//! Tree-height raster detection and terrain vegetation rendering.
+//! Procedural vegetation.
+//!
+//! Real canopy data was tried and dropped deliberately. Nothing in the
+//! simulation reads tree positions — link budget is distance and antenna gain
+//! only (see `networking::detect_links_and_send_headers`), so trees are purely
+//! scenery. At the densities that actually look like forest, per-tree fidelity
+//! from a height raster is invisible, while the fetch cost was minutes. A
+//! deterministic scatter gives the same picture for free.
+//!
+//! Every tree is the same height by design: this is ground cover for scale and
+//! parallax, not a forestry model.
 
 use super::TerrainHeightMap;
-use crate::area::ScenarioArea;
-use bevy::{log::info, prelude::*};
-use std::{cmp::Ordering, collections::HashMap, io::Cursor, time::Duration};
-use tiff::decoder::{Decoder, DecodingResult};
+use bevy::{asset::RenderAssetUsages, log::info, mesh::Indices, prelude::*};
 
-const DEFAULT_MIN_HEIGHT_M: f32 = 5.0;
-const DEFAULT_MIN_SPACING_M: f32 = 8.0;
-const DEFAULT_MAX_TREES: usize = 10_000;
-
-/// Tree heights in decimetres. Row zero is the north edge.
-#[derive(Clone, Debug)]
-pub struct TreeHeightRaster {
-    pub heights_dm: Vec<i16>,
-    pub width: usize,
-    pub height: usize,
-    pub pixel_size_m: f32,
-    pub area_width_m: f32,
-    pub area_height_m: f32,
-}
+/// Distance between trees before jitter, in metres. The dominant cost knob:
+/// tree count scales with its inverse square, so halving this quadruples both
+/// triangle count and vertex memory. Lower it for a thicker forest if your GPU
+/// has the headroom.
+const DEFAULT_SPACING_M: f32 = 40.0;
+const DEFAULT_TREE_HEIGHT_M: f32 = 50.0;
+/// Fraction of the spacing a tree may wander from its grid slot. Enough to
+/// break up the lattice without opening gaps.
+const JITTER_FRACTION: f32 = 0.45;
+/// Crown radius as a fraction of total height. At the default spacing this puts
+/// neighbouring crowns just about in contact, so the canopy reads as closed.
+const CROWN_RADIUS_FRACTION: f32 = 0.28;
+const TRUNK_HEIGHT_FRACTION: f32 = 0.34;
+const TRUNK_RADIUS_FRACTION: f32 = 0.030;
+const CROWN_SIDES: usize = 5;
+const TRUNK_SIDES: usize = 3;
+/// Side length of one merged forest mesh, in kilometres. Trees are welded into
+/// per-chunk meshes so a dense forest costs a few hundred entities rather than
+/// a few hundred thousand, while staying small enough to frustum-cull well.
+const CHUNK_KM: f32 = 1.0;
+/// A tree is dropped when the ground under it is both near the terrain floor
+/// and locally flat — that combination is lake or sea, not low ground.
+const WATER_MAX_HEIGHT_M: f32 = 0.75;
+const WATER_MAX_RELIEF_M: f32 = 0.40;
+/// Horizontal offset used to measure local relief for the water test.
+const RELIEF_SAMPLE_KM: f32 = 0.03;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TreeInstance {
@@ -29,316 +48,265 @@ pub struct TreeInstance {
     pub crown_radius_m: f32,
 }
 
-#[derive(Resource, Default)]
-pub struct VegetationMap {
-    pub trees: Vec<TreeInstance>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct DetectionConfig {
-    pub min_height_m: f32,
-    pub min_spacing_m: f32,
-    pub max_trees: usize,
-}
-
-impl DetectionConfig {
-    pub fn from_env() -> Self {
-        Self {
-            min_height_m: env_f32("TREE_MIN_HEIGHT_M", DEFAULT_MIN_HEIGHT_M, 0.1, 100.0),
-            min_spacing_m: env_f32("TREE_MIN_SPACING_M", DEFAULT_MIN_SPACING_M, 1.0, 100.0),
-            max_trees: std::env::var("TREE_MAX_COUNT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_MAX_TREES)
-                .min(100_000),
-        }
-    }
-}
-
-/// Optional offline raster source used by the asynchronous terrain load. The
-/// first three whitespace-separated fields are width, height, and pixel size
-/// in metres; all remaining fields are signed tree heights in decimetres.
-pub fn load_configured(area: &ScenarioArea) -> Result<VegetationMap, String> {
-    if !vegetation_enabled() {
-        return Ok(VegetationMap::default());
-    }
-    let raster = if let Ok(path) = std::env::var("TREE_HEIGHT_RASTER_PATH") {
-        read_text_raster(&path, area.size_km)?
-    } else {
-        fetch_tree_height_raster(area)?
-    };
-    let width = raster.width;
-    let height = raster.height;
-    let trees = detect_trees(&raster, DetectionConfig::from_env())?;
-    info!(
-        "tree-height raster {width}x{height}: detected {} trees",
-        trees.len()
-    );
-    Ok(VegetationMap { trees })
-}
-
-fn read_text_raster(path: &str, area_size_km: f32) -> Result<TreeHeightRaster, String> {
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("could not read tree-height raster {path}: {error}"))?;
-    let mut fields = text.split_whitespace();
-    let width = parse_field::<usize>(&mut fields, "width")?;
-    let height = parse_field::<usize>(&mut fields, "height")?;
-    let pixel_size_m = parse_field::<f32>(&mut fields, "pixel size")?;
-    let heights_dm = fields
-        .map(|value| {
-            value
-                .parse::<i16>()
-                .map_err(|_| format!("invalid tree height: {value}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(TreeHeightRaster {
-        heights_dm,
-        width,
-        height,
-        pixel_size_m,
-        area_width_m: area_size_km * 1_000.0,
-        area_height_m: area_size_km * 1_000.0,
-    })
-}
-
-fn fetch_tree_height_raster(area: &ScenarioArea) -> Result<TreeHeightRaster, String> {
-    let endpoint = std::env::var("TREE_HEIGHT_SERVICE_URL").unwrap_or_else(|_| {
-        "https://geodata.skogsstyrelsen.se/arcgis/rest/services/Publikt/Tradhojd_3_1/ImageServer/exportImage".into()
-    });
-    let resolution_m = env_f32("TREE_RASTER_RESOLUTION_M", 5.0, 2.0, 100.0);
-    let pixels = ((area.size_km * 1_000.0 / resolution_m).ceil() as usize).clamp(2, 4_000);
-    let [west, south, east, north] = area.wgs84_bbox();
-    let bbox = format!("{west},{south},{east},{north}");
-    let size = format!("{pixels},{pixels}");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let bytes = client
-        .get(endpoint)
-        .query(&[
-            ("bbox", bbox.as_str()),
-            ("bboxSR", "4326"),
-            ("imageSR", "4326"),
-            ("size", size.as_str()),
-            ("format", "tiff"),
-            ("pixelType", "S16"),
-            ("interpolation", "RSP_NearestNeighbor"),
-            ("f", "image"),
-        ])
-        .send()
-        .and_then(|response| response.error_for_status())
-        .map_err(|e| format!("tree-height service request failed: {e}"))?
-        .bytes()
-        .map_err(|e| format!("tree-height download failed: {e}"))?;
-    decode_tiff(&bytes, area.size_km)
-}
-
-fn decode_tiff(bytes: &[u8], area_size_km: f32) -> Result<TreeHeightRaster, String> {
-    let mut decoder =
-        Decoder::new(Cursor::new(bytes)).map_err(|e| format!("invalid tree-height TIFF: {e}"))?;
-    let (width, height) = decoder.dimensions().map_err(|e| e.to_string())?;
-    let heights_dm = match decoder.read_image().map_err(|e| e.to_string())? {
-        DecodingResult::I16(values) => values,
-        DecodingResult::U16(values) => values
-            .into_iter()
-            .map(|v| v.min(i16::MAX as u16) as i16)
-            .collect(),
-        DecodingResult::U8(values) => values.into_iter().map(i16::from).collect(),
-        other => return Err(format!("unsupported tree-height TIFF pixels: {other:?}")),
-    };
-    let width = width as usize;
-    let height = height as usize;
-    Ok(TreeHeightRaster {
-        heights_dm,
-        width,
-        height,
-        pixel_size_m: area_size_km * 1_000.0 / width as f32,
-        area_width_m: area_size_km * 1_000.0,
-        area_height_m: area_size_km * 1_000.0,
-    })
-}
-
-fn parse_field<T: std::str::FromStr>(
-    fields: &mut std::str::SplitWhitespace<'_>,
-    name: &str,
-) -> Result<T, String> {
-    fields
-        .next()
-        .ok_or_else(|| format!("tree-height raster is missing {name}"))?
-        .parse()
-        .map_err(|_| format!("tree-height raster has an invalid {name}"))
-}
-
 #[derive(Component)]
 pub struct TerrainTree;
 
-/// Find canopy maxima, then resolve overlapping crowns tallest-first.
-pub fn detect_trees(
-    raster: &TreeHeightRaster,
-    config: DetectionConfig,
-) -> Result<Vec<TreeInstance>, String> {
-    if config.max_trees == 0 {
-        return Ok(Vec::new());
-    }
-    if raster.width == 0 || raster.height == 0 {
-        return Ok(Vec::new());
-    }
-    if raster.heights_dm.len() != raster.width * raster.height {
-        return Err("tree-height raster dimensions do not match its data".into());
-    }
-    if !raster.pixel_size_m.is_finite() || raster.pixel_size_m <= 0.0 {
-        return Err("tree-height raster pixel size must be positive".into());
-    }
-    let radius = ((config.min_spacing_m * 0.5) / raster.pixel_size_m)
-        .ceil()
-        .max(1.0) as isize;
-    let minimum_dm = (config.min_height_m * 10.0).ceil() as i16;
-    let mut candidates = Vec::new();
-    for row in 0..raster.height {
-        for column in 0..raster.width {
-            let value = raster.heights_dm[row * raster.width + column];
-            if value >= minimum_dm && is_local_maximum(raster, column, row, value, radius) {
-                candidates.push(to_tree(raster, column, row, value));
-            }
+/// Density multipliers the area-selection slider offers, relative to
+/// `DEFAULT_SPACING_M`. The ceiling is where a 20 km area stops fitting
+/// comfortably in GPU memory on an integrated card.
+pub const MIN_DENSITY: f32 = 0.25;
+pub const MAX_DENSITY: f32 = 2.0;
+pub const DENSITY_STEP: f32 = 0.25;
+
+/// Chosen before generation on the area-selection screen. Trees and contour
+/// lines are mutually exclusive: a forest hides the ground the contours
+/// describe, so the two would only fight for the same pixels.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct VegetationSettings {
+    pub enabled: bool,
+    /// Trees per unit area, relative to the default scatter.
+    pub density: f32,
+}
+
+impl Default for VegetationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: vegetation_enabled(),
+            density: 1.0,
         }
     }
-    candidates.sort_by(|a, b| {
-        b.height_m
-            .partial_cmp(&a.height_m)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.z_km.total_cmp(&b.z_km))
-            .then_with(|| a.x_km.total_cmp(&b.x_km))
-    });
-    let spacing_sq = (config.min_spacing_m / 1_000.0).powi(2);
-    let spacing_km = config.min_spacing_m / 1_000.0;
-    let mut accepted: Vec<TreeInstance> =
-        Vec::with_capacity(config.max_trees.min(candidates.len()));
-    let mut spatial: HashMap<(i32, i32), Vec<TreeInstance>> = HashMap::new();
-    for candidate in candidates {
-        let cell = (
-            (candidate.x_km / spacing_km).floor() as i32,
-            (candidate.z_km / spacing_km).floor() as i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScatterConfig {
+    pub spacing_m: f32,
+    pub height_m: f32,
+    pub area_size_km: f32,
+}
+
+impl ScatterConfig {
+    pub fn for_settings(settings: &VegetationSettings, area_size_km: f32) -> Self {
+        // Density counts trees per unit area, so spacing goes as its inverse
+        // square root: twice the density gives each tree half the ground.
+        let base = env_f32("TREE_SPACING_M", DEFAULT_SPACING_M, 5.0, 500.0);
+        let density = settings.density.clamp(MIN_DENSITY, MAX_DENSITY);
+        Self {
+            spacing_m: (base / density.sqrt()).clamp(5.0, 500.0),
+            height_m: env_f32("TREE_HEIGHT_M", DEFAULT_TREE_HEIGHT_M, 1.0, 150.0),
+            area_size_km,
+        }
+    }
+}
+
+/// Deterministic hash so a given area always grows the same forest — otherwise
+/// trees would jump on every reload of the same scenario.
+fn hash_to_unit(x: u32, y: u32, salt: u32) -> f32 {
+    let mut h = x
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(y.wrapping_mul(0x85EB_CA6B))
+        .wrapping_add(salt.wrapping_mul(0xC2B2_AE35));
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2545_F491);
+    h ^= h >> 13;
+    // Top 24 bits into [0, 1).
+    (h >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// Lay trees on a jittered grid across the whole area.
+pub fn scatter(config: ScatterConfig) -> Vec<TreeInstance> {
+    let extent_m = config.area_size_km * 1_000.0;
+    let half_m = extent_m * 0.5;
+    let steps = (extent_m / config.spacing_m).floor().max(1.0) as u32;
+    let jitter = config.spacing_m * JITTER_FRACTION;
+    let crown_radius_m = config.height_m * CROWN_RADIUS_FRACTION;
+
+    let mut trees = Vec::with_capacity((steps as usize).saturating_mul(steps as usize));
+    for row in 0..steps {
+        for column in 0..steps {
+            let base_x = (column as f32 + 0.5) * config.spacing_m - half_m;
+            let base_z = (row as f32 + 0.5) * config.spacing_m - half_m;
+            let dx = (hash_to_unit(column, row, 1) - 0.5) * 2.0 * jitter;
+            let dz = (hash_to_unit(column, row, 2) - 0.5) * 2.0 * jitter;
+            trees.push(TreeInstance {
+                x_km: (base_x + dx) / 1_000.0,
+                z_km: (base_z + dz) / 1_000.0,
+                height_m: config.height_m,
+                crown_radius_m,
+            });
+        }
+    }
+    trees
+}
+
+/// Accumulates many trees into one mesh.
+#[derive(Default)]
+struct MeshBuilder {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+}
+
+impl MeshBuilder {
+    fn push_triangle(&mut self, a: Vec3, b: Vec3, c: Vec3) {
+        let normal = (b - a).cross(c - a).normalize_or_zero();
+        for vertex in [a, b, c] {
+            self.positions.push(vertex.to_array());
+            self.normals.push(normal.to_array());
+        }
+    }
+
+    /// Append one tree, in kilometres, with its base at `base`.
+    fn push_tree(&mut self, base: Vec3, height_km: f32, crown_radius_km: f32, yaw: f32) {
+        let trunk_height = height_km * TRUNK_HEIGHT_FRACTION;
+        let trunk_radius = (height_km * TRUNK_RADIUS_FRACTION).max(0.000_2);
+        let ring = |sides: usize, side: usize, radius: f32, y: f32| {
+            let angle = side as f32 / sides as f32 * std::f32::consts::TAU + yaw;
+            base + Vec3::new(angle.cos() * radius, y, angle.sin() * radius)
+        };
+
+        // Trunk: a low-sided prism from the ground to the base of the crown.
+        for side in 0..TRUNK_SIDES {
+            let p0 = ring(TRUNK_SIDES, side, trunk_radius, 0.0);
+            let p1 = ring(TRUNK_SIDES, side + 1, trunk_radius, 0.0);
+            let top = Vec3::Y * trunk_height;
+            self.push_triangle(p0, p1, p1 + top);
+            self.push_triangle(p0, p1 + top, p0 + top);
+        }
+
+        // Crown: a cone from the top of the trunk to the tip.
+        let apex = base + Vec3::Y * height_km;
+        for side in 0..CROWN_SIDES {
+            let p0 = ring(CROWN_SIDES, side, crown_radius_km, trunk_height);
+            let p1 = ring(CROWN_SIDES, side + 1, crown_radius_km, trunk_height);
+            self.push_triangle(p0, p1, apex);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    fn build(self) -> Mesh {
+        let indices: Vec<u32> = (0..self.positions.len() as u32).collect();
+        let mut mesh = Mesh::new(
+            bevy::render::mesh::PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
         );
-        let overlaps = (-1..=1).any(|dx| {
-            (-1..=1).any(|dz| {
-                spatial
-                    .get(&(cell.0 + dx, cell.1 + dz))
-                    .is_some_and(|trees| {
-                        trees.iter().any(|tree| {
-                            (tree.x_km - candidate.x_km).powi(2)
-                                + (tree.z_km - candidate.z_km).powi(2)
-                                < spacing_sq
-                        })
-                    })
-            })
-        });
-        if overlaps {
-            continue;
-        }
-        spatial.entry(cell).or_default().push(candidate);
-        accepted.push(candidate);
-        if accepted.len() == config.max_trees {
-            break;
-        }
-    }
-    Ok(accepted)
-}
-
-fn is_local_maximum(
-    raster: &TreeHeightRaster,
-    column: usize,
-    row: usize,
-    value: i16,
-    radius: isize,
-) -> bool {
-    for dy in -radius..=radius {
-        for dx in -radius..=radius {
-            if dx == 0 && dy == 0 {
-                continue;
-            }
-            let (x, y) = (column as isize + dx, row as isize + dy);
-            if x < 0 || y < 0 || x >= raster.width as isize || y >= raster.height as isize {
-                continue;
-            }
-            let other = raster.heights_dm[y as usize * raster.width + x as usize];
-            // A deterministic north-west winner collapses flat plateaus.
-            if other > value || (other == value && (dy < 0 || (dy == 0 && dx < 0))) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn to_tree(raster: &TreeHeightRaster, column: usize, row: usize, height_dm: i16) -> TreeInstance {
-    let x_m = (column as f32 + 0.5) * raster.pixel_size_m - raster.area_width_m * 0.5;
-    // Raster rows run north to south, while Bevy +Z points north.
-    let z_m = raster.area_height_m * 0.5 - (row as f32 + 0.5) * raster.pixel_size_m;
-    let height_m = height_dm as f32 / 10.0;
-    TreeInstance {
-        x_km: x_m / 1_000.0,
-        z_km: z_m / 1_000.0,
-        height_m,
-        crown_radius_m: (height_m * 0.2).clamp(1.0, 8.0),
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, self.positions);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals);
+        mesh.insert_indices(Indices::U32(indices));
+        mesh
     }
 }
 
-/// Render two directly batched entities per tree, without parent entities.
+/// Trees only belong on land. Water in this terrain is whatever sits on the
+/// normalised floor and is locally flat — real ground that low still undulates.
+fn is_land(height_map: &TerrainHeightMap, x_km: f32, z_km: f32) -> bool {
+    let ground_m = height_map.height_at(x_km, z_km) * 1_000.0;
+    if ground_m > WATER_MAX_HEIGHT_M {
+        return true;
+    }
+    let d = RELIEF_SAMPLE_KM;
+    let samples = [
+        height_map.height_at(x_km + d, z_km),
+        height_map.height_at(x_km - d, z_km),
+        height_map.height_at(x_km, z_km + d),
+        height_map.height_at(x_km, z_km - d),
+    ];
+    let highest = samples.iter().copied().fold(f32::NEG_INFINITY, f32::max) * 1_000.0;
+    let lowest = samples.iter().copied().fold(f32::INFINITY, f32::min) * 1_000.0;
+    (highest - lowest) > WATER_MAX_RELIEF_M
+}
+
+/// Grow and spawn the forest. Runs once on entering the simulation.
 pub fn spawn_trees(
     mut commands: Commands,
     height_map: Res<TerrainHeightMap>,
-    vegetation: Res<VegetationMap>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    settings: Res<VegetationSettings>,
 ) {
-    if !vegetation_enabled() || vegetation.trees.is_empty() {
+    if !settings.enabled {
         return;
     }
-    let trunk_mesh = meshes.add(Cylinder::new(1.0, 1.0));
-    let crown_mesh = meshes.add(Cone::new(1.0, 1.0));
-    let trunk_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb_u8(0x6f, 0x4e, 0x37),
-        perceptual_roughness: 1.0,
-        ..default()
-    });
-    let crown_mat = materials.add(StandardMaterial {
+    let config = ScatterConfig::for_settings(&settings, height_map.size_km);
+    let candidates = scatter(config);
+    if candidates.is_empty() {
+        return;
+    }
+
+    let half_km = config.area_size_km * 0.5;
+    let chunks_per_side = (config.area_size_km / CHUNK_KM).ceil().max(1.0) as usize;
+    let mut builders: Vec<MeshBuilder> = (0..chunks_per_side * chunks_per_side)
+        .map(|_| MeshBuilder::default())
+        .collect();
+
+    let mut planted = 0usize;
+    for tree in candidates {
+        if !is_land(&height_map, tree.x_km, tree.z_km) {
+            continue;
+        }
+        let chunk_x = (((tree.x_km + half_km) / CHUNK_KM) as usize).min(chunks_per_side - 1);
+        let chunk_z = (((tree.z_km + half_km) / CHUNK_KM) as usize).min(chunks_per_side - 1);
+        let origin = Vec3::new(
+            chunk_x as f32 * CHUNK_KM - half_km,
+            0.0,
+            chunk_z as f32 * CHUNK_KM - half_km,
+        );
+
+        // Vary yaw and size so a shared silhouette does not read as clones.
+        let key = (tree.x_km.to_bits(), tree.z_km.to_bits());
+        let yaw = hash_to_unit(key.0, key.1, 3) * std::f32::consts::TAU;
+        let scale = 0.8 + hash_to_unit(key.0, key.1, 4) * 0.45;
+        let ground = height_map.height_at(tree.x_km, tree.z_km);
+        builders[chunk_z * chunks_per_side + chunk_x].push_tree(
+            Vec3::new(tree.x_km, ground, tree.z_km) - origin,
+            tree.height_m / 1_000.0 * scale,
+            tree.crown_radius_m / 1_000.0 * scale,
+            yaw,
+        );
+        planted += 1;
+    }
+
+    let material = materials.add(StandardMaterial {
         base_color: Color::srgb_u8(0x2f, 0x6f, 0x3e),
         perceptual_roughness: 0.95,
         ..default()
     });
-    let visibility_range =
-        VisibilityRange::abrupt(0.0, env_f32("TREE_LOD_DISTANCE_KM", 40.0, 0.1, 1_000.0));
-    for tree in &vegetation.trees {
-        let (height, crown_radius) = (tree.height_m / 1_000.0, tree.crown_radius_m / 1_000.0);
-        let (trunk_height, crown_height) = (height * 0.42, height * 0.78);
-        let ground = height_map.height_at(tree.x_km, tree.z_km);
-        let trunk_radius = (crown_radius * 0.16).max(0.0008);
+    // No `VisibilityRange`: the whole 20 km area is on screen when you zoom out,
+    // and a distance cut-off puts a visible circular edge across the forest.
+    // Frustum culling per chunk is the only culling these meshes get.
+    let mut chunk_count = 0;
+    for (index, builder) in builders.into_iter().enumerate() {
+        if builder.is_empty() {
+            continue;
+        }
+        let (chunk_x, chunk_z) = (index % chunks_per_side, index / chunks_per_side);
+        let origin = Vec3::new(
+            chunk_x as f32 * CHUNK_KM - half_km,
+            0.0,
+            chunk_z as f32 * CHUNK_KM - half_km,
+        );
         commands.spawn((
-            Mesh3d(trunk_mesh.clone()),
-            MeshMaterial3d(trunk_mat.clone()),
-            Transform::from_xyz(tree.x_km, ground + trunk_height * 0.5, tree.z_km)
-                .with_scale(Vec3::new(trunk_radius, trunk_height, trunk_radius)),
-            visibility_range.clone(),
+            Mesh3d(meshes.add(builder.build())),
+            MeshMaterial3d(material.clone()),
+            Transform::from_translation(origin),
             TerrainTree,
         ));
-        commands.spawn((
-            Mesh3d(crown_mesh.clone()),
-            MeshMaterial3d(crown_mat.clone()),
-            Transform::from_xyz(tree.x_km, ground + height - crown_height * 0.5, tree.z_km)
-                .with_scale(Vec3::new(crown_radius, crown_height, crown_radius)),
-            visibility_range.clone(),
-            TerrainTree,
-        ));
+        chunk_count += 1;
     }
-    info!("spawned {} terrain trees", vegetation.trees.len());
+
+    info!(
+        "spawned {} procedural trees ({:.0} m tall, {:.0} m spacing) in {chunk_count} chunks",
+        planted,
+        config.height_m,
+        config.spacing_m
+    );
 }
 
 pub fn cleanup_trees(mut commands: Commands, trees: Query<Entity, With<TerrainTree>>) {
     for entity in &trees {
         commands.entity(entity).despawn();
     }
-    commands.remove_resource::<VegetationMap>();
 }
 
 fn vegetation_enabled() -> bool {
@@ -346,6 +314,7 @@ fn vegetation_enabled() -> bool {
         .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
         .unwrap_or(true)
 }
+
 fn env_f32(name: &str, default: f32, min: f32, max: f32) -> f32 {
     std::env::var(name)
         .ok()
@@ -358,60 +327,109 @@ fn env_f32(name: &str, default: f32, min: f32, max: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn raster(values: &[i16], width: usize, height: usize) -> TreeHeightRaster {
-        TreeHeightRaster {
-            heights_dm: values.to_vec(),
-            width,
-            height,
-            pixel_size_m: 2.0,
-            area_width_m: width as f32 * 2.0,
-            area_height_m: height as f32 * 2.0,
-        }
-    }
-    fn config(spacing: f32, max_trees: usize) -> DetectionConfig {
-        DetectionConfig {
-            min_height_m: 5.0,
-            min_spacing_m: spacing,
-            max_trees,
+
+    fn config(spacing_m: f32, area_size_km: f32) -> ScatterConfig {
+        ScatterConfig {
+            spacing_m,
+            height_m: 50.0,
+            area_size_km,
         }
     }
 
     #[test]
-    fn finds_maximum_above_threshold() {
-        let trees = detect_trees(
-            &raster(&[0, 20, 0, 40, 120, 30, 0, 20, 0], 3, 3),
-            config(2.0, 10),
-        )
-        .unwrap();
-        assert_eq!(trees.len(), 1);
-        assert_eq!(trees[0].height_m, 12.0);
+    fn scatter_covers_the_area_at_the_requested_density() {
+        let trees = scatter(config(100.0, 10.0));
+        // 10 km at 100 m spacing -> a 100 x 100 lattice.
+        assert_eq!(trees.len(), 100 * 100);
     }
+
     #[test]
-    fn north_row_maps_to_positive_z() {
-        let trees = detect_trees(&raster(&[100, 0, 0, 80], 2, 2), config(2.0, 10)).unwrap();
-        let north = trees.iter().find(|t| t.height_m == 10.0).unwrap();
-        assert!(north.z_km > 0.0);
-        assert!(north.x_km < 0.0);
+    fn every_tree_lands_inside_the_area() {
+        let area_size_km = 20.0;
+        let half = area_size_km / 2.0;
+        for tree in scatter(config(45.0, area_size_km)) {
+            assert!(tree.x_km.abs() <= half, "x {} outside", tree.x_km);
+            assert!(tree.z_km.abs() <= half, "z {} outside", tree.z_km);
+        }
     }
+
     #[test]
-    fn spacing_prefers_taller_tree() {
-        let trees = detect_trees(&raster(&[0, 120, 0, 110, 0], 5, 1), config(5.0, 10)).unwrap();
-        assert_eq!(trees.len(), 1);
-        assert_eq!(trees[0].height_m, 12.0);
+    fn scatter_is_deterministic() {
+        assert_eq!(scatter(config(80.0, 5.0)), scatter(config(80.0, 5.0)));
     }
+
     #[test]
-    fn thinning_is_deterministic_and_tallest_first() {
-        let input = raster(&[100, 0, 130, 0, 120], 5, 1);
-        let a = detect_trees(&input, config(2.0, 2)).unwrap();
-        let b = detect_trees(&input, config(2.0, 2)).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(
-            a.iter().map(|t| t.height_m).collect::<Vec<_>>(),
-            vec![13.0, 12.0]
+    fn jitter_actually_breaks_the_lattice() {
+        let trees = scatter(config(100.0, 5.0));
+        // No two trees should share an exact grid column position.
+        let first_row: Vec<f32> = trees.iter().take(10).map(|t| t.z_km).collect();
+        assert!(
+            first_row.windows(2).any(|w| w[0] != w[1]),
+            "trees are still perfectly aligned"
         );
     }
+
     #[test]
-    fn rejects_bad_dimensions() {
-        assert!(detect_trees(&raster(&[100], 2, 2), config(2.0, 10)).is_err());
+    fn all_trees_share_the_configured_height() {
+        let trees = scatter(config(120.0, 4.0));
+        assert!(trees.iter().all(|t| t.height_m == 50.0));
+    }
+
+    #[test]
+    fn one_tree_contributes_the_expected_geometry() {
+        let mut builder = MeshBuilder::default();
+        builder.push_tree(Vec3::ZERO, 0.05, 0.014, 0.0);
+        // Trunk sides are quads (two triangles); crown sides are single
+        // triangles. Three vertices each, no sharing.
+        let expected = (TRUNK_SIDES * 2 + CROWN_SIDES) * 3;
+        assert_eq!(builder.positions.len(), expected);
+        assert_eq!(builder.normals.len(), expected);
+        assert!(builder.positions.iter().all(|p| p[1] >= 0.0));
+        // The tip reaches the requested height.
+        let peak = builder.positions.iter().map(|p| p[1]).fold(0.0, f32::max);
+        assert!((peak - 0.05).abs() < 1e-6, "peak {peak}");
+    }
+
+    #[test]
+    fn chunked_meshes_keep_entity_count_far_below_tree_count() {
+        // The whole point of chunking: 20 km at 40 m spacing is ~250k trees but
+        // only ~400 chunk meshes.
+        let trees = scatter(config(40.0, 20.0));
+        let chunks = (20.0f32 / CHUNK_KM).ceil() as usize;
+        assert!(trees.len() > 200_000);
+        assert!(chunks * chunks < 500);
+    }
+
+    #[test]
+    fn density_scales_tree_count_linearly() {
+        let area_km = 8.0;
+        let count = |density: f32| {
+            let settings = VegetationSettings { enabled: true, density };
+            scatter(ScatterConfig::for_settings(&settings, area_km)).len() as f32
+        };
+
+        let baseline = count(1.0);
+        // Tree count is per unit area, so it should track the multiplier
+        // directly even though spacing moves by its square root.
+        assert!((count(MAX_DENSITY) / baseline - MAX_DENSITY).abs() < 0.05);
+        assert!((count(MIN_DENSITY) / baseline - MIN_DENSITY).abs() < 0.05);
+    }
+
+    #[test]
+    fn density_is_clamped_to_the_slider_range() {
+        let area_km = 8.0;
+        let spacing = |density: f32| {
+            ScatterConfig::for_settings(&VegetationSettings { enabled: true, density }, area_km)
+                .spacing_m
+        };
+        assert_eq!(spacing(100.0), spacing(MAX_DENSITY));
+        assert_eq!(spacing(0.0), spacing(MIN_DENSITY));
+    }
+
+    #[test]
+    fn spacing_is_clamped_to_something_survivable() {
+        // A 1 m spacing over 20 km would be 400 million trees.
+        let clamped = env_f32("TREE_SPACING_M_UNSET_FOR_TEST", 0.5, 5.0, 500.0);
+        assert_eq!(clamped, 5.0);
     }
 }

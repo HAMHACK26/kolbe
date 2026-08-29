@@ -2917,20 +2917,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hackathon_hamburg"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "dotenvy",
- "flate2",
- "proj4rs",
- "pyo3",
- "reqwest",
- "serde_json",
- "tiff",
-]
-
-[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3484,6 +3470,20 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "kolbe"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "dotenvy",
+ "flate2",
+ "proj4rs",
+ "pyo3",
+ "reqwest",
+ "serde_json",
+ "tiff",
+]
 
 [[package]]
 name = "ktx2"

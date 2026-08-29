@@ -28,9 +28,15 @@ pub fn setup(
     theme: Res<Theme>,
 ) {
     let pal = theme.palette();
-    commands.spawn((Camera3d::default(), Transform::default()));
+    // `AmbientLight` is a per-camera override of `GlobalAmbientLight` and so
+    // `#[require(Camera)]`s one. Spawned on its own it lights nothing and leaves
+    // a camera entity with no render graph, which Bevy warns about every run.
+    commands.spawn((
+        Camera3d::default(),
+        Transform::default(),
+        AmbientLight { brightness: 300.0, ..default() },
+    ));
 
-    commands.spawn(AmbientLight { brightness: 300.0, ..default() });
     commands.spawn((
         DirectionalLight { illuminance: 8000.0, shadow_maps_enabled: false, ..default() },
         Transform::from_xyz(8.0, 16.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
