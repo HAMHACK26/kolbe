@@ -159,6 +159,13 @@ impl RelayTopology {
         self.parent(a) == Some(b) || self.parent(b) == Some(a)
     }
 
+    pub(crate) fn required_edges(&self) -> Vec<(Entity, Entity)> {
+        self.parents
+            .iter()
+            .map(|(&child, &parent)| (child, parent))
+            .collect()
+    }
+
     pub(crate) fn same_wave(&self, a: Entity, b: Entity) -> bool {
         self.waves.iter().any(|wave| wave.contains(&a) && wave.contains(&b))
     }

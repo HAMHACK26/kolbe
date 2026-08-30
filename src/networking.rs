@@ -115,14 +115,60 @@ pub const FLIGHT_LOOKAHEAD_SECS: f32 = 0.1;
 /// How often a header resends while a link stays up (on the sender's own clock).
 pub const HEADER_INTERVAL_SECS: f64 = 0.1;
 
-/// Desired number of simultaneous direct radio peers per drone.
+/// Hard maximum number of simultaneous direct radio peers per drone.
 pub const TARGET_DIRECT_CONNECTIONS: usize = 3;
+
+const REQUIRED_LINK_PRIORITY: u8 = 0;
+const MANAGED_LINK_PRIORITY: u8 = 1;
+const SAME_WAVE_LINK_PRIORITY: u8 = 2;
+const INCIDENTAL_LINK_PRIORITY: u8 = 3;
+
+struct LinkCandidate {
+    peer: Entity,
+    usable_slots: Vec<usize>,
+    priority: u8,
+    was_connected: bool,
+    distance_km: f32,
+}
+
+fn assign_antenna_slots(
+    mut candidates: Vec<LinkCandidate>,
+    antenna_count: usize,
+    connection_limit: usize,
+) -> Vec<(Entity, usize)> {
+    candidates.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| b.was_connected.cmp(&a.was_connected))
+            .then_with(|| a.distance_km.total_cmp(&b.distance_km))
+            .then_with(|| a.peer.to_bits().cmp(&b.peer.to_bits()))
+    });
+
+    let mut used_slots = HashSet::new();
+    let mut assigned = Vec::new();
+    for candidate in candidates {
+        if assigned.len() >= connection_limit.min(antenna_count) {
+            break;
+        }
+        let Some(slot) = candidate
+            .usable_slots
+            .into_iter()
+            .find(|slot| *slot < antenna_count && !used_slots.contains(slot))
+        else {
+            continue;
+        };
+        used_slots.insert(slot);
+        assigned.push((candidate.peer, slot));
+    }
+    assigned
+}
 
 const REASSIGN_MAX_DISTANCE_KM: f32 = 2.75;
 const REASSIGN_MIN_IMPROVEMENT_KM: f32 = 0.25;
 const REASSIGN_TIMEOUT_SECS: f32 = 8.0;
 const REASSIGN_COOLDOWN_SECS: f32 = 20.0;
 const REASSIGN_STABLE_FRAMES: u8 = 3;
+const REASSIGN_ROLLBACK_FRAMES: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ManagedEdge(Entity, Entity);
@@ -157,10 +203,19 @@ struct ReassignmentAttempt {
     stable_frames: u8,
 }
 
+#[derive(Clone, Debug)]
+struct ReassignmentRollback {
+    newly_suppressed: Vec<ManagedEdge>,
+    replaced_established: Vec<(Entity, ManagedPeer)>,
+    remaining_secs: f32,
+    missed_frames: u8,
+}
+
 #[derive(Resource, Default)]
 pub(crate) struct ConnectionReassignments {
     active: Option<ReassignmentAttempt>,
     established: HashMap<Entity, ManagedPeer>,
+    rollback: HashMap<ManagedEdge, ReassignmentRollback>,
     suppressed: HashSet<ManagedEdge>,
     cooldowns: HashMap<Entity, f32>,
 }
@@ -302,7 +357,8 @@ impl DroneClock {
 pub struct LinkSet {
     pub connected: std::collections::HashMap<Entity, f64>,
     /// The local antenna reserved for each live peer session. A peer can have
-    /// only one active antenna on this node, even if beams overlap.
+    /// only one active antenna on this node, and each local antenna can serve
+    /// only one peer, even if beams overlap.
     pub antenna_for_peer: std::collections::HashMap<Entity, usize>,
 }
 
@@ -576,9 +632,9 @@ pub fn advance_clocks(time: Res<Time>, mut clocks: Query<&mut DroneClock>) {
 /// Detect peer radio links and, every `HEADER_INTERVAL_SECS` while a link
 /// stays up, emit a header and send it to the peer.
 ///
-/// For every ordered (self, peer) pair, take the best RSSI across self's
-/// antennas. `rssi >= sensitivity` means self's antenna is receiving peer —
-/// only possible when the antennas face each other.
+/// For every ordered (self, peer) pair, collect the antennas with sufficient
+/// RSSI, then assign each local antenna to at most one peer. Required relay
+/// links are assigned before optional links.
 ///
 /// This runs over every radio node — the base included, since it carries
 /// [`Antennas`] just like a drone does. A base has no airframe, hence no
@@ -631,9 +687,24 @@ pub fn detect_links_and_send_headers(
         let self_pos = self_gt.translation();
         let vector_from_base = self_pos - base_pos;
 
-        // All peers currently detected (regardless of resend cadence) — this
-        // is what `connections` means for our own upserted row on the peer.
-        let detected: Vec<(Entity, usize)> = positions
+        let topology_slots: HashMap<Entity, usize> = relay_topology
+            .as_deref()
+            .map(|topology| {
+                topology
+                    .antenna_targets(self_entity)
+                    .into_iter()
+                    .map(|(slot, peer)| (peer, slot))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let managed_target = reassignments
+            .as_deref()
+            .and_then(|state| state.managed_target(self_entity));
+
+        // Find every physically plausible peer, then assign at most one peer
+        // to each antenna. Required relay targets win over managed, same-wave,
+        // and incidental links so the hard cap cannot sever the relay tree.
+        let candidates: Vec<LinkCandidate> = positions
             .iter()
             .filter_map(|(peer_entity, peer_gt, peer_antennas, peer_kin)| {
                 if peer_entity == self_entity {
@@ -647,14 +718,45 @@ pub fn detect_links_and_send_headers(
                 }
                 let peer_pos = peer_gt.translation();
                 let distance_km = (peer_pos - self_pos).length();
-                if let Some(topology) = relay_topology.as_deref() {
-                    let protected = topology.requires_link(self_entity, peer_entity);
-                    let protected_base =
-                        protected && topology.involves_base(self_entity, peer_entity);
-                    let launch_peer = topology.same_wave(self_entity, peer_entity);
-                    if protected_base || launch_peer {
-                        return (distance_km <= MAX_RELAY_HOP_KM).then_some((peer_entity, 0));
+                let topology_slot = topology_slots.get(&peer_entity).copied();
+                let managed_slot = managed_target
+                    .filter(|(peer, _, _)| *peer == peer_entity)
+                    .map(|(_, slot, _)| slot);
+                let (protected_base, launch_peer) = relay_topology
+                    .as_deref()
+                    .map(|topology| {
+                        (
+                            topology.requires_link(self_entity, peer_entity)
+                                && topology.involves_base(self_entity, peer_entity),
+                            topology.same_wave(self_entity, peer_entity),
+                        )
+                    })
+                    .unwrap_or((false, false));
+
+                if protected_base || launch_peer {
+                    if distance_km > MAX_RELAY_HOP_KM {
+                        return None;
                     }
+                    let usable_slots = topology_slot
+                        .or(managed_slot)
+                        .map(|slot| vec![slot])
+                        .unwrap_or_else(|| (0..antennas.0.len()).collect());
+                    return Some(LinkCandidate {
+                        peer: peer_entity,
+                        usable_slots,
+                        priority: if topology_slot.is_some() {
+                            REQUIRED_LINK_PRIORITY
+                        } else if managed_slot.is_some() {
+                            MANAGED_LINK_PRIORITY
+                        } else {
+                            SAME_WAVE_LINK_PRIORITY
+                        },
+                        was_connected: links.connected.contains_key(&peer_entity),
+                        distance_km,
+                    });
+                }
+
+                if let Some(topology) = relay_topology.as_deref() {
                     // Only the current rear wave retains direct base links.
                     if topology.involves_base(self_entity, peer_entity) {
                         return None;
@@ -667,21 +769,47 @@ pub fn detect_links_and_send_headers(
                 {
                     return None;
                 }
-                let local_antenna = antennas.0.iter().enumerate().find_map(|(index, antenna)| {
-                    let theta = antenna.off_boresight_deg(heading_deg, self_pos, peer_pos);
-                    (antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm)
-                        .then_some(index)
-                });
+                let preferred_slot = topology_slot.or(managed_slot);
+                let usable_slots: Vec<usize> = antennas
+                    .0
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| preferred_slot.is_none_or(|slot| slot == *index))
+                    .filter_map(|(index, antenna)| {
+                        let theta = antenna.off_boresight_deg(heading_deg, self_pos, peer_pos);
+                        (antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm)
+                            .then_some(index)
+                    })
+                    .collect();
+                if usable_slots.is_empty() {
+                    return None;
+                }
                 let peer_heading = peer_kin.map(|kin| kin.heading_deg).unwrap_or(0.0);
                 let peer_detects_us = peer_antennas.0.iter().any(|antenna| {
                     let theta = antenna.off_boresight_deg(peer_heading, peer_pos, self_pos);
                     antenna.rssi_dbm(theta, 0.0, distance_km) >= antenna.sensitivity_dbm
                 });
-                local_antenna
-                    .filter(|_| peer_detects_us)
-                    .map(|antenna_index| (peer_entity, antenna_index))
+                peer_detects_us.then_some(LinkCandidate {
+                    peer: peer_entity,
+                    usable_slots,
+                    priority: if topology_slot.is_some() {
+                        REQUIRED_LINK_PRIORITY
+                    } else if managed_slot.is_some() {
+                        MANAGED_LINK_PRIORITY
+                    } else {
+                        INCIDENTAL_LINK_PRIORITY
+                    },
+                    was_connected: links.connected.contains_key(&peer_entity),
+                    distance_km,
+                })
             })
             .collect();
+        let connection_limit = if kin.is_some() {
+            TARGET_DIRECT_CONNECTIONS
+        } else {
+            antennas.0.len()
+        };
+        let detected = assign_antenna_slots(candidates, antennas.0.len(), connection_limit);
         let origin_connections: Vec<String> = detected
             .iter()
             .filter_map(|(e, _)| uuids.get(*e).ok().map(|u| u.0.clone()))
@@ -1048,12 +1176,52 @@ fn reconnect_waiting(state: &PairingState) -> bool {
     )
 }
 
+fn has_mutual_link(
+    live_links: &HashMap<Entity, HashSet<Entity>>,
+    first: Entity,
+    second: Entity,
+) -> bool {
+    live_links
+        .get(&first)
+        .is_some_and(|peers| peers.contains(&second))
+        && live_links
+            .get(&second)
+            .is_some_and(|peers| peers.contains(&first))
+}
+
+fn all_nodes_reach_base_after_removing(
+    live_links: &HashMap<Entity, HashSet<Entity>>,
+    base: Entity,
+    nodes: &[Entity],
+    removed: &HashSet<ManagedEdge>,
+) -> bool {
+    let mut reached = HashSet::from([base]);
+    let mut pending = vec![base];
+    while let Some(entity) = pending.pop() {
+        let Some(peers) = live_links.get(&entity) else {
+            continue;
+        };
+        for &peer in peers {
+            if removed.contains(&ManagedEdge::new(entity, peer))
+                || !has_mutual_link(live_links, entity, peer)
+            {
+                continue;
+            }
+            if reached.insert(peer) {
+                pending.push(peer);
+            }
+        }
+    }
+    nodes.iter().all(|entity| reached.contains(entity))
+}
+
 #[allow(clippy::type_complexity)]
 pub fn plan_connection_reassignments(
     time: Res<Time>,
     topology: Res<RelayTopology>,
     mut reassignments: ResMut<ConnectionReassignments>,
-    bases: Query<&Base>,
+    bases: Query<(Entity, &Base)>,
+    radio_links: Query<(Entity, &LinkSet)>,
     drones: Query<
         (
             Entity,
@@ -1074,11 +1242,21 @@ pub fn plan_connection_reassignments(
         return;
     }
 
-    let base_position = bases
+    let Some((base_entity, base)) = bases.iter().next() else {
+        return;
+    };
+    let base_position = base.position;
+    let live_links: HashMap<Entity, HashSet<Entity>> = radio_links
         .iter()
-        .next()
-        .map(|base| base.position)
-        .unwrap_or(Vec3::ZERO);
+        .map(|(entity, links)| (entity, links.connected.keys().copied().collect()))
+        .collect();
+    if topology
+        .required_edges()
+        .into_iter()
+        .any(|(first, second)| !has_mutual_link(&live_links, first, second))
+    {
+        return;
+    }
     let nodes: Vec<_> = drones.iter().collect();
     let mut eligible: HashMap<Entity, (usize, Entity, f32)> = HashMap::new();
 
@@ -1089,10 +1267,7 @@ pub fn plan_connection_reassignments(
         {
             continue;
         }
-        let Some(slot) = free_managed_slot(&topology, *entity, antennas.0.len()) else {
-            continue;
-        };
-        let Some((drop_peer, drop_distance)) = droppable_peer(
+        let Some((drop_peer, drop_distance, slot)) = droppable_peer(
             *entity,
             transform.translation(),
             links,
@@ -1104,6 +1279,13 @@ pub fn plan_connection_reassignments(
         ) else {
             continue;
         };
+        let reserved = topology
+            .antenna_targets(*entity)
+            .into_iter()
+            .any(|(reserved_slot, _)| reserved_slot == slot);
+        if slot >= antennas.0.len() || reserved {
+            continue;
+        }
         eligible.insert(*entity, (slot, drop_peer, drop_distance));
     }
 
@@ -1159,6 +1341,16 @@ pub fn plan_connection_reassignments(
         ManagedEdge::new(edge.0, drop_a),
         ManagedEdge::new(edge.1, drop_b),
     ];
+    let removed: HashSet<ManagedEdge> = dropped.into_iter().collect();
+    let drone_entities: Vec<Entity> = nodes.iter().map(|(entity, ..)| *entity).collect();
+    if !all_nodes_reach_base_after_removing(
+        &live_links,
+        base_entity,
+        &drone_entities,
+        &removed,
+    ) {
+        return;
+    }
     let mut newly_suppressed = Vec::new();
     let mut replaced_established = Vec::new();
     for dropped_edge in dropped {
@@ -1182,10 +1374,53 @@ pub fn update_connection_reassignments(
     mut reassignments: ResMut<ConnectionReassignments>,
     links: Query<&LinkSet>,
 ) {
+    let dt = time.delta_secs();
+    let rollback_edges: Vec<ManagedEdge> = reassignments.rollback.keys().copied().collect();
+    let mut failed_rollbacks = Vec::new();
+    let mut expired_rollbacks = Vec::new();
+    for edge in rollback_edges {
+        let connected = links
+            .get(edge.0)
+            .is_ok_and(|set| set.connected.contains_key(&edge.1))
+            && links
+                .get(edge.1)
+                .is_ok_and(|set| set.connected.contains_key(&edge.0));
+        let rollback = reassignments
+            .rollback
+            .get_mut(&edge)
+            .expect(stringify!(rollback_edge_came_from_map));
+        rollback.remaining_secs -= dt;
+        rollback.missed_frames = if connected {
+            0
+        } else {
+            rollback.missed_frames.saturating_add(1)
+        };
+        if rollback.missed_frames >= REASSIGN_ROLLBACK_FRAMES {
+            failed_rollbacks.push(edge);
+        } else if rollback.remaining_secs <= 0.0 {
+            expired_rollbacks.push(edge);
+        }
+    }
+    for edge in expired_rollbacks {
+        reassignments.rollback.remove(&edge);
+    }
+    for edge in failed_rollbacks {
+        let Some(rollback) = reassignments.rollback.remove(&edge) else {
+            continue;
+        };
+        reassignments.remove_established_edge(edge);
+        for old_edge in rollback.newly_suppressed {
+            reassignments.suppressed.remove(&old_edge);
+        }
+        for (entity, managed) in rollback.replaced_established {
+            reassignments.established.insert(entity, managed);
+        }
+    }
+
     let Some(attempt) = reassignments.active.as_mut() else {
         return;
     };
-    attempt.elapsed_secs += time.delta_secs();
+    attempt.elapsed_secs += dt;
     let connected = links
         .get(attempt.edge.0)
         .is_ok_and(|set| set.connected.contains_key(&attempt.edge.1))
@@ -1205,6 +1440,12 @@ pub fn update_connection_reassignments(
 
     let attempt = reassignments.active.take().unwrap();
     if succeeded {
+        let rollback = ReassignmentRollback {
+            newly_suppressed: attempt.newly_suppressed,
+            replaced_established: attempt.replaced_established,
+            remaining_secs: REASSIGN_COOLDOWN_SECS,
+            missed_frames: 0,
+        };
         reassignments.established.insert(
             attempt.edge.0,
             ManagedPeer {
@@ -1219,6 +1460,7 @@ pub fn update_connection_reassignments(
                 antenna_slot: attempt.slots[1],
             },
         );
+        reassignments.rollback.insert(attempt.edge, rollback);
     } else {
         for edge in attempt.newly_suppressed {
             reassignments.suppressed.remove(&edge);
@@ -1233,19 +1475,6 @@ pub fn update_connection_reassignments(
     reassignments
         .cooldowns
         .insert(attempt.edge.1, REASSIGN_COOLDOWN_SECS);
-}
-
-fn free_managed_slot(
-    topology: &RelayTopology,
-    entity: Entity,
-    antenna_count: usize,
-) -> Option<usize> {
-    let reserved: HashSet<usize> = topology
-        .antenna_targets(entity)
-        .into_iter()
-        .map(|(slot, _)| slot)
-        .collect();
-    (0..antenna_count).find(|slot| !reserved.contains(slot))
 }
 
 fn estimated_peer_distance(
@@ -1269,7 +1498,7 @@ fn droppable_peer(
     reassignments: &ConnectionReassignments,
     uuids: &Query<&DroneUuid>,
     base_position: Vec3,
-) -> Option<(Entity, f32)> {
+) -> Option<(Entity, f32, usize)> {
     if let Some(managed) = reassignments.established.get(&entity) {
         if links.connected.contains_key(&managed.peer)
             && !topology.requires_link(entity, managed.peer)
@@ -1277,7 +1506,8 @@ fn droppable_peer(
         {
             let peer_uuid = uuids.get(managed.peer).ok()?;
             let distance = estimated_peer_distance(position, &peer_uuid.0, table, base_position)?;
-            return Some((managed.peer, distance));
+            let slot = *links.antenna_for_peer.get(&managed.peer)?;
+            return Some((managed.peer, distance, slot));
         }
     }
 
@@ -1291,7 +1521,8 @@ fn droppable_peer(
         .filter_map(|peer| {
             let peer_uuid = uuids.get(peer).ok()?;
             let distance = estimated_peer_distance(position, &peer_uuid.0, table, base_position)?;
-            Some((peer, distance))
+            let slot = *links.antenna_for_peer.get(&peer)?;
+            Some((peer, distance, slot))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
 }
@@ -1476,19 +1707,78 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn antenna_assignment_caps_handoff_drone_at_three_required_links() {
+        let entity = |id| Entity::from_raw_u32(id).expect(stringify!(valid_entity));
+        let base = entity(1);
+        let older = vec![entity(10), entity(11), entity(12)];
+        let newer = vec![entity(20), entity(21)];
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, older);
+        topology.register_wave(base, newer.clone());
+
+        let required = topology.antenna_targets(newer[0]);
+        assert_eq!(required.len(), TARGET_DIRECT_CONNECTIONS);
+        let mut candidates: Vec<LinkCandidate> = required
+            .iter()
+            .map(|(slot, peer)| LinkCandidate {
+                peer: *peer,
+                usable_slots: vec![*slot],
+                priority: REQUIRED_LINK_PRIORITY,
+                was_connected: true,
+                distance_km: 1.0,
+            })
+            .collect();
+        candidates.push(LinkCandidate {
+            peer: newer[1],
+            usable_slots: vec![0, 1, 2],
+            priority: SAME_WAVE_LINK_PRIORITY,
+            was_connected: true,
+            distance_km: 0.1,
+        });
+
+        let assigned = assign_antenna_slots(candidates, 3, TARGET_DIRECT_CONNECTIONS);
+        let assigned_peers: HashSet<Entity> = assigned.iter().map(|(peer, _)| *peer).collect();
+        let assigned_slots: HashSet<usize> = assigned.iter().map(|(_, slot)| *slot).collect();
+
+        assert_eq!(assigned.len(), TARGET_DIRECT_CONNECTIONS);
+        assert_eq!(assigned_slots.len(), TARGET_DIRECT_CONNECTIONS);
+        assert!(required.iter().all(|(_, peer)| assigned_peers.contains(peer)));
+        assert!(!assigned_peers.contains(&newer[1]));
+    }
+
+    #[test]
+    fn live_graph_rejects_removing_a_drones_only_base_path() {
+        let entity = |id| Entity::from_raw_u32(id).expect(stringify!(valid_entity));
+        let base = entity(1);
+        let relay = entity(2);
+        let outer = entity(3);
+        let live_links = HashMap::from([
+            (base, HashSet::from([relay])),
+            (relay, HashSet::from([base, outer])),
+            (outer, HashSet::from([relay])),
+        ]);
+
+        assert!(all_nodes_reach_base_after_removing(
+            &live_links,
+            base,
+            &[relay, outer],
+            &HashSet::new(),
+        ));
+        assert!(!all_nodes_reach_base_after_removing(
+            &live_links,
+            base,
+            &[relay, outer],
+            &HashSet::from([ManagedEdge::new(relay, outer)]),
+        ));
+    }
+
     fn planner_app(second_inside: bool) -> (App, Entity, Entity, Entity, Entity) {
         let mut app = App::new();
         app.init_resource::<Time>();
         app.init_resource::<ConnectionReassignments>();
 
-        let base = app
-            .world_mut()
-            .spawn(Base {
-                id: String::new(),
-                position: Vec3::ZERO,
-                antennas: Vec::new(),
-            })
-            .id();
+        let base = app.world_mut().spawn_empty().id();
         let first = app.world_mut().spawn_empty().id();
         let second = app.world_mut().spawn_empty().id();
         let first_uuid = format_uuid_v4(1, 1);
@@ -1506,8 +1796,25 @@ mod tests {
 
         let mut first_links = LinkSet::default();
         first_links.connected.insert(old_first, 0.0);
+        first_links.connected.insert(base, 0.0);
+        first_links.antenna_for_peer.insert(old_first, 2);
+        first_links.antenna_for_peer.insert(base, 1);
         let mut second_links = LinkSet::default();
         second_links.connected.insert(old_second, 0.0);
+        second_links.connected.insert(base, 0.0);
+        second_links.antenna_for_peer.insert(old_second, 0);
+        second_links.antenna_for_peer.insert(base, 1);
+        let mut base_links = LinkSet::default();
+        base_links.connected.insert(first, 0.0);
+        base_links.connected.insert(second, 0.0);
+        app.world_mut().entity_mut(base).insert((
+            Base {
+                id: String::new(),
+                position: Vec3::ZERO,
+                antennas: Vec::new(),
+            },
+            base_links,
+        ));
 
         let row = |id: &String, location: Vec3| MeshRow {
             id: id.clone(),
@@ -1598,16 +1905,51 @@ mod tests {
         app.update();
 
         let state = app.world().resource::<ConnectionReassignments>();
-        assert_eq!(
-            state.active.as_ref().map(|attempt| attempt.edge),
-            Some(ManagedEdge::new(first, second))
-        );
+        let attempt = state.active.as_ref().unwrap();
+        assert_eq!(attempt.edge, ManagedEdge::new(first, second));
+        let first_slot = if attempt.edge.0 == first {
+            attempt.slots[0]
+        } else {
+            attempt.slots[1]
+        };
+        let second_slot = if attempt.edge.0 == second {
+            attempt.slots[0]
+        } else {
+            attempt.slots[1]
+        };
+        assert_eq!(first_slot, 2);
+        assert_eq!(second_slot, 0);
         assert!(state.is_suppressed(first, old_first));
         assert!(state.is_suppressed(second, old_second));
 
         let topology = app.world().resource::<RelayTopology>();
         assert!(topology.requires_link(first, topology.parent(first).unwrap()));
         assert!(topology.requires_link(second, topology.parent(second).unwrap()));
+    }
+
+    #[test]
+    fn planner_waits_while_a_protected_link_is_not_mutually_live() {
+        let (mut app, first, _, _, _) = planner_app(true);
+        let base = app
+            .world()
+            .resource::<RelayTopology>()
+            .parent(first)
+            .unwrap();
+        app.world_mut()
+            .entity_mut(first)
+            .get_mut::<LinkSet>()
+            .unwrap()
+            .connected
+            .remove(&base);
+
+        app.update();
+
+        assert!(
+            app.world()
+                .resource::<ConnectionReassignments>()
+                .active
+                .is_none()
+        );
     }
 
     #[test]
@@ -1723,6 +2065,8 @@ mod tests {
         app.init_resource::<Time>();
         let first = app.world_mut().spawn(LinkSet::default()).id();
         let second = app.world_mut().spawn(LinkSet::default()).id();
+        let old_peer = app.world_mut().spawn_empty().id();
+        let old_edge = ManagedEdge::new(first, old_peer);
         app.world_mut()
             .get_mut::<LinkSet>(first)
             .unwrap()
@@ -1737,11 +2081,12 @@ mod tests {
             active: Some(ReassignmentAttempt {
                 edge: ManagedEdge::new(first, second),
                 slots: [0, 2],
-                newly_suppressed: Vec::new(),
+                newly_suppressed: vec![old_edge],
                 replaced_established: Vec::new(),
                 elapsed_secs: 0.0,
                 stable_frames: 0,
             }),
+            suppressed: HashSet::from([old_edge]),
             ..default()
         });
         app.add_systems(Update, update_connection_reassignments);
@@ -1763,19 +2108,48 @@ mod tests {
             .resource_mut::<Time>()
             .advance_by(Duration::from_millis(16));
         app.update();
-        let state = app.world().resource::<ConnectionReassignments>();
         let edge = ManagedEdge::new(first, second);
         let first_slot = if edge.0 == first { 0 } else { 2 };
         let second_slot = if edge.0 == second { 0 } else { 2 };
-        assert!(state.active.is_none());
-        assert_eq!(
-            state.managed_target(first),
-            Some((second, first_slot, false))
-        );
-        assert_eq!(
-            state.managed_target(second),
-            Some((first, second_slot, false))
-        );
+        {
+            let state = app.world().resource::<ConnectionReassignments>();
+            assert!(state.active.is_none());
+            assert!(state.rollback.contains_key(&edge));
+            assert!(state.is_suppressed(first, old_peer));
+            assert_eq!(
+                state.managed_target(first),
+                Some((second, first_slot, false))
+            );
+            assert_eq!(
+                state.managed_target(second),
+                Some((first, second_slot, false))
+            );
+        }
+
+        app.world_mut()
+            .entity_mut(first)
+            .get_mut::<LinkSet>()
+            .unwrap()
+            .connected
+            .remove(&second);
+        app.world_mut()
+            .entity_mut(second)
+            .get_mut::<LinkSet>()
+            .unwrap()
+            .connected
+            .remove(&first);
+        for _ in 0..REASSIGN_ROLLBACK_FRAMES {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(Duration::from_millis(16));
+            app.update();
+        }
+
+        let state = app.world().resource::<ConnectionReassignments>();
+        assert!(!state.rollback.contains_key(&edge));
+        assert!(!state.is_suppressed(first, old_peer));
+        assert_eq!(state.managed_target(first), None);
+        assert_eq!(state.managed_target(second), None);
     }
 
     #[test]
