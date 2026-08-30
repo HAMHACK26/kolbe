@@ -73,8 +73,10 @@ use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
 use crate::navigation::FlightLimits;
 use crate::networking::{
-    DroneClock, DroneUuid, LinkSet, MeshTable, Pairing, PairingState, RingIndex,
+    ConnectionReassignments, DroneClock, DroneUuid, LinkSet, MeshTable, Pairing, PairingState,
+    RingIndex,
 };
+use crate::tracking::TrackedPeers;
 use crate::world::{RelayLinkPhase, RelayTopology};
 
 /// Mechanical/electronic scan speed floor, rad/s (~4.8 rpm).
@@ -196,6 +198,58 @@ pub struct SeekState {
     pub next_elapsed_secs: f32,
     pub prev_elapsed_secs: f32,
     pub relay_elapsed_secs: HashMap<Entity, f32>,
+}
+
+#[allow(clippy::type_complexity)]
+pub fn aim_connection_reassignments(
+    time: Res<Time>,
+    reassignments: Res<ConnectionReassignments>,
+    topology: Res<RelayTopology>,
+    mut drones: Query<(
+        Entity,
+        &Transform,
+        &mut Antennas,
+        &DroneUuid,
+        &DroneKinematics,
+        &LinkSet,
+        &MeshTable,
+        &TrackedPeers,
+    ), With<Drone>>,
+    uuids: Query<&DroneUuid>,
+    bases: Query<&Base>,
+) {
+    let base_position = bases.iter().next().map(|base| base.position).unwrap_or(Vec3::ZERO);
+    for (entity, transform, mut antennas, uuid, kinematics, links, table, tracked) in &mut drones {
+        let Some((peer, slot, acquiring)) = reassignments.managed_aim_target(&topology, entity) else {
+            continue;
+        };
+        let peer_position = tracked.0.get(&peer).copied().or_else(|| {
+            let peer_uuid = uuids.get(peer).ok()?;
+            table.0.get(&peer_uuid.0).map(|row| base_position + row.location)
+        });
+        let Some(peer_position) = peer_position else {
+            continue;
+        };
+        let Some(antenna) = antennas.0.get_mut(slot) else {
+            continue;
+        };
+        let (azimuth, elevation) = angles_toward(transform.translation, peer_position);
+        let searching = acquiring || !links.connected.contains_key(&peer);
+        let (azimuth_offset, elevation_offset) = if searching {
+            let omega = scan_angular_speed_rad_s(
+                uuid_to_u64(&uuid.0),
+                OMEGA_MIN_RAD_S,
+                OMEGA_MAX_RAD_S,
+            );
+            let angle = time.elapsed_secs() * omega;
+            let radius = antenna.theta_3db_deg * 0.35;
+            (radius * angle.cos(), radius * angle.sin())
+        } else {
+            (0.0, 0.0)
+        };
+        antenna.azimuth_deg = (azimuth - kinematics.heading_deg + azimuth_offset).rem_euclid(360.0);
+        antenna.elevation_deg = (elevation + elevation_offset).clamp(-90.0, 90.0);
+    }
 }
 
 /// Spiral-search every required relay edge whose reusable lifecycle is either
@@ -334,7 +388,9 @@ fn conical_scan_slot(
 #[allow(clippy::type_complexity)] // Bevy queries describe the component access contract.
 pub fn seek_lost_links(
     time: Res<Time>,
+    topology: Res<RelayTopology>,
     mut drones: Query<(
+        Entity,
         &Transform,
         &mut Antennas,
         &RingIndex,
@@ -364,6 +420,7 @@ pub fn seek_lost_links(
     let n = ring.len();
 
     for (
+        entity,
         self_transform,
         mut antennas,
         self_ring,
@@ -402,39 +459,48 @@ pub fn seek_lost_links(
 
         let (_, next_entity, next_uuid) = ring[(self_ring.0 + 1) % n].clone();
         let (_, prev_entity, prev_uuid) = ring[(self_ring.0 + n - 1) % n].clone();
+        let reserved_slots: Vec<usize> = topology
+            .antenna_targets(entity)
+            .into_iter()
+            .map(|(slot, _)| slot)
+            .collect();
 
-        seek_one_slot(SeekSlotArgs {
-            antennas: &mut antennas,
-            antenna_idx: 0,
-            neighbor_entity: next_entity,
-            neighbor_uuid: &next_uuid,
-            links,
-            table,
-            self_pos,
-            base_pos,
-            self_clock_now: clock.now,
-            max_speed_mps,
-            omega_rad_s: omega,
-            dt,
-            heading_deg: kin.heading_deg,
-            elapsed: &mut seek.next_elapsed_secs,
-        });
-        seek_one_slot(SeekSlotArgs {
-            antennas: &mut antennas,
-            antenna_idx: 2,
-            neighbor_entity: prev_entity,
-            neighbor_uuid: &prev_uuid,
-            links,
-            table,
-            self_pos,
-            base_pos,
-            self_clock_now: clock.now,
-            max_speed_mps,
-            omega_rad_s: omega,
-            dt,
-            heading_deg: kin.heading_deg,
-            elapsed: &mut seek.prev_elapsed_secs,
-        });
+        if !reserved_slots.contains(&0) {
+            seek_one_slot(SeekSlotArgs {
+                antennas: &mut antennas,
+                antenna_idx: 0,
+                neighbor_entity: next_entity,
+                neighbor_uuid: &next_uuid,
+                links,
+                table,
+                self_pos,
+                base_pos,
+                self_clock_now: clock.now,
+                max_speed_mps,
+                omega_rad_s: omega,
+                dt,
+                heading_deg: kin.heading_deg,
+                elapsed: &mut seek.next_elapsed_secs,
+            });
+        }
+        if !reserved_slots.contains(&2) {
+            seek_one_slot(SeekSlotArgs {
+                antennas: &mut antennas,
+                antenna_idx: 2,
+                neighbor_entity: prev_entity,
+                neighbor_uuid: &prev_uuid,
+                links,
+                table,
+                self_pos,
+                base_pos,
+                self_clock_now: clock.now,
+                max_speed_mps,
+                omega_rad_s: omega,
+                dt,
+                heading_deg: kin.heading_deg,
+                elapsed: &mut seek.prev_elapsed_secs,
+            });
+        }
     }
 }
 

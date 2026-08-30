@@ -51,8 +51,9 @@
 //!   always fresh).
 //! - Every other row in the body is a candidate at `row.neighbour_distance +
 //!   1` (one hop further than it was from the sender). A brand-new id is
-//!   added at that distance; a known id is only updated if the new path is
-//!   strictly shorter (standard distance-vector relaxation).
+//!   added at that distance; a known id is updated if the new path is shorter
+//!   or equally short. Equal-hop updates preserve the route while refreshing
+//!   moving-position telemetry.
 //! - Relaxed/added rows keep the **incoming** timestamp, never the receiver's
 //!   own clock — only a direct connection (distance 0) gets a fresh stamp.
 //!   This is how staleness/provenance survives being relayed through the mesh.
@@ -104,9 +105,9 @@ use crate::base::Base;
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
 use crate::spherical::SphericalVec;
-use crate::tracking::TrackedPeers;
-use crate::world::{MAX_RELAY_HOP_KM, RelayTopology};
 use crate::terrain::{RadioCanopies, TerrainHeightMap, terrain_blocks_radio_path};
+use crate::tracking::TrackedPeers;
+use crate::world::{DeploymentTarget, MAX_RELAY_HOP_KM, RelayTopology};
 
 /// How far ahead the flight-direction vector predicts (seconds).
 pub const FLIGHT_LOOKAHEAD_SECS: f32 = 0.1;
@@ -116,6 +117,126 @@ pub const HEADER_INTERVAL_SECS: f64 = 0.1;
 
 /// Desired number of simultaneous direct radio peers per drone.
 pub const TARGET_DIRECT_CONNECTIONS: usize = 3;
+
+const REASSIGN_MAX_DISTANCE_KM: f32 = 2.75;
+const REASSIGN_MIN_IMPROVEMENT_KM: f32 = 0.25;
+const REASSIGN_TIMEOUT_SECS: f32 = 8.0;
+const REASSIGN_COOLDOWN_SECS: f32 = 20.0;
+const REASSIGN_STABLE_FRAMES: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ManagedEdge(Entity, Entity);
+
+impl ManagedEdge {
+    fn new(a: Entity, b: Entity) -> Self {
+        if a.to_bits() <= b.to_bits() {
+            Self(a, b)
+        } else {
+            Self(b, a)
+        }
+    }
+
+    fn contains(self, entity: Entity) -> bool {
+        self.0 == entity || self.1 == entity
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ManagedPeer {
+    peer: Entity,
+    antenna_slot: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ReassignmentAttempt {
+    edge: ManagedEdge,
+    slots: [usize; 2],
+    newly_suppressed: Vec<ManagedEdge>,
+    replaced_established: Vec<(Entity, ManagedPeer)>,
+    elapsed_secs: f32,
+    stable_frames: u8,
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct ConnectionReassignments {
+    active: Option<ReassignmentAttempt>,
+    established: HashMap<Entity, ManagedPeer>,
+    suppressed: HashSet<ManagedEdge>,
+    cooldowns: HashMap<Entity, f32>,
+}
+
+impl ConnectionReassignments {
+    pub(crate) fn holds(&self, entity: Entity) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|attempt| attempt.edge.contains(entity))
+    }
+
+    pub(crate) fn is_suppressed(&self, a: Entity, b: Entity) -> bool {
+        self.suppressed.contains(&ManagedEdge::new(a, b))
+    }
+
+    pub(crate) fn managed_target(&self, entity: Entity) -> Option<(Entity, usize, bool)> {
+        if let Some(attempt) = &self.active {
+            if attempt.edge.0 == entity {
+                return Some((attempt.edge.1, attempt.slots[0], true));
+            }
+            if attempt.edge.1 == entity {
+                return Some((attempt.edge.0, attempt.slots[1], true));
+            }
+        }
+        self.established
+            .get(&entity)
+            .map(|managed| (managed.peer, managed.antenna_slot, false))
+    }
+
+    pub(crate) fn managed_aim_target(
+        &self,
+        topology: &RelayTopology,
+        entity: Entity,
+    ) -> Option<(Entity, usize, bool)> {
+        let target = self.managed_target(entity)?;
+        let slot_is_reserved = topology
+            .antenna_targets(entity)
+            .into_iter()
+            .any(|(slot, _)| slot == target.1);
+        (!slot_is_reserved).then_some(target)
+    }
+
+    fn tick_cooldowns(&mut self, dt: f32) {
+        self.cooldowns.retain(|_, remaining| {
+            *remaining -= dt;
+            *remaining > 0.0
+        });
+    }
+
+    fn cooling_down(&self, entity: Entity) -> bool {
+        self.cooldowns.contains_key(&entity)
+    }
+
+    fn remove_established_edge(&mut self, edge: ManagedEdge) -> Vec<(Entity, ManagedPeer)> {
+        let mut removed = Vec::new();
+        if self
+            .established
+            .get(&edge.0)
+            .is_some_and(|managed| managed.peer == edge.1)
+        {
+            if let Some(managed) = self.established.remove(&edge.0) {
+                removed.push((edge.0, managed));
+            }
+        }
+        if self
+            .established
+            .get(&edge.1)
+            .is_some_and(|managed| managed.peer == edge.0)
+        {
+            if let Some(managed) = self.established.remove(&edge.1) {
+                removed.push((edge.1, managed));
+            }
+        }
+        removed
+    }
+}
 
 /// Speed of light (km/s) — ranging is in km.
 pub const SPEED_OF_LIGHT_KM_S: f64 = 299_792.458;
@@ -149,7 +270,10 @@ impl DroneUuid {
     /// every drone gets a distinct value.
     pub fn random() -> Self {
         let seed = fresh_seed(0x9e3779b97f4a7c15);
-        DroneUuid(format_uuid_v4(splitmix64(seed), splitmix64(seed ^ 0xD1B54A32D192ED03)))
+        DroneUuid(format_uuid_v4(
+            splitmix64(seed),
+            splitmix64(seed ^ 0xD1B54A32D192ED03),
+        ))
     }
 }
 
@@ -223,7 +347,10 @@ pub enum PairingState {
     AwaitingAccept { request_id: String, target: String },
     /// I accepted `requester`'s `Request` and stopped for them; waiting on
     /// their `Position` to complete the pairing.
-    AcceptedAwaitingPosition { request_id: String, requester: String },
+    AcceptedAwaitingPosition {
+        request_id: String,
+        requester: String,
+    },
     /// Handshake complete — paired with `peer`.
     Paired { request_id: String, peer: String },
 }
@@ -300,7 +427,10 @@ pub struct NetworkingBundle {
 
 impl NetworkingBundle {
     pub fn random(ring_index: usize) -> Self {
-        Self { radio: RadioBundle::random(), ring_index: RingIndex(ring_index) }
+        Self {
+            radio: RadioBundle::random(),
+            ring_index: RingIndex(ring_index),
+        }
     }
 }
 
@@ -459,6 +589,7 @@ pub fn advance_clocks(time: Res<Time>, mut clocks: Query<&mut DroneClock>) {
 pub fn detect_links_and_send_headers(
     mut mailbox: ResMut<Mailbox>,
     relay_topology: Option<Res<RelayTopology>>,
+    reassignments: Option<Res<ConnectionReassignments>>,
     mut nodes: Query<(
         Entity,
         &GlobalTransform,
@@ -471,7 +602,12 @@ pub fn detect_links_and_send_headers(
         &MeshTable,
     )>,
     positions: Query<
-        (Entity, &GlobalTransform, &Antennas, Option<&DroneKinematics>),
+        (
+            Entity,
+            &GlobalTransform,
+            &Antennas,
+            Option<&DroneKinematics>,
+        ),
         With<Antennas>,
     >,
     uuids: Query<&DroneUuid>,
@@ -481,13 +617,17 @@ pub fn detect_links_and_send_headers(
 ) {
     // `connected_antenna` is this drone's position vector relative to base —
     // not the antenna's own pointing direction.
-    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+    let base_pos = bases
+        .iter()
+        .next()
+        .map(|b| b.position)
+        .unwrap_or(Vec3::ZERO);
 
-    for (self_entity, self_gt, antennas, kin, clock, uuid, mut links, mut sent, table) in
-        &mut nodes
+    for (self_entity, self_gt, antennas, kin, clock, uuid, mut links, mut sent, table) in &mut nodes
     {
-        let (heading_deg, velocity) =
-            kin.map(|k| (k.heading_deg, k.velocity)).unwrap_or((0.0, Vec3::ZERO));
+        let (heading_deg, velocity) = kin
+            .map(|k| (k.heading_deg, k.velocity))
+            .unwrap_or((0.0, Vec3::ZERO));
         let self_pos = self_gt.translation();
         let vector_from_base = self_pos - base_pos;
 
@@ -499,6 +639,12 @@ pub fn detect_links_and_send_headers(
                 if peer_entity == self_entity {
                     return None;
                 }
+                if reassignments
+                    .as_deref()
+                    .is_some_and(|state| state.is_suppressed(self_entity, peer_entity))
+                {
+                    return None;
+                }
                 let peer_pos = peer_gt.translation();
                 let distance_km = (peer_pos - self_pos).length();
                 if let Some(topology) = relay_topology.as_deref() {
@@ -507,8 +653,7 @@ pub fn detect_links_and_send_headers(
                         protected && topology.involves_base(self_entity, peer_entity);
                     let launch_peer = topology.same_wave(self_entity, peer_entity);
                     if protected_base || launch_peer {
-                        return (distance_km <= MAX_RELAY_HOP_KM)
-                            .then_some((peer_entity, 0));
+                        return (distance_km <= MAX_RELAY_HOP_KM).then_some((peer_entity, 0));
                     }
                     // Only the current rear wave retains direct base links.
                     if topology.involves_base(self_entity, peer_entity) {
@@ -516,7 +661,9 @@ pub fn detect_links_and_send_headers(
                     }
                 }
                 if terrain_blocks_radio_path(&terrain, self_pos, peer_pos)
-                    || canopies.as_ref().is_some_and(|trees| trees.blocks_path(self_pos, peer_pos))
+                    || canopies
+                        .as_ref()
+                        .is_some_and(|trees| trees.blocks_path(self_pos, peer_pos))
                 {
                     return None;
                 }
@@ -535,11 +682,10 @@ pub fn detect_links_and_send_headers(
                     .map(|antenna_index| (peer_entity, antenna_index))
             })
             .collect();
-        let origin_connections: Vec<String> =
-            detected
-                .iter()
-                .filter_map(|(e, _)| uuids.get(*e).ok().map(|u| u.0.clone()))
-                .collect();
+        let origin_connections: Vec<String> = detected
+            .iter()
+            .filter_map(|(e, _)| uuids.get(*e).ok().map(|u| u.0.clone()))
+            .collect();
         let body: Vec<MeshRow> = table.0.values().cloned().collect();
 
         let mut detected_now: std::collections::HashMap<Entity, f64> =
@@ -624,10 +770,13 @@ pub fn route_packets(
                 // target instead of aiming at (comms-wise) unknowable live
                 // ground truth. This never touches the responder's own
                 // position/velocity.
-                resp_tracked.0.insert(pkt.origin, pkt.origin_pos + pkt.header.flight_direction);
+                resp_tracked
+                    .0
+                    .insert(pkt.origin, pkt.origin_pos + pkt.header.flight_direction);
 
                 // Relay-merge every third-party row: one hop further than it
-                // was from the sender, and only if that's an improvement.
+                // was from the sender. Equally short paths refresh mutable
+                // position telemetry without degrading route quality.
                 // Timestamp is never touched here — only a direct connection
                 // (handled below) is allowed to stamp our own clock.
                 for row in &pkt.body {
@@ -636,7 +785,7 @@ pub fn route_packets(
                     }
                     let candidate_distance = row.neighbour_distance + 1;
                     match resp_table.0.get_mut(&row.id) {
-                        Some(existing) if candidate_distance < existing.neighbour_distance => {
+                        Some(existing) if candidate_distance <= existing.neighbour_distance => {
                             existing.location = row.location;
                             existing.connections = row.connections.clone();
                             existing.neighbour_distance = candidate_distance;
@@ -644,26 +793,32 @@ pub fn route_packets(
                         }
                         Some(_) => {}
                         None => {
-                            resp_table.0.insert(row.id.clone(), MeshRow {
-                                id: row.id.clone(),
-                                timestamp: row.timestamp,
-                                location: row.location,
-                                neighbour_distance: candidate_distance,
-                                connections: row.connections.clone(),
-                            });
+                            resp_table.0.insert(
+                                row.id.clone(),
+                                MeshRow {
+                                    id: row.id.clone(),
+                                    timestamp: row.timestamp,
+                                    location: row.location,
+                                    neighbour_distance: candidate_distance,
+                                    connections: row.connections.clone(),
+                                },
+                            );
                         }
                     }
                 }
 
                 // The sender is a live direct connection right now — always
                 // upsert at distance 0 with our own clock's current time.
-                resp_table.0.insert(pkt.header.id.clone(), MeshRow {
-                    id: pkt.header.id.clone(),
-                    timestamp: resp_clock.now,
-                    location: pkt.header.connected_antenna,
-                    neighbour_distance: 0,
-                    connections: pkt.origin_connections.clone(),
-                });
+                resp_table.0.insert(
+                    pkt.header.id.clone(),
+                    MeshRow {
+                        id: pkt.header.id.clone(),
+                        timestamp: resp_clock.now,
+                        location: pkt.header.connected_antenna,
+                        neighbour_distance: 0,
+                        connections: pkt.origin_connections.clone(),
+                    },
+                );
 
                 // Send the header straight back for ranging.
                 let dist_km = (responder_pos - pkt.origin_pos).length() as f64;
@@ -680,7 +835,9 @@ pub fn route_packets(
             }
             PacketKind::Echo => {
                 // `target` is the originator — recover distance from timing.
-                let Ok((orig_gt, mut results, ..)) = drones.get_mut(target) else { continue };
+                let Ok((orig_gt, mut results, ..)) = drones.get_mut(target) else {
+                    continue;
+                };
                 let round_trip = pkt.arrival_time - pkt.header.time_received;
                 let distance_km =
                     ((round_trip - pkt.responder_delay) * SPEED_OF_LIGHT_KM_S / 2.0) as f32;
@@ -706,9 +863,19 @@ pub fn process_reconnect(
     mut bus: ResMut<ReconnectBus>,
     mut requests: ResMut<ReconnectRequests>,
     bases: Query<&Base>,
-    mut drones: Query<(&DroneUuid, &GlobalTransform, &LinkSet, &DroneClock, &mut Pairing)>,
+    mut drones: Query<(
+        &DroneUuid,
+        &GlobalTransform,
+        &LinkSet,
+        &DroneClock,
+        &mut Pairing,
+    )>,
 ) {
-    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+    let base_pos = bases
+        .iter()
+        .next()
+        .map(|b| b.position)
+        .unwrap_or(Vec3::ZERO);
     let incoming = std::mem::take(&mut bus.0);
     let mut outgoing: Vec<ReconnectMsg> = Vec::new();
 
@@ -746,7 +913,9 @@ pub fn process_reconnect(
 
     // ── Process one hop of in-flight messages ───────────────────────────────
     for msg in incoming {
-        let Ok((uuid, gt, links, clock, mut pairing)) = drones.get_mut(msg.to) else { continue };
+        let Ok((uuid, gt, links, clock, mut pairing)) = drones.get_mut(msg.to) else {
+            continue;
+        };
 
         // Dedup on (id, phase): already handled → drop entirely.
         let key = (msg.request_id.clone(), msg.kind.phase());
@@ -806,7 +975,9 @@ pub fn process_reconnect(
                         for &peer in links.connected.keys() {
                             outgoing.push(ReconnectMsg {
                                 request_id: msg.request_id.clone(),
-                                kind: ReconnectKind::Position { payload: pos_rel_base },
+                                kind: ReconnectKind::Position {
+                                    payload: pos_rel_base,
+                                },
                                 requester: msg.requester.clone(),
                                 target: msg.target.clone(),
                                 to: peer,
@@ -862,9 +1033,7 @@ pub fn process_reconnect(
 /// override the halt.
 ///
 /// Runs after `detect_links_and_send_headers`, so `LinkSet` is this frame's.
-pub fn halt_on_link_loss(
-    mut drones: Query<(&Pairing, &mut DroneKinematics), With<Drone>>,
-) {
+pub fn halt_on_link_loss(mut drones: Query<(&Pairing, &mut DroneKinematics), With<Drone>>) {
     for (pairing, mut kin) in &mut drones {
         if reconnect_waiting(&pairing.state) {
             kin.velocity = Vec3::ZERO;
@@ -877,6 +1046,254 @@ fn reconnect_waiting(state: &PairingState) -> bool {
         state,
         PairingState::AwaitingAccept { .. } | PairingState::AcceptedAwaitingPosition { .. }
     )
+}
+
+#[allow(clippy::type_complexity)]
+pub fn plan_connection_reassignments(
+    time: Res<Time>,
+    topology: Res<RelayTopology>,
+    mut reassignments: ResMut<ConnectionReassignments>,
+    bases: Query<&Base>,
+    drones: Query<
+        (
+            Entity,
+            &GlobalTransform,
+            &DroneUuid,
+            &LinkSet,
+            &MeshTable,
+            &Pairing,
+            &DeploymentTarget,
+            &Antennas,
+        ),
+        With<Drone>,
+    >,
+    uuids: Query<&DroneUuid>,
+) {
+    reassignments.tick_cooldowns(time.delta_secs());
+    if reassignments.active.is_some() || topology.handoff_pending() {
+        return;
+    }
+
+    let base_position = bases
+        .iter()
+        .next()
+        .map(|base| base.position)
+        .unwrap_or(Vec3::ZERO);
+    let nodes: Vec<_> = drones.iter().collect();
+    let mut eligible: HashMap<Entity, (usize, Entity, f32)> = HashMap::new();
+
+    for (entity, transform, _, links, table, pairing, target, antennas) in &nodes {
+        if !target.spreading
+            || !matches!(pairing.state, PairingState::Idle)
+            || reassignments.cooling_down(*entity)
+        {
+            continue;
+        }
+        let Some(slot) = free_managed_slot(&topology, *entity, antennas.0.len()) else {
+            continue;
+        };
+        let Some((drop_peer, drop_distance)) = droppable_peer(
+            *entity,
+            transform.translation(),
+            links,
+            table,
+            &topology,
+            &reassignments,
+            &uuids,
+            base_position,
+        ) else {
+            continue;
+        };
+        eligible.insert(*entity, (slot, drop_peer, drop_distance));
+    }
+
+    let mut choices: HashMap<Entity, Entity> = HashMap::new();
+    for (entity, transform, _, links, table, _, _, _) in &nodes {
+        let Some((_, _, drop_distance)) = eligible.get(entity) else {
+            continue;
+        };
+        let mut closest: Option<(Entity, f32)> = None;
+        for (peer, _, peer_uuid, _, _, _, _, _) in &nodes {
+            if entity == peer
+                || !eligible.contains_key(peer)
+                || links.connected.contains_key(peer)
+                || reassignments.is_suppressed(*entity, *peer)
+            {
+                continue;
+            }
+            let Some(distance) = estimated_peer_distance(
+                transform.translation(),
+                &peer_uuid.0,
+                table,
+                base_position,
+            ) else {
+                continue;
+            };
+            if distance > REASSIGN_MAX_DISTANCE_KM
+                || distance + REASSIGN_MIN_IMPROVEMENT_KM >= *drop_distance
+            {
+                continue;
+            }
+            if closest.is_none_or(|(_, best)| distance < best) {
+                closest = Some((*peer, distance));
+            }
+        }
+        if let Some((peer, _)) = closest {
+            choices.insert(*entity, peer);
+        }
+    }
+
+    let selected = choices
+        .iter()
+        .filter_map(|(&entity, &peer)| {
+            (choices.get(&peer) == Some(&entity)).then_some(ManagedEdge::new(entity, peer))
+        })
+        .min_by_key(|edge| (edge.0.to_bits(), edge.1.to_bits()));
+    let Some(edge) = selected else {
+        return;
+    };
+
+    let (slot_a, drop_a, _) = eligible[&edge.0];
+    let (slot_b, drop_b, _) = eligible[&edge.1];
+    let dropped = [
+        ManagedEdge::new(edge.0, drop_a),
+        ManagedEdge::new(edge.1, drop_b),
+    ];
+    let mut newly_suppressed = Vec::new();
+    let mut replaced_established = Vec::new();
+    for dropped_edge in dropped {
+        replaced_established.extend(reassignments.remove_established_edge(dropped_edge));
+        if reassignments.suppressed.insert(dropped_edge) {
+            newly_suppressed.push(dropped_edge);
+        }
+    }
+    reassignments.active = Some(ReassignmentAttempt {
+        edge,
+        slots: [slot_a, slot_b],
+        newly_suppressed,
+        replaced_established,
+        elapsed_secs: 0.0,
+        stable_frames: 0,
+    });
+}
+
+pub fn update_connection_reassignments(
+    time: Res<Time>,
+    mut reassignments: ResMut<ConnectionReassignments>,
+    links: Query<&LinkSet>,
+) {
+    let Some(attempt) = reassignments.active.as_mut() else {
+        return;
+    };
+    attempt.elapsed_secs += time.delta_secs();
+    let connected = links
+        .get(attempt.edge.0)
+        .is_ok_and(|set| set.connected.contains_key(&attempt.edge.1))
+        && links
+            .get(attempt.edge.1)
+            .is_ok_and(|set| set.connected.contains_key(&attempt.edge.0));
+    attempt.stable_frames = if connected {
+        attempt.stable_frames.saturating_add(1)
+    } else {
+        0
+    };
+    let succeeded = attempt.stable_frames >= REASSIGN_STABLE_FRAMES;
+    let timed_out = attempt.elapsed_secs >= REASSIGN_TIMEOUT_SECS;
+    if !succeeded && !timed_out {
+        return;
+    }
+
+    let attempt = reassignments.active.take().unwrap();
+    if succeeded {
+        reassignments.established.insert(
+            attempt.edge.0,
+            ManagedPeer {
+                peer: attempt.edge.1,
+                antenna_slot: attempt.slots[0],
+            },
+        );
+        reassignments.established.insert(
+            attempt.edge.1,
+            ManagedPeer {
+                peer: attempt.edge.0,
+                antenna_slot: attempt.slots[1],
+            },
+        );
+    } else {
+        for edge in attempt.newly_suppressed {
+            reassignments.suppressed.remove(&edge);
+        }
+        for (entity, managed) in attempt.replaced_established {
+            reassignments.established.insert(entity, managed);
+        }
+    }
+    reassignments
+        .cooldowns
+        .insert(attempt.edge.0, REASSIGN_COOLDOWN_SECS);
+    reassignments
+        .cooldowns
+        .insert(attempt.edge.1, REASSIGN_COOLDOWN_SECS);
+}
+
+fn free_managed_slot(
+    topology: &RelayTopology,
+    entity: Entity,
+    antenna_count: usize,
+) -> Option<usize> {
+    let reserved: HashSet<usize> = topology
+        .antenna_targets(entity)
+        .into_iter()
+        .map(|(slot, _)| slot)
+        .collect();
+    (0..antenna_count).find(|slot| !reserved.contains(slot))
+}
+
+fn estimated_peer_distance(
+    self_position: Vec3,
+    peer_uuid: &str,
+    table: &MeshTable,
+    base_position: Vec3,
+) -> Option<f32> {
+    table
+        .0
+        .get(peer_uuid)
+        .map(|row| self_position.distance(base_position + row.location))
+}
+
+fn droppable_peer(
+    entity: Entity,
+    position: Vec3,
+    links: &LinkSet,
+    table: &MeshTable,
+    topology: &RelayTopology,
+    reassignments: &ConnectionReassignments,
+    uuids: &Query<&DroneUuid>,
+    base_position: Vec3,
+) -> Option<(Entity, f32)> {
+    if let Some(managed) = reassignments.established.get(&entity) {
+        if links.connected.contains_key(&managed.peer)
+            && !topology.requires_link(entity, managed.peer)
+            && !topology.involves_base(entity, managed.peer)
+        {
+            let peer_uuid = uuids.get(managed.peer).ok()?;
+            let distance = estimated_peer_distance(position, &peer_uuid.0, table, base_position)?;
+            return Some((managed.peer, distance));
+        }
+    }
+
+    links
+        .connected
+        .keys()
+        .copied()
+        .filter(|peer| {
+            !topology.requires_link(entity, *peer) && !topology.involves_base(entity, *peer)
+        })
+        .filter_map(|peer| {
+            let peer_uuid = uuids.get(peer).ok()?;
+            let distance = estimated_peer_distance(position, &peer_uuid.0, table, base_position)?;
+            Some((peer, distance))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 /// Ask a nearby drone for a connection.
@@ -904,16 +1321,35 @@ fn reconnect_waiting(state: &PairingState) -> bool {
 /// `seeking` lets search on their own initiative instead.
 pub fn request_nearby_connections(
     mut requests: ResMut<ReconnectRequests>,
+    reassignments: Option<Res<ConnectionReassignments>>,
     bases: Query<&Base>,
     drones: Query<
-        (Entity, &GlobalTransform, &DroneClock, &LinkSet, &MeshTable, &Pairing),
+        (
+            Entity,
+            &GlobalTransform,
+            &DroneClock,
+            &LinkSet,
+            &MeshTable,
+            &Pairing,
+        ),
         With<Drone>,
     >,
     uuids: Query<&DroneUuid>,
 ) {
-    let base_pos = bases.iter().next().map(|b| b.position).unwrap_or(Vec3::ZERO);
+    let base_pos = bases
+        .iter()
+        .next()
+        .map(|b| b.position)
+        .unwrap_or(Vec3::ZERO);
 
     for (entity, gt, clock, links, table, pairing) in &drones {
+        if reassignments
+            .as_deref()
+            .and_then(|state| state.managed_target(entity))
+            .is_some()
+        {
+            continue;
+        }
         // One handshake at a time, and honor the back-off after a failure.
         if !matches!(pairing.state, PairingState::Idle) || clock.now < pairing.retry_after {
             continue;
@@ -1015,17 +1451,129 @@ fn format_uuid_v4(hi: u64, lo: u64) -> String {
     let b = |v: u64, shift: u32| ((v >> shift) & 0xff) as u8;
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b(hi, 56), b(hi, 48), b(hi, 40), b(hi, 32),
-        b(hi, 24), b(hi, 16),
-        b(hi, 8), b(hi, 0),
-        b(lo, 56), b(lo, 48),
-        b(lo, 40), b(lo, 32), b(lo, 24), b(lo, 16), b(lo, 8), b(lo, 0),
+        b(hi, 56),
+        b(hi, 48),
+        b(hi, 40),
+        b(hi, 32),
+        b(hi, 24),
+        b(hi, 16),
+        b(hi, 8),
+        b(hi, 0),
+        b(lo, 56),
+        b(lo, 48),
+        b(lo, 40),
+        b(lo, 32),
+        b(lo, 24),
+        b(lo, 16),
+        b(lo, 8),
+        b(lo, 0),
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    fn planner_app(second_inside: bool) -> (App, Entity, Entity, Entity, Entity) {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        app.init_resource::<ConnectionReassignments>();
+
+        let base = app
+            .world_mut()
+            .spawn(Base {
+                id: String::new(),
+                position: Vec3::ZERO,
+                antennas: Vec::new(),
+            })
+            .id();
+        let first = app.world_mut().spawn_empty().id();
+        let second = app.world_mut().spawn_empty().id();
+        let first_uuid = format_uuid_v4(1, 1);
+        let second_uuid = format_uuid_v4(2, 2);
+        let old_first_uuid = format_uuid_v4(3, 3);
+        let old_second_uuid = format_uuid_v4(4, 4);
+        let old_first = app
+            .world_mut()
+            .spawn(DroneUuid(old_first_uuid.clone()))
+            .id();
+        let old_second = app
+            .world_mut()
+            .spawn(DroneUuid(old_second_uuid.clone()))
+            .id();
+
+        let mut first_links = LinkSet::default();
+        first_links.connected.insert(old_first, 0.0);
+        let mut second_links = LinkSet::default();
+        second_links.connected.insert(old_second, 0.0);
+
+        let row = |id: &String, location: Vec3| MeshRow {
+            id: id.clone(),
+            timestamp: 0.0,
+            location,
+            neighbour_distance: 0,
+            connections: Vec::new(),
+        };
+        let first_table = MeshTable(HashMap::from([
+            (second_uuid.clone(), row(&second_uuid, Vec3::X)),
+            (
+                old_first_uuid.clone(),
+                row(&old_first_uuid, Vec3::new(-2.0, 0.0, 0.0)),
+            ),
+        ]));
+        let second_table = MeshTable(HashMap::from([
+            (first_uuid.clone(), row(&first_uuid, Vec3::ZERO)),
+            (
+                old_second_uuid.clone(),
+                row(&old_second_uuid, Vec3::new(3.0, 0.0, 0.0)),
+            ),
+        ]));
+        let antennas = || {
+            Antennas(vec![
+                crate::drone::make_antenna(0.0, 0.0, 0),
+                crate::drone::make_antenna(0.0, 0.0, 1),
+                crate::drone::make_antenna(0.0, 0.0, 2),
+            ])
+        };
+        let target = |spreading| DeploymentTarget {
+            ingress: Vec3::ZERO,
+            slot: Vec3::ZERO,
+            spreading,
+        };
+
+        app.world_mut().entity_mut(first).insert((
+            Drone {
+                id: first_uuid.clone(),
+            },
+            GlobalTransform::from_translation(Vec3::ZERO),
+            DroneUuid(first_uuid),
+            first_links,
+            first_table,
+            Pairing::default(),
+            target(true),
+            antennas(),
+        ));
+        app.world_mut().entity_mut(second).insert((
+            Drone {
+                id: second_uuid.clone(),
+            },
+            GlobalTransform::from_translation(Vec3::X),
+            DroneUuid(second_uuid),
+            second_links,
+            second_table,
+            Pairing::default(),
+            target(second_inside),
+            antennas(),
+        ));
+
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![first, second]);
+        app.insert_resource(topology);
+        app.add_systems(Update, plan_connection_reassignments);
+        (app, first, second, old_first, old_second)
+    }
 
     #[test]
     fn only_unfinished_reconnects_hold_flight() {
@@ -1042,5 +1590,227 @@ mod tests {
             request_id: "request".into(),
             peer: "peer".into(),
         }));
+    }
+
+    #[test]
+    fn planner_replaces_only_optional_links_for_mutual_neighbours_inside_target() {
+        let (mut app, first, second, old_first, old_second) = planner_app(true);
+        app.update();
+
+        let state = app.world().resource::<ConnectionReassignments>();
+        assert_eq!(
+            state.active.as_ref().map(|attempt| attempt.edge),
+            Some(ManagedEdge::new(first, second))
+        );
+        assert!(state.is_suppressed(first, old_first));
+        assert!(state.is_suppressed(second, old_second));
+
+        let topology = app.world().resource::<RelayTopology>();
+        assert!(topology.requires_link(first, topology.parent(first).unwrap()));
+        assert!(topology.requires_link(second, topology.parent(second).unwrap()));
+    }
+
+    #[test]
+    fn planner_waits_until_both_neighbours_are_inside_target() {
+        let (mut app, _, _, _, _) = planner_app(false);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ConnectionReassignments>()
+                .active
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn protected_relay_slot_blocks_optional_reassignment_aim() {
+        let entity = |id| Entity::from_raw_u32(id).unwrap();
+        let base = entity(1);
+        let older = entity(10);
+        let newer = entity(20);
+        let optional_peer = entity(30);
+        let mut topology = RelayTopology::default();
+        topology.register_wave(base, vec![older]);
+        topology.register_wave(base, vec![newer]);
+        let reserved_slot = topology
+            .antenna_targets(older)
+            .into_iter()
+            .find_map(|(slot, target)| (target == newer).then_some(slot))
+            .unwrap();
+        let mut state = ConnectionReassignments::default();
+        state.established.insert(
+            older,
+            ManagedPeer {
+                peer: optional_peer,
+                antenna_slot: reserved_slot,
+            },
+        );
+
+        assert_eq!(
+            state.managed_target(older),
+            Some((optional_peer, reserved_slot, false))
+        );
+        assert_eq!(state.managed_aim_target(&topology, older), None);
+    }
+
+    #[test]
+    fn equal_hop_relay_refreshes_peer_position() {
+        let mut app = App::new();
+        app.init_resource::<Mailbox>();
+        let responder_uuid = format_uuid_v4(10, 10);
+        let sender_uuid = format_uuid_v4(20, 20);
+        let peer_uuid = format_uuid_v4(30, 30);
+        let responder = app
+            .world_mut()
+            .spawn((
+                GlobalTransform::default(),
+                RangingResults::default(),
+                DroneUuid(responder_uuid),
+                DroneClock { now: 5.0 },
+                MeshTable(HashMap::from([(
+                    peer_uuid.clone(),
+                    MeshRow {
+                        id: peer_uuid.clone(),
+                        timestamp: 1.0,
+                        location: Vec3::ZERO,
+                        neighbour_distance: 1,
+                        connections: Vec::new(),
+                    },
+                )])),
+                TrackedPeers::default(),
+            ))
+            .id();
+        let sender = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<Mailbox>().0.push((
+            responder,
+            Packet {
+                kind: PacketKind::Header,
+                origin: sender,
+                responder,
+                origin_pos: Vec3::ZERO,
+                header: NetworkHeader {
+                    id: sender_uuid,
+                    connected_antenna: Vec3::ZERO,
+                    flight_direction: Vec3::ZERO,
+                    time_received: 0.0,
+                },
+                body: vec![MeshRow {
+                    id: peer_uuid.clone(),
+                    timestamp: 2.0,
+                    location: Vec3::X,
+                    neighbour_distance: 0,
+                    connections: Vec::new(),
+                }],
+                origin_connections: Vec::new(),
+                responder_pos: Vec3::ZERO,
+                responder_delay: 0.0,
+                arrival_time: 0.0,
+            },
+        ));
+        app.add_systems(Update, route_packets);
+
+        app.update();
+
+        let table = app.world().entity(responder).get::<MeshTable>().unwrap();
+        let refreshed = table.0.get(&peer_uuid).unwrap();
+        assert_eq!(refreshed.location, Vec3::X);
+        assert_eq!(refreshed.timestamp, 2.0);
+    }
+
+    #[test]
+    fn reassignment_confirms_after_three_connected_frames() {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        let first = app.world_mut().spawn(LinkSet::default()).id();
+        let second = app.world_mut().spawn(LinkSet::default()).id();
+        app.world_mut()
+            .get_mut::<LinkSet>(first)
+            .unwrap()
+            .connected
+            .insert(second, 0.0);
+        app.world_mut()
+            .get_mut::<LinkSet>(second)
+            .unwrap()
+            .connected
+            .insert(first, 0.0);
+        app.insert_resource(ConnectionReassignments {
+            active: Some(ReassignmentAttempt {
+                edge: ManagedEdge::new(first, second),
+                slots: [0, 2],
+                newly_suppressed: Vec::new(),
+                replaced_established: Vec::new(),
+                elapsed_secs: 0.0,
+                stable_frames: 0,
+            }),
+            ..default()
+        });
+        app.add_systems(Update, update_connection_reassignments);
+
+        for _ in 0..2 {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(Duration::from_millis(16));
+            app.update();
+        }
+        assert!(
+            app.world()
+                .resource::<ConnectionReassignments>()
+                .active
+                .is_some()
+        );
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(16));
+        app.update();
+        let state = app.world().resource::<ConnectionReassignments>();
+        let edge = ManagedEdge::new(first, second);
+        let first_slot = if edge.0 == first { 0 } else { 2 };
+        let second_slot = if edge.0 == second { 0 } else { 2 };
+        assert!(state.active.is_none());
+        assert_eq!(
+            state.managed_target(first),
+            Some((second, first_slot, false))
+        );
+        assert_eq!(
+            state.managed_target(second),
+            Some((first, second_slot, false))
+        );
+    }
+
+    #[test]
+    fn reassignment_timeout_restores_old_link_and_tracking_assignment() {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        let first = app.world_mut().spawn(LinkSet::default()).id();
+        let second = app.world_mut().spawn(LinkSet::default()).id();
+        let old_peer = app.world_mut().spawn_empty().id();
+        let old_edge = ManagedEdge::new(first, old_peer);
+        let old_assignment = ManagedPeer {
+            peer: old_peer,
+            antenna_slot: 2,
+        };
+        app.insert_resource(ConnectionReassignments {
+            active: Some(ReassignmentAttempt {
+                edge: ManagedEdge::new(first, second),
+                slots: [0, 0],
+                newly_suppressed: vec![old_edge],
+                replaced_established: vec![(first, old_assignment)],
+                elapsed_secs: 0.0,
+                stable_frames: 0,
+            }),
+            suppressed: HashSet::from([old_edge]),
+            ..default()
+        });
+        app.add_systems(Update, update_connection_reassignments);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(REASSIGN_TIMEOUT_SECS + 0.1));
+        app.update();
+
+        let state = app.world().resource::<ConnectionReassignments>();
+        assert!(state.active.is_none());
+        assert!(!state.is_suppressed(first, old_peer));
+        assert_eq!(state.managed_target(first), Some((old_peer, 2, false)));
     }
 }

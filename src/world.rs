@@ -48,6 +48,14 @@ impl Default for WindSettings {
 pub const DRONE_GROUND_CLEARANCE_KM: f32 = 0.05;
 pub const DEPLOYMENT_INTERVAL_SECS: f32 = 30.0;
 const DEPLOYMENT_BATCH_SIZE: usize = 3;
+
+fn next_deployment_batch_size(remaining: usize) -> usize {
+    if remaining == DEPLOYMENT_BATCH_SIZE + 1 {
+        2
+    } else {
+        remaining.min(DEPLOYMENT_BATCH_SIZE)
+    }
+}
 /// Keeps launches clear of the base and of each other before navigation has
 /// had a chance to separate the formation.
 const LAUNCH_RING_RADIUS_KM: f32 = 0.10;
@@ -674,6 +682,7 @@ fn networking_with_launch_briefing(
         .map(|(id, row)| {
             let mut row = row.clone();
             row.timestamp = local_now;
+            row.neighbour_distance = row.neighbour_distance.saturating_add(1);
             (id.clone(), row)
         })
         .collect();
@@ -702,7 +711,8 @@ pub fn spawn_next_drone(
         .get(deployment.base_entity)
         .map(|table| table.0.clone())
         .unwrap_or_default();
-    let end = (deployment.next_index + DEPLOYMENT_BATCH_SIZE).min(deployment.total_count);
+    let remaining = deployment.total_count - deployment.next_index;
+    let end = deployment.next_index + next_deployment_batch_size(remaining);
     let mut wave = Vec::with_capacity(end - deployment.next_index);
     for index in deployment.next_index..end {
         wave.push(spawn_deployment_drone(
@@ -932,6 +942,7 @@ mod tests {
 
         assert_eq!(inherited.location, Vec3::new(1.5, 0.0, 0.5));
         assert_eq!(inherited.timestamp, networking.radio.clock.now);
+        assert_eq!(inherited.neighbour_distance, 1);
     }
 
     #[test]
@@ -1090,6 +1101,14 @@ mod tests {
         assert!(timer.tick(Duration::from_secs(1)).just_finished());
         assert!(!timer.tick(Duration::from_secs(29)).just_finished());
         assert!(timer.tick(Duration::from_secs(1)).just_finished());
+    }
+
+    #[test]
+    fn four_remaining_drones_split_into_two_two_drone_waves() {
+        assert_eq!(next_deployment_batch_size(5), 3);
+        assert_eq!(next_deployment_batch_size(4), 2);
+        assert_eq!(next_deployment_batch_size(2), 2);
+        assert_eq!(next_deployment_batch_size(3), 3);
     }
 
     #[test]

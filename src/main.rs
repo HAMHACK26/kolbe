@@ -80,6 +80,7 @@ fn teardown_simulation(
     commands.insert_resource(networking::Mailbox::default());
     commands.insert_resource(networking::ReconnectBus::default());
     commands.insert_resource(networking::ReconnectRequests::default());
+    commands.insert_resource(networking::ConnectionReassignments::default());
 }
 
 fn main() {
@@ -119,6 +120,7 @@ fn main() {
         .init_resource::<networking::Mailbox>()
         .init_resource::<networking::ReconnectBus>()
         .init_resource::<networking::ReconnectRequests>()
+        .init_resource::<networking::ConnectionReassignments>()
         .init_resource::<ui::NetworkTablePanelOpen>()
         .init_resource::<tiles::TileCache>()
         .add_systems(Startup, (install_default_font, ui::setup_camera, theme::setup_moon))
@@ -220,15 +222,18 @@ fn main() {
             Update,
             (
                 world::spawn_next_drone,
+                networking::plan_connection_reassignments,
                 navigation::go_to_network_area,
                 networking::request_nearby_connections,
                 networking::process_reconnect,
                 tracking::maintain_mesh_antennas,
                 tracking::maintain_base_antennas,
-                tracking::maintain_relay_antennas,
                 seeking::seek_lost_links,
+                seeking::aim_connection_reassignments,
+                tracking::maintain_relay_antennas,
                 seeking::seek_relay_links,
                 networking::detect_links_and_send_headers,
+                networking::update_connection_reassignments,
                 world::update_relay_link_lifecycle,
                 networking::route_packets,
                 // Last word on velocity: the proximity ring deflects whatever

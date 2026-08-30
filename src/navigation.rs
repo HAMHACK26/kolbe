@@ -42,6 +42,7 @@ use bevy::prelude::*;
 
 use crate::drone::Drone;
 use crate::factories::movement::DroneKinematics;
+use crate::networking::ConnectionReassignments;
 use crate::world::{DeploymentTarget, RELAY_WORKING_HOP_KM, RelayTopology};
 
 /// The flight envelope a drone is governed to. All limits are deliberately
@@ -270,6 +271,7 @@ pub fn go_to_network_area(
     network_area: Res<crate::area::NetworkArea>,
     scenario: Res<crate::area::ScenarioArea>,
     topology: Res<RelayTopology>,
+    reassignments: Res<ConnectionReassignments>,
     positions: Query<(Entity, &Transform), Or<(With<Drone>, With<crate::base::Base>)>>,
     mut drones: Query<
         (Entity, &Transform, &mut DeploymentTarget, &mut DroneKinematics),
@@ -292,7 +294,9 @@ pub fn go_to_network_area(
         if !target.spreading && inside_target_area(transform.translation, &network_area, &scenario) {
             target.spreading = true;
         }
-        let desired_waypoint = if target.spreading {
+        let desired_waypoint = if reassignments.holds(entity) {
+            transform.translation
+        } else if target.spreading {
             let slot = repel_from_target_boundary(
                 transform.translation,
                 clamp_to_target_area(target.slot, &network_area, &scenario),
@@ -528,6 +532,7 @@ mod relay_navigation_tests {
         let mut topology = RelayTopology::default();
         topology.register_wave(base, vec![drone]);
         app.insert_resource(topology);
+        app.init_resource::<ConnectionReassignments>();
         app.add_systems(Update, go_to_network_area);
         app.world_mut()
             .resource_mut::<Time>()
