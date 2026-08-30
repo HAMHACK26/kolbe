@@ -226,6 +226,7 @@ fn main() {
                 navigation::go_to_network_area,
                 networking::request_nearby_connections,
                 networking::process_reconnect,
+                networking::expire_stale_handshakes,
                 tracking::maintain_mesh_antennas,
                 tracking::maintain_base_antennas,
                 seeking::seek_lost_links,

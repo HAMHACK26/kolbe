@@ -1215,6 +1215,61 @@ fn all_nodes_reach_base_after_removing(
     nodes.iter().all(|entity| reached.contains(entity))
 }
 
+fn free_optional_antenna_slot(
+    entity: Entity,
+    links: &LinkSet,
+    antennas: &Antennas,
+    topology: &RelayTopology,
+) -> Option<usize> {
+    let reserved: HashSet<usize> = topology
+        .antenna_targets(entity)
+        .into_iter()
+        .map(|(slot, _)| slot)
+        .collect();
+    let used: HashSet<usize> = links.antenna_for_peer.values().copied().collect();
+    (0..antennas.0.len()).find(|slot| !reserved.contains(slot) && !used.contains(slot))
+}
+
+fn select_best_mutual_reassignment(
+    choices: &HashMap<Entity, (Entity, f32)>,
+    eligible: &HashMap<Entity, (usize, Entity, f32)>,
+    mut is_safe: impl FnMut(ManagedEdge) -> bool,
+) -> Option<ManagedEdge> {
+    let candidates: HashSet<ManagedEdge> = choices
+        .iter()
+        .filter_map(|(&entity, &(peer, _))| {
+            choices
+                .get(&peer)
+                .is_some_and(|&(choice, _)| choice == entity)
+                .then_some(ManagedEdge::new(entity, peer))
+        })
+        .collect();
+    let score = |edge: &ManagedEdge| {
+        let drop_a = eligible[&edge.0].2;
+        let drop_b = eligible[&edge.1].2;
+        let replacement_a = choices[&edge.0].1;
+        let replacement_b = choices[&edge.1].1;
+        (
+            drop_a.max(drop_b),
+            (drop_a - replacement_a) + (drop_b - replacement_b),
+        )
+    };
+
+    candidates
+        .into_iter()
+        .filter(|edge| is_safe(*edge))
+        .min_by(|a, b| {
+            let score_a = score(a);
+            let score_b = score(b);
+            score_b
+                .0
+                .total_cmp(&score_a.0)
+                .then_with(|| score_b.1.total_cmp(&score_a.1))
+                .then_with(|| a.0.to_bits().cmp(&b.0.to_bits()))
+                .then_with(|| a.1.to_bits().cmp(&b.1.to_bits()))
+        })
+}
+
 #[allow(clippy::type_complexity)]
 pub fn plan_connection_reassignments(
     time: Res<Time>,
@@ -1258,6 +1313,109 @@ pub fn plan_connection_reassignments(
         return;
     }
     let nodes: Vec<_> = drones.iter().collect();
+
+    let mut addition_ready: HashMap<Entity, (usize, bool)> = HashMap::new();
+    for (entity, _, _, links, _, pairing, target, antennas) in &nodes {
+        let pairing_available = matches!(
+            &pairing.state,
+            PairingState::Idle | PairingState::Paired { .. }
+        );
+        if !target.spreading
+            || !pairing_available
+            || reassignments.cooling_down(*entity)
+            || reassignments.established.contains_key(entity)
+            || links.connected.len() >= TARGET_DIRECT_CONNECTIONS
+        {
+            continue;
+        }
+        let mutual_degree = live_links
+            .get(entity)
+            .into_iter()
+            .flatten()
+            .filter(|&&peer| has_mutual_link(&live_links, *entity, peer))
+            .count();
+        if mutual_degree == 0 {
+            continue;
+        }
+        let Some(slot) = free_optional_antenna_slot(*entity, links, antennas, &topology) else {
+            continue;
+        };
+        addition_ready.insert(*entity, (slot, mutual_degree == 1));
+    }
+
+    let mut addition_candidates = Vec::new();
+    for first_index in 0..nodes.len() {
+        let (first, first_transform, first_uuid, first_links, first_table, _, _, _) =
+            nodes[first_index];
+        let Some(&(first_slot, first_is_leaf)) = addition_ready.get(&first) else {
+            continue;
+        };
+        for (
+            second,
+            second_transform,
+            second_uuid,
+            _,
+            second_table,
+            _,
+            _,
+            _,
+        ) in nodes.iter().copied().skip(first_index + 1)
+        {
+            let Some(&(second_slot, second_is_leaf)) = addition_ready.get(&second) else {
+                continue;
+            };
+            if (!first_is_leaf && !second_is_leaf)
+                || first_links.connected.contains_key(&second)
+                || reassignments.is_suppressed(first, second)
+            {
+                continue;
+            }
+            let Some(first_distance) = estimated_peer_distance(
+                first_transform.translation(),
+                &second_uuid.0,
+                first_table,
+                base_position,
+            ) else {
+                continue;
+            };
+            let Some(second_distance) = estimated_peer_distance(
+                second_transform.translation(),
+                &first_uuid.0,
+                second_table,
+                base_position,
+            ) else {
+                continue;
+            };
+            let distance = first_distance.max(second_distance);
+            if distance > REASSIGN_MAX_DISTANCE_KM {
+                continue;
+            }
+            let edge = ManagedEdge::new(first, second);
+            let slots = if edge.0 == first {
+                [first_slot, second_slot]
+            } else {
+                [second_slot, first_slot]
+            };
+            addition_candidates.push((edge, slots, distance));
+        }
+    }
+    let addition = addition_candidates.into_iter().min_by(|a, b| {
+        a.2.total_cmp(&b.2)
+            .then_with(|| a.0.0.to_bits().cmp(&b.0.0.to_bits()))
+            .then_with(|| a.0.1.to_bits().cmp(&b.0.1.to_bits()))
+    });
+    if let Some((edge, slots, _)) = addition {
+        reassignments.active = Some(ReassignmentAttempt {
+            edge,
+            slots,
+            newly_suppressed: Vec::new(),
+            replaced_established: Vec::new(),
+            elapsed_secs: 0.0,
+            stable_frames: 0,
+        });
+        return;
+    }
+
     let mut eligible: HashMap<Entity, (usize, Entity, f32)> = HashMap::new();
 
     for (entity, transform, _, links, table, pairing, target, antennas) in &nodes {
@@ -1273,7 +1431,6 @@ pub fn plan_connection_reassignments(
             links,
             table,
             &topology,
-            &reassignments,
             &uuids,
             base_position,
         ) else {
@@ -1289,7 +1446,7 @@ pub fn plan_connection_reassignments(
         eligible.insert(*entity, (slot, drop_peer, drop_distance));
     }
 
-    let mut choices: HashMap<Entity, Entity> = HashMap::new();
+    let mut choices: HashMap<Entity, (Entity, f32)> = HashMap::new();
     for (entity, transform, _, links, table, _, _, _) in &nodes {
         let Some((_, _, drop_distance)) = eligible.get(entity) else {
             continue;
@@ -1320,17 +1477,24 @@ pub fn plan_connection_reassignments(
                 closest = Some((*peer, distance));
             }
         }
-        if let Some((peer, _)) = closest {
-            choices.insert(*entity, peer);
+        if let Some(choice) = closest {
+            choices.insert(*entity, choice);
         }
     }
 
-    let selected = choices
-        .iter()
-        .filter_map(|(&entity, &peer)| {
-            (choices.get(&peer) == Some(&entity)).then_some(ManagedEdge::new(entity, peer))
-        })
-        .min_by_key(|edge| (edge.0.to_bits(), edge.1.to_bits()));
+    let drone_entities: Vec<Entity> = nodes.iter().map(|(entity, ..)| *entity).collect();
+    let selected = select_best_mutual_reassignment(&choices, &eligible, |edge| {
+        let removed = HashSet::from([
+            ManagedEdge::new(edge.0, eligible[&edge.0].1),
+            ManagedEdge::new(edge.1, eligible[&edge.1].1),
+        ]);
+        all_nodes_reach_base_after_removing(
+            &live_links,
+            base_entity,
+            &drone_entities,
+            &removed,
+        )
+    });
     let Some(edge) = selected else {
         return;
     };
@@ -1342,7 +1506,6 @@ pub fn plan_connection_reassignments(
         ManagedEdge::new(edge.1, drop_b),
     ];
     let removed: HashSet<ManagedEdge> = dropped.into_iter().collect();
-    let drone_entities: Vec<Entity> = nodes.iter().map(|(entity, ..)| *entity).collect();
     if !all_nodes_reach_base_after_removing(
         &live_links,
         base_entity,
@@ -1495,22 +1658,9 @@ fn droppable_peer(
     links: &LinkSet,
     table: &MeshTable,
     topology: &RelayTopology,
-    reassignments: &ConnectionReassignments,
     uuids: &Query<&DroneUuid>,
     base_position: Vec3,
 ) -> Option<(Entity, f32, usize)> {
-    if let Some(managed) = reassignments.established.get(&entity) {
-        if links.connected.contains_key(&managed.peer)
-            && !topology.requires_link(entity, managed.peer)
-            && !topology.involves_base(entity, managed.peer)
-        {
-            let peer_uuid = uuids.get(managed.peer).ok()?;
-            let distance = estimated_peer_distance(position, &peer_uuid.0, table, base_position)?;
-            let slot = *links.antenna_for_peer.get(&managed.peer)?;
-            return Some((managed.peer, distance, slot));
-        }
-    }
-
     links
         .connected
         .keys()
@@ -1773,6 +1923,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn selector_prioritizes_the_pair_with_the_longest_safe_drop() {
+        let entity = |id| Entity::from_raw_u32(id).expect(stringify!(valid_entity));
+        let short_a = entity(1);
+        let short_b = entity(2);
+        let stretched_a = entity(3);
+        let stretched_b = entity(4);
+        let choices = HashMap::from([
+            (short_a, (short_b, 0.5)),
+            (short_b, (short_a, 0.5)),
+            (stretched_a, (stretched_b, 1.0)),
+            (stretched_b, (stretched_a, 1.0)),
+        ]);
+        let eligible = HashMap::from([
+            (short_a, (0, entity(10), 1.5)),
+            (short_b, (0, entity(11), 1.5)),
+            (stretched_a, (0, entity(12), 2.7)),
+            (stretched_b, (0, entity(13), 2.6)),
+        ]);
+
+        assert_eq!(
+            select_best_mutual_reassignment(&choices, &eligible, |_| true),
+            Some(ManagedEdge::new(stretched_a, stretched_b))
+        );
+    }
+
     fn planner_app(second_inside: bool) -> (App, Entity, Entity, Entity, Entity) {
         let mut app = App::new();
         app.init_resource::<Time>();
@@ -1785,13 +1961,17 @@ mod tests {
         let second_uuid = format_uuid_v4(2, 2);
         let old_first_uuid = format_uuid_v4(3, 3);
         let old_second_uuid = format_uuid_v4(4, 4);
+        let mut old_first_links = LinkSet::default();
+        old_first_links.connected.insert(first, 0.0);
         let old_first = app
             .world_mut()
-            .spawn(DroneUuid(old_first_uuid.clone()))
+            .spawn((DroneUuid(old_first_uuid.clone()), old_first_links))
             .id();
+        let mut old_second_links = LinkSet::default();
+        old_second_links.connected.insert(second, 0.0);
         let old_second = app
             .world_mut()
-            .spawn(DroneUuid(old_second_uuid.clone()))
+            .spawn((DroneUuid(old_second_uuid.clone()), old_second_links))
             .id();
 
         let mut first_links = LinkSet::default();
@@ -1925,6 +2105,98 @@ mod tests {
         let topology = app.world().resource::<RelayTopology>();
         assert!(topology.requires_link(first, topology.parent(first).unwrap()));
         assert!(topology.requires_link(second, topology.parent(second).unwrap()));
+    }
+
+    #[test]
+    fn planner_adds_a_leaf_link_without_suppressing_existing_connections() {
+        let (mut app, leaf, neighbour, old_leaf, old_neighbour) = planner_app(true);
+        {
+            let mut leaf_entity = app.world_mut().entity_mut(leaf);
+            let mut links = leaf_entity.get_mut::<LinkSet>().unwrap();
+            links.connected.remove(&old_leaf);
+            links.antenna_for_peer.remove(&old_leaf);
+            drop(links);
+            let mut pairing = leaf_entity.get_mut::<Pairing>().unwrap();
+            pairing.state = PairingState::Paired {
+                request_id: String::new(),
+                peer: String::new(),
+            };
+            pairing.frozen = true;
+        }
+
+        app.update();
+
+        let state = app.world().resource::<ConnectionReassignments>();
+        let attempt = state.active.as_ref().unwrap();
+        assert_eq!(attempt.edge, ManagedEdge::new(leaf, neighbour));
+        assert!(attempt.newly_suppressed.is_empty());
+        assert!(attempt.replaced_established.is_empty());
+        assert!(!state.is_suppressed(leaf, old_leaf));
+        assert!(!state.is_suppressed(neighbour, old_neighbour));
+        let topology = app.world().resource::<RelayTopology>();
+        assert!(topology.requires_link(leaf, topology.parent(leaf).unwrap()));
+        assert!(topology.requires_link(neighbour, topology.parent(neighbour).unwrap()));
+    }
+
+    #[test]
+    fn planner_drops_longest_optional_link_even_when_shorter_link_is_managed() {
+        let (mut app, first, second, old_first, old_second) = planner_app(true);
+        let long_first_uuid = format_uuid_v4(5, 5);
+        let long_second_uuid = format_uuid_v4(6, 6);
+        let long_first = app
+            .world_mut()
+            .spawn(DroneUuid(long_first_uuid.clone()))
+            .id();
+        let long_second = app
+            .world_mut()
+            .spawn(DroneUuid(long_second_uuid.clone()))
+            .id();
+
+        for (entity, peer, peer_uuid, peer_position, slot) in [
+            (first, long_first, long_first_uuid, Vec3::new(-2.6, 0.0, 0.0), 0),
+            (second, long_second, long_second_uuid, Vec3::new(3.6, 0.0, 0.0), 2),
+        ] {
+            let mut entity_mut = app.world_mut().entity_mut(entity);
+            let mut links = entity_mut.get_mut::<LinkSet>().unwrap();
+            links.connected.insert(peer, 0.0);
+            links.antenna_for_peer.insert(peer, slot);
+            drop(links);
+            entity_mut.get_mut::<MeshTable>().unwrap().0.insert(
+                peer_uuid.clone(),
+                MeshRow {
+                    id: peer_uuid,
+                    timestamp: 0.0,
+                    location: peer_position,
+                    neighbour_distance: 0,
+                    connections: Vec::new(),
+                },
+            );
+        }
+        {
+            let mut state = app.world_mut().resource_mut::<ConnectionReassignments>();
+            state.established.insert(
+                first,
+                ManagedPeer {
+                    peer: old_first,
+                    antenna_slot: 2,
+                },
+            );
+            state.established.insert(
+                second,
+                ManagedPeer {
+                    peer: old_second,
+                    antenna_slot: 0,
+                },
+            );
+        }
+
+        app.update();
+
+        let state = app.world().resource::<ConnectionReassignments>();
+        assert!(state.is_suppressed(first, long_first));
+        assert!(state.is_suppressed(second, long_second));
+        assert!(!state.is_suppressed(first, old_first));
+        assert!(!state.is_suppressed(second, old_second));
     }
 
     #[test]
