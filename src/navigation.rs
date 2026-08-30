@@ -297,17 +297,17 @@ pub fn go_to_network_area(
         let desired_waypoint = if reassignments.holds(entity) {
             transform.translation
         } else if target.spreading {
-            let slot = repel_from_target_boundary(
+            let spaced_slot = repel_from_nearby_drones(
+                entity,
                 transform.translation,
                 clamp_to_target_area(target.slot, &network_area, &scenario),
+                &peer_positions,
                 &network_area,
                 &scenario,
             );
-            repel_from_nearby_drones(
-                entity,
+            repel_from_target_boundary(
                 transform.translation,
-                slot,
-                &peer_positions,
+                spaced_slot,
                 &network_area,
                 &scenario,
             )
@@ -381,9 +381,11 @@ fn repel_from_nearby_drones(
     }
 }
 
-/// The blue boundary behaves like a virtual survey neighbor at this distance.
-/// It keeps the formation off edges and combines two edge forces at corners.
-const TARGET_BOUNDARY_SPACING_KM: f32 = crate::world::FORMATION_RADIUS_KM;
+/// Inside this band the blue boundary adds a progressively stronger inward
+/// steering suggestion. It is deliberately not an inset geofence: deployment,
+/// relay constraints, reassignment holds, and safety systems keep their normal
+/// authority.
+const TARGET_BOUNDARY_CLEARANCE_KM: f32 = 1.0;
 
 fn repel_from_target_boundary(
     position: Vec3,
@@ -409,8 +411,12 @@ fn repel_from_target_boundary(
         }
         let inward = Vec2::new(-edge.y, edge.x) / length;
         let distance = ((point - *start).dot(inward)).max(0.0);
-        if distance < TARGET_BOUNDARY_SPACING_KM {
-            let weight = (1.0 - distance / TARGET_BOUNDARY_SPACING_KM).clamp(0.0, 1.0);
+        if distance < TARGET_BOUNDARY_CLEARANCE_KM {
+            let proximity =
+                (1.0 - distance / TARGET_BOUNDARY_CLEARANCE_KM).clamp(0.0, 1.0);
+            // Smoothstep avoids a noticeable steering change where the soft
+            // boundary first becomes active.
+            let weight = proximity * proximity * (3.0 - 2.0 * proximity);
             push += inward * weight;
             urgency = urgency.max(weight);
         }
@@ -418,7 +424,8 @@ fn repel_from_target_boundary(
     if push.length_squared() <= f32::EPSILON {
         return slot;
     }
-    let escape = position + Vec3::new(push.x, 0.0, push.y).normalize() * TARGET_BOUNDARY_SPACING_KM;
+    let escape = position
+        + Vec3::new(push.x, 0.0, push.y).normalize() * TARGET_BOUNDARY_CLEARANCE_KM;
     slot.lerp(clamp_to_target_area(escape, area, scenario), urgency)
 }
 
@@ -492,6 +499,25 @@ mod relay_navigation_tests {
 
     use super::*;
 
+    fn square_target_area(
+        half_width_km: f32,
+    ) -> (crate::area::NetworkArea, crate::area::ScenarioArea) {
+        let scenario = crate::area::ScenarioArea {
+            name: stringify!(test),
+            latitude: 0.0,
+            longitude: 0.0,
+            size_km: half_width_km * 2.0,
+        };
+        let lon = half_width_km as f64 / 111.320;
+        let lat = half_width_km as f64 / 110.574;
+        let area = crate::area::NetworkArea {
+            hull: vec![(-lon, -lat), (lon, -lat), (lon, lat), (-lon, lat)],
+            valid: true,
+            ..default()
+        };
+        (area, scenario)
+    }
+
     #[test]
     fn relay_waypoint_never_exceeds_working_hop() {
         let parent = Vec3::new(1.0, 0.0, -2.0);
@@ -500,30 +526,82 @@ mod relay_navigation_tests {
     }
 
     #[test]
+    fn target_boundary_bias_is_inactive_outside_its_one_kilometre_band() {
+        let (area, scenario) = square_target_area(5.0);
+        let slot = Vec3::new(5.0, 0.0, 0.0);
+
+        let waypoint = repel_from_target_boundary(
+            Vec3::new(3.5, 0.0, 0.0),
+            slot,
+            &area,
+            &scenario,
+        );
+
+        assert_eq!(waypoint, slot);
+    }
+
+    #[test]
+    fn target_boundary_bias_smoothly_turns_a_waypoint_inward() {
+        let (area, scenario) = square_target_area(5.0);
+        let slot = Vec3::new(5.0, 0.0, 0.0);
+
+        let waypoint = repel_from_target_boundary(
+            Vec3::new(4.5, 0.0, 0.0),
+            slot,
+            &area,
+            &scenario,
+        );
+
+        assert!(waypoint.x < slot.x);
+        assert!(waypoint.x > 3.5);
+        assert!(waypoint.z.abs() < 1e-6);
+        assert!(inside_target_area(waypoint, &area, &scenario));
+    }
+
+    #[test]
+    fn target_boundary_bias_combines_edges_at_a_corner() {
+        let (area, scenario) = square_target_area(5.0);
+        let slot = Vec3::new(5.0, 0.0, 5.0);
+
+        let waypoint = repel_from_target_boundary(
+            Vec3::new(4.5, 0.0, 4.5),
+            slot,
+            &area,
+            &scenario,
+        );
+
+        assert!(waypoint.x < slot.x);
+        assert!(waypoint.z < slot.z);
+        assert!(inside_target_area(waypoint, &area, &scenario));
+    }
+
+    #[test]
     fn connected_drone_accelerates_toward_the_area() {
         let mut app = App::new();
+        let (area, scenario) = square_target_area(5.0);
         app.insert_resource(Time::<()>::default());
-        app.insert_resource(crate::area::NetworkArea::default());
-        app.insert_resource(crate::area::ScenarioArea::default());
+        app.insert_resource(area);
+        app.insert_resource(scenario);
+        let base_position = Vec3::new(5.9, 0.0, 0.0);
         let base = app
             .world_mut()
             .spawn((
                 crate::base::Base {
                     id: "base".into(),
-                    position: Vec3::ZERO,
+                    position: base_position,
                     antennas: Vec::new(),
                 },
-                Transform::default(),
+                Transform::from_translation(base_position),
             ))
             .id();
         let drone = app
             .world_mut()
             .spawn((
                 Drone { id: "drone".into() },
-                Transform::from_xyz(0.1, 0.0, 0.0),
+                Transform::from_xyz(6.0, 0.0, 0.0),
                 DeploymentTarget {
-                    ingress: Vec3::X,
-                    slot: Vec3::X,
+                    ingress: Vec3::new(4.0, 0.0, 0.0),
+                    slot: Vec3::ZERO,
                     spreading: false,
                 },
                 DroneKinematics::default(),
@@ -546,6 +624,6 @@ mod relay_navigation_tests {
             .get::<DroneKinematics>()
             .unwrap()
             .velocity;
-        assert!(velocity.x > 0.0);
+        assert!(velocity.x < 0.0);
     }
 }
